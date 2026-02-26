@@ -1,0 +1,89 @@
+defaults:
+  - system
+
+# Training experiment configuration
+experiment:
+  name: "efficientnet_b2_baseline"
+  tags: ["baseline", "efficientnet", "chest_xray"]
+  seed: 42
+  notes: "Baseline training with EfficientNet-B2 on merged chest X-ray dataset"
+
+# Model selection
+model:
+  name: efficientnet_b2
+
+# Data configuration override
+data:
+  batch_size: 32
+  num_workers: 4
+
+# Training hyperparameters
+training:
+  max_epochs: 100
+  accelerator: gpu
+  devices: 1
+  precision: 16
+  
+  # Optimizer
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    
+  # Scheduler
+  scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts
+    T_0: 10
+    T_mult: 2
+    eta_min: 1.0e-6
+  
+  # Loss function
+  loss:
+    _target_: xclinvision.training.losses.FocalLoss
+    alpha: 0.25
+    gamma: 2.0
+    weight: [1.0, 1.5, 1.5]
+
+# Callbacks
+callbacks:
+  early_stopping:
+    _target_: pytorch_lightning.callbacks.EarlyStopping
+    monitor: val_auc
+    mode: max
+    patience: 10
+    min_delta: 0.001
+    
+  model_checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: "${system.paths.models_dir}/${experiment.name}"
+    monitor: val_auc
+    mode: max
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_auc:.4f}"
+    save_last: true
+    
+  learning_rate_monitor:
+    _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    logging_interval: step
+
+# Logger configuration
+logger:
+  mlflow:
+    _target_: pytorch_lightning.loggers.MLFlowLogger
+    experiment_name: ${experiment.name}
+    tracking_uri: ${system.paths.mlflow_dir}
+    tags: ${experiment.tags}
+
+# Evaluation configuration
+evaluation:
+  metrics:
+    - accuracy
+    - precision
+    - recall
+    - f1_score
+    - roc_auc
+    - confusion_matrix
+  
+  calibration:
+    compute_ece: true
+    num_bins: 15

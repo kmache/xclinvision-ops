@@ -1,0 +1,83 @@
+name: swin_t
+type: transformer
+
+architecture:
+  backbone: swin_tiny_patch4_window7_224
+  pretrained: true
+  num_classes: 3
+  dropout_rate: 0.2
+  
+  # Custom head for Swin Transformer
+  head:
+    type: sequential
+    layers:
+      - type: layernorm
+        normalized_shape: 768
+      - type: flatten
+      - type: dropout
+        p: 0.2
+      - type: linear
+        in_features: 768
+        out_features: 256
+      - type: gelu
+      - type: dropout
+        p: 0.2
+      - type: linear
+        in_features: 256
+        out_features: 3
+
+# Transfer learning strategy
+transfer_learning:
+  freeze_backbone: false
+  differential_lr:
+    enabled: true
+    backbone_lr: 5.0e-6
+    head_lr: 5.0e-5
+
+input:
+  size: [224, 224]  # Swin is trained on 224x224
+  channels: 3
+  normalize:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+training:
+  batch_size: 16  # Smaller batch for transformer
+  epochs: 100
+  gradient_accumulation_steps: 2
+  
+  optimizer:
+    name: adamw
+    lr: 5.0e-5
+    weight_decay: 0.05
+    betas: [0.9, 0.999]
+    
+  scheduler:
+    name: cosine_warmup
+    warmup_epochs: 10
+    min_lr: 1.0e-7
+
+uncertainty:
+  temperature_scaling: true
+  mc_dropout:
+    enabled: true
+    num_samples: 10
+
+explainability:
+  method: attention_rollout
+  target_layer: layers
+  discard_ratio: 0.9
+
+comparison:
+  category: Hierarchical Vision Transformer
+  strengths:
+    - Excellent localization
+    - State-of-the-art for pneumonia detection
+    - Captures global context
+  weaknesses:
+    - Complex architecture
+    - Needs more data
+    - Higher latency
+  expected_performance:
+    recall_pneumonia: 0.91
+    ece: 0.18

@@ -1,0 +1,87 @@
+name: efficientnet_b2
+type: cnn
+
+architecture:
+  backbone: efficientnet_b2
+  pretrained: true
+  num_classes: 3
+  dropout_rate: 0.3
+  
+  # Custom head configuration
+  head:
+    type: sequential
+    layers:
+      - type: adaptive_avg_pool2d
+        output_size: [1, 1]
+      - type: flatten
+      - type: dropout
+        p: 0.3
+      - type: linear
+        in_features: 1408  # EfficientNet-B2 features
+        out_features: 512
+      - type: batch_norm1d
+        num_features: 512
+      - type: relu
+      - type: dropout
+        p: 0.3
+      - type: linear
+        in_features: 512
+        out_features: 3
+
+# Transfer learning strategy
+transfer_learning:
+  freeze_backbone: false
+  freeze_bn: true
+  differential_lr:
+    enabled: true
+    backbone_lr: 1.0e-5
+    head_lr: 1.0e-4
+
+# Input configuration
+input:
+  size: [384, 384]
+  channels: 3
+  normalize:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+# Training configuration
+training:
+  batch_size: 32
+  epochs: 100
+  
+  optimizer:
+    name: adamw
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    
+  scheduler:
+    name: cosine_warmup
+    warmup_epochs: 5
+    min_lr: 1.0e-6
+
+# Uncertainty estimation
+uncertainty:
+  temperature_scaling: true
+  mc_dropout:
+    enabled: true
+    num_samples: 10
+    dropout_rate: 0.3
+
+# Explainability
+explainability:
+  method: gradcam++
+  target_layer: features
+  
+# Model comparison metadata
+comparison:
+  category: CNN (Modern)
+  strengths:
+    - Best accuracy-compute trade-off
+    - Commonly used in production
+    - Efficient architecture
+  weaknesses:
+    - Slightly slower than ResNet-50
+  expected_performance:
+    recall_pneumonia: 0.92
+    ece: 0.05

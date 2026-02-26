@@ -1,0 +1,30 @@
+# Ignore data files
+data/
+
+# Ignore model artifacts
+models/
+*.pt
+*.pth
+*.onnx
+*.h5
+*.pkl
+*.joblib
+
+# Ignore logs
+logs/
+*.log
+
+# Ignore virtual environments
+.venv/
+venv/
+
+# Ignore build artifacts
+build/
+dist/
+*.egg-info/
+
+# Ignore notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore vector DB
+data/vector_db/
