@@ -9,9 +9,20 @@ __version__ = "0.1.0"
 __author__ = "XClinVision Team"
 __license__ = "MIT"
 
-from xclinvision.architecture import create_model
-from xclinvision.inference import predict
-from xclinvision.xai import generate_explanation
+
+def __getattr__(name: str):
+    """Lazy imports so lightweight modules (e.g. processing) load without heavy deps."""
+    if name == "create_model":
+        from xclinvision.architecture import create_model
+        return create_model
+    if name == "predict":
+        from xclinvision.inference import predict
+        return predict
+    if name == "generate_explanation":
+        from xclinvision.xai import generate_explanation
+        return generate_explanation
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "create_model",

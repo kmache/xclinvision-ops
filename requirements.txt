@@ -1,0 +1,14 @@
+kagglehub
+pandas
+numpy
+scikit-learn
+matplotlib
+seaborn
+torch
+torchvision
+timm
+albumentations
+opencv-python
+scipy
+mlflow
+open_clip_torch

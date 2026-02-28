@@ -14,7 +14,8 @@ from pytorch_lightning.loggers import MLFlowLogger
 import yaml
 import argparse
 
-from xclinvision.architecture import create_model
+from xclinvision.models import build_model
+from xclinvision.dataset import ChestXrayDataModule
 from xclinvision.trainer import XClinVisionModel, MetricsCallback
 
 
@@ -27,7 +28,9 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--manifest", type=str, default="data/processed/manifest.csv")
+    parser.add_argument("--cache-size", type=int, default=1000, help="LRU cache size for images")
     return parser.parse_args()
 
 
@@ -37,6 +40,20 @@ def main():
     # Set seed
     pl.seed_everything(args.seed)
     
+    # Create DataModule
+    data_module = ChestXrayDataModule(
+        manifest_path=args.manifest,
+        batch_size=args.batch_size,
+        num_workers=4,
+        image_size=224,
+        cache_size=args.cache_size,
+    )
+    data_module.setup()
+    
+    # Compute class weights from training data
+    class_weights = data_module.get_class_weights().tolist()
+    print(f"Computed class weights: {class_weights}")
+    
     # Load config
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
@@ -44,10 +61,9 @@ def main():
     print(f"Training {args.model} model...")
     
     # Create model
-    model = create_model(
+    model = build_model(
         model_name=args.model,
         num_classes=3,
-        dropout_rate=0.3,
         pretrained=True,
     )
     
@@ -57,7 +73,7 @@ def main():
         num_classes=3,
         learning_rate=args.lr,
         loss_type="focal",
-        class_weights=[1.0, 1.5, 1.5],
+        class_weights=class_weights,
     )
     
     # Callbacks
@@ -95,11 +111,11 @@ def main():
         gradient_clip_val=1.0,
     )
     
-    print("Note: Data loading not yet implemented. Add DataModule integration.")
-    print("Training pipeline ready for integration with processed datasets.")
-    
-    # Placeholder for actual training
-    # trainer.fit(pl_module, datamodule=data_module)
+    # Train
+    print(f"Starting training with {len(data_module.train_dataset)} train samples...")
+    trainer.fit(pl_module, 
+                train_dataloaders=data_module.train_dataloader(),
+                val_dataloaders=data_module.val_dataloader())
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ paths:
   data_dir: "./data"
   raw_data_dir: "./data/raw"
   processed_data_dir: "./data/processed"
+  quarantine_dir: "./data/quarantine"
   models_dir: "./models"
   logs_dir: "./logs"
   outputs_dir: "./outputs"

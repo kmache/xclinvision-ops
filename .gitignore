@@ -41,20 +41,26 @@ ENV/
 
 # Environment variables
 .env
-.env.*
+.env.* 
 
 # Data files
-data/raw/*
-data/processed/*
-data/vector_db/*
+data/raw/
+new_data/
+data/quarantine/
+data/duplicate/ 
+data/processed/
+data/vector_db/
+# Keep the directory structure on Git
 !data/raw/.gitkeep
-!data/processed/.gitkeep
+!data/processed/.gitkeep 
 !data/vector_db/.gitkeep
+!data/processed/manifest.csv
 
-# Model artifacts
-models/
+# Model artifacts 
+models/*
+!models/.gitkeep
 *.pt
-*.pth
+*.pth 
 *.onnx
 *.h5
 *.pkl
