@@ -1,3 +1,4 @@
+# BiomedCLIP — model-specific overrides (merged on top of system.yaml)
 name: biomedclip
 type: foundation_model
 
@@ -6,8 +7,6 @@ architecture:
   pretrained: true
   num_classes: 3
   dropout_rate: 0.2
-  
-  # Custom classification head
   head:
     type: sequential
     layers:
@@ -16,7 +15,7 @@ architecture:
       - type: dropout
         p: 0.2
       - type: linear
-        in_features: 512
+        in_features: 512  # BiomedCLIP vision feature dim
         out_features: 256
       - type: relu
       - type: dropout
@@ -25,41 +24,28 @@ architecture:
         in_features: 256
         out_features: 3
 
-# Transfer learning strategy
 transfer_learning:
   freeze_vision_encoder: false
-  freeze_text_encoder: true  # Don't use text encoder for classification
+  freeze_text_encoder: true  # Only vision encoder used for classification
   differential_lr:
     enabled: true
     encoder_lr: 1.0e-5
     head_lr: 1.0e-4
 
+# Override system defaults where this model differs
 input:
   size: [224, 224]
-  channels: 3
-  normalize:
-    mean: [0.48145466, 0.4578275, 0.40821073]  # CLIP normalization
+  normalize:  # CLIP-specific normalization (differs from ImageNet)
+    mean: [0.48145466, 0.4578275, 0.40821073]
     std: [0.26862954, 0.26130258, 0.27577711]
 
 training:
   batch_size: 16
-  epochs: 100
-  
   optimizer:
-    name: adamw
     lr: 1.0e-5  # Lower LR for foundation models
     weight_decay: 0.1
-    
   scheduler:
-    name: cosine_warmup
-    warmup_epochs: 5
     min_lr: 1.0e-7
-
-uncertainty:
-  temperature_scaling: true
-  mc_dropout:
-    enabled: true
-    num_samples: 10
 
 explainability:
   method: attention_map

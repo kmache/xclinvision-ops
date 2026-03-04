@@ -1,212 +1,404 @@
 """Evaluation metrics and calibration analysis."""
 
-from typing import Dict, List, Tuple, Optional
+import json
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import torch
 from sklearn.metrics import (
     accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
     precision_score,
     recall_score,
-    f1_score,
     roc_auc_score,
-    confusion_matrix,
-    classification_report,
 )
-from scipy.special import softmax
 
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
 
 class MetricsComputer:
-    """Compute comprehensive evaluation metrics for medical AI."""
-    
-    def __init__(self, class_names: List[str] = None):
+    """Compute comprehensive evaluation metrics for medical AI classification.
+
+    Covers accuracy, per-class precision/recall/F1, macro/weighted averages,
+    sensitivity, specificity, AUC-ROC, and sklearn classification report.
+    """
+
+    def __init__(self, class_names: Optional[List[str]] = None):
         self.class_names = class_names or ["Normal", "Pneumonia", "Tuberculosis"]
-        
+
+    # ------------------------------------------------------------------
+    # Full metric suite
+    # ------------------------------------------------------------------
+
     def compute_all_metrics(
         self,
         y_true: np.ndarray,
         y_pred: np.ndarray,
         y_probs: np.ndarray,
     ) -> Dict[str, float]:
-        """Compute all relevant metrics for medical classification."""
-        metrics = {}
-        
-        # Basic metrics
-        metrics["accuracy"] = accuracy_score(y_true, y_pred)
-        metrics["macro_precision"] = precision_score(
-            y_true, y_pred, average="macro", zero_division=0
+        """Compute all evaluation metrics for multi-class classification.
+
+        Args:
+            y_true: Ground-truth integer labels, shape (N,).
+            y_pred: Predicted integer labels, shape (N,).
+            y_probs: Predicted probabilities, shape (N, num_classes).
+
+        Returns:
+            Flat dict mapping metric names to float values.
+        """
+        n_classes = len(self.class_names)
+        metrics: Dict[str, float] = {}
+
+        # ---- aggregate -----------------------------------------------
+        metrics["accuracy"] = float(accuracy_score(y_true, y_pred))
+        metrics["macro_precision"] = float(
+            precision_score(y_true, y_pred, average="macro", zero_division=0)
         )
-        metrics["macro_recall"] = recall_score(
-            y_true, y_pred, average="macro", zero_division=0
+        metrics["macro_recall"] = float(
+            recall_score(y_true, y_pred, average="macro", zero_division=0)
         )
-        metrics["macro_f1"] = f1_score(
-            y_true, y_pred, average="macro", zero_division=0
+        metrics["macro_f1"] = float(
+            f1_score(y_true, y_pred, average="macro", zero_division=0)
         )
-        
-        # Per-class metrics
-        for i, class_name in enumerate(self.class_names):
-            metrics[f"{class_name}_precision"] = precision_score(
-                y_true, y_pred, labels=[i], average=None, zero_division=0
-            )[0]
-            metrics[f"{class_name}_recall"] = recall_score(
-                y_true, y_pred, labels=[i], average=None, zero_division=0
-            )[0]
-            metrics[f"{class_name}_f1"] = f1_score(
-                y_true, y_pred, labels=[i], average=None, zero_division=0
-            )[0]
-            
-        # Sensitivity and Specificity
-        cm = confusion_matrix(y_true, y_pred, labels=range(len(self.class_names)))
-        for i, class_name in enumerate(self.class_names):
-            tn = np.sum(cm) - np.sum(cm[i, :]) - np.sum(cm[:, i]) + cm[i, i]
-            fp = np.sum(cm[:, i]) - cm[i, i]
-            fn = np.sum(cm[i, :]) - cm[i, i]
+        metrics["weighted_precision"] = float(
+            precision_score(y_true, y_pred, average="weighted", zero_division=0)
+        )
+        metrics["weighted_recall"] = float(
+            recall_score(y_true, y_pred, average="weighted", zero_division=0)
+        )
+        metrics["weighted_f1"] = float(
+            f1_score(y_true, y_pred, average="weighted", zero_division=0)
+        )
+
+        # ---- per-class -----------------------------------------------
+        per_precision = precision_score(
+            y_true, y_pred, labels=list(range(n_classes)),
+            average=None, zero_division=0
+        )
+        per_recall = recall_score(
+            y_true, y_pred, labels=list(range(n_classes)),
+            average=None, zero_division=0
+        )
+        per_f1 = f1_score(
+            y_true, y_pred, labels=list(range(n_classes)),
+            average=None, zero_division=0
+        )
+
+        for i, name in enumerate(self.class_names):
+            metrics[f"{name}_precision"] = float(per_precision[i])
+            metrics[f"{name}_recall"]    = float(per_recall[i])
+            metrics[f"{name}_f1"]        = float(per_f1[i])
+
+        # ---- sensitivity / specificity (OvR) --------------------------
+        cm = confusion_matrix(y_true, y_pred, labels=list(range(n_classes)))
+        total = np.sum(cm)
+        for i, name in enumerate(self.class_names):
             tp = cm[i, i]
-            
-            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-            specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-            
-            metrics[f"{class_name}_sensitivity"] = sensitivity
-            metrics[f"{class_name}_specificity"] = specificity
-            
-        # AUC-ROC
+            fp = np.sum(cm[:, i]) - tp
+            fn = np.sum(cm[i, :]) - tp
+            tn = total - tp - fp - fn
+
+            metrics[f"{name}_sensitivity"] = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+            metrics[f"{name}_specificity"] = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+            metrics[f"{name}_ppv"]         = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+            metrics[f"{name}_npv"]         = float(tn / (tn + fn)) if (tn + fn) > 0 else 0.0
+
+        # ---- AUC-ROC --------------------------------------------------
         try:
-            y_true_onehot = np.eye(len(self.class_names))[y_true]
-            metrics["macro_auc"] = roc_auc_score(
-                y_true_onehot, y_probs, multi_class="ovr", average="macro"
+            if np.any(y_true < 0) or np.any(y_true >= n_classes):
+                raise ValueError(
+                    f"y_true contains labels outside [0, {n_classes}): "
+                    f"min={int(np.min(y_true))}, max={int(np.max(y_true))}"
+                )
+            y_true_oh = np.eye(n_classes)[y_true]
+            metrics["macro_auc"] = float(
+                roc_auc_score(y_true_oh, y_probs, multi_class="ovr", average="macro")
             )
-        except ValueError:
+            metrics["weighted_auc"] = float(
+                roc_auc_score(y_true_oh, y_probs, multi_class="ovr", average="weighted")
+            )
+        except ValueError as exc:
+            logger.warning(f"AUC-ROC computation failed: {exc}")
             metrics["macro_auc"] = 0.0
-            
+            metrics["weighted_auc"] = 0.0
+
         return metrics
-    
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     def compute_confusion_matrix(
         self,
         y_true: np.ndarray,
         y_pred: np.ndarray,
     ) -> np.ndarray:
-        """Compute confusion matrix."""
+        """Return the confusion matrix (rows = true, columns = predicted)."""
         return confusion_matrix(
-            y_true, y_pred, labels=range(len(self.class_names))
+            y_true, y_pred, labels=list(range(len(self.class_names)))
         )
 
+    def generate_classification_report(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        output_dict: bool = False,
+    ):
+        """Return sklearn's classification report as a string or dict.
+
+        Args:
+            y_true: Ground-truth labels.
+            y_pred: Predicted labels.
+            output_dict: If True return a dict; otherwise return a string.
+        """
+        return classification_report(
+            y_true,
+            y_pred,
+            target_names=self.class_names,
+            zero_division=0,
+            output_dict=output_dict,
+        )
+
+    def print_summary(
+        self,
+        metrics: Dict[str, float],
+        y_true: Optional[np.ndarray] = None,
+        y_pred: Optional[np.ndarray] = None,
+    ) -> None:
+        """Pretty-print key metrics and (optionally) a confusion matrix."""
+        lines = []
+        lines.append("")
+        lines.append("=" * 60)
+        lines.append("EVALUATION SUMMARY")
+        lines.append("=" * 60)
+        lines.append(f"  Accuracy      : {metrics.get('accuracy', 0):.4f}")
+        lines.append(f"  Macro F1      : {metrics.get('macro_f1', 0):.4f}")
+        lines.append(f"  Weighted F1   : {metrics.get('weighted_f1', 0):.4f}")
+        lines.append(f"  Macro AUC     : {metrics.get('macro_auc', 0):.4f}")
+        lines.append("")
+        for name in self.class_names:
+            sens = metrics.get(f"{name}_sensitivity", 0)
+            spec = metrics.get(f"{name}_specificity", 0)
+            f1   = metrics.get(f"{name}_f1", 0)
+            lines.append(f"  {name:<14}: Sens={sens:.3f}  Spec={spec:.3f}  F1={f1:.3f}")
+        if y_true is not None and y_pred is not None:
+            lines.append("")
+            lines.append("Confusion Matrix (rows=true, cols=pred):")
+            cm = self.compute_confusion_matrix(y_true, y_pred)
+            header = "  " + "  ".join(f"{n[:6]:>6}" for n in self.class_names)
+            lines.append(header)
+            for row, name in zip(cm, self.class_names):
+                lines.append(f"  {name[:6]:>6}  " + "  ".join(f"{v:>6}" for v in row))
+        lines.append("=" * 60)
+        lines.append("")
+        logger.info("\n".join(lines))
+
+    def save_results(
+        self,
+        metrics: Dict,
+        output_path: str,
+    ) -> None:
+        """Serialise the metrics dict to a JSON file.
+
+        Args:
+            metrics: Dict produced by compute_all_metrics (may contain nested
+                dicts or lists – each value must be JSON-serialisable).
+            output_path: Destination file path (created if needed).
+        """
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(metrics, f, indent=4)
+        logger.info(f"Results saved to {path}")
+
+
+# ---------------------------------------------------------------------------
+# Calibration
+# ---------------------------------------------------------------------------
 
 class CalibrationAnalyzer:
-    """Analyze model calibration using Expected Calibration Error."""
-    
+    """Analyse model calibration using Expected Calibration Error (ECE)."""
+
     def __init__(self, num_bins: int = 15):
         self.num_bins = num_bins
-        
+
     def compute_ece(
         self,
         y_true: np.ndarray,
         y_probs: np.ndarray,
     ) -> float:
-        """Compute Expected Calibration Error."""
-        # Get predicted class and confidence
-        y_pred = np.argmax(y_probs, axis=1)
+        """Compute Expected Calibration Error.
+
+        Partitions samples into confidence bins; ECE is the weighted mean
+        absolute difference between average confidence and average accuracy
+        within each bin.
+
+        Args:
+            y_true: Ground-truth integer labels, shape (N,).
+            y_probs: Predicted probabilities, shape (N, num_classes).
+
+        Returns:
+            ECE ∈ [0, 1] (lower is better-calibrated).
+        """
+        y_pred      = np.argmax(y_probs, axis=1)
         confidences = np.max(y_probs, axis=1)
-        accuracies = (y_pred == y_true).astype(float)
-        
-        # Create bins
+        accuracies  = (y_pred == y_true).astype(float)
+
         bin_boundaries = np.linspace(0, 1, self.num_bins + 1)
         ece = 0.0
-        
+
         for i in range(self.num_bins):
-            bin_lower = bin_boundaries[i]
-            bin_upper = bin_boundaries[i + 1]
-            
-            # Find samples in this bin
-            in_bin = np.logical_and(
-                confidences > bin_lower,
-                confidences <= bin_upper,
-            )
-            bin_size = np.sum(in_bin)
-            
-            if bin_size > 0:
-                avg_confidence = np.mean(confidences[in_bin])
-                avg_accuracy = np.mean(accuracies[in_bin])
-                ece += (bin_size / len(y_true)) * np.abs(avg_confidence - avg_accuracy)
-                
+            lo, hi = bin_boundaries[i], bin_boundaries[i + 1]
+            in_bin  = (confidences >= lo) & (confidences <= hi) if i == 0 else (confidences > lo) & (confidences <= hi)
+            bin_n   = int(np.sum(in_bin))
+            if bin_n > 0:
+                avg_conf = float(np.mean(confidences[in_bin]))
+                avg_acc  = float(np.mean(accuracies[in_bin]))
+                ece += (bin_n / len(y_true)) * abs(avg_conf - avg_acc)
+
         return ece
-    
+
     def compute_calibration_curve(
         self,
         y_true: np.ndarray,
         y_probs: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Compute calibration curve data."""
-        y_pred = np.argmax(y_probs, axis=1)
-        confidences = np.max(y_probs, axis=1)
-        accuracies = (y_pred == y_true).astype(float)
-        
-        bin_boundaries = np.linspace(0, 1, self.num_bins + 1)
-        bin_centers = []
-        bin_accuracies = []
-        bin_counts = []
-        
-        for i in range(self.num_bins):
-            bin_lower = bin_boundaries[i]
-            bin_upper = bin_boundaries[i + 1]
-            
-            in_bin = np.logical_and(
-                confidences > bin_lower,
-                confidences <= bin_upper,
-            )
-            bin_size = np.sum(in_bin)
-            
-            if bin_size > 0:
-                bin_centers.append((bin_lower + bin_upper) / 2)
-                bin_accuracies.append(np.mean(accuracies[in_bin]))
-                bin_counts.append(bin_size)
-            else:
-                bin_centers.append((bin_lower + bin_upper) / 2)
-                bin_accuracies.append(0.0)
-                bin_counts.append(0)
-                
-        return np.array(bin_centers), np.array(bin_accuracies), np.array(bin_counts)
+        """Compute reliability diagram data.
 
+        Returns:
+            bin_centers   (num_bins,) – mid-point of each confidence bin
+            bin_accuracies(num_bins,) – mean accuracy within each bin
+            bin_counts    (num_bins,) – number of samples in each bin
+        """
+        y_pred      = np.argmax(y_probs, axis=1)
+        confidences = np.max(y_probs, axis=1)
+        accuracies  = (y_pred == y_true).astype(float)
+
+        bin_boundaries = np.linspace(0, 1, self.num_bins + 1)
+        bin_centers, bin_accuracies, bin_counts = [], [], []
+
+        for i in range(self.num_bins):
+            lo, hi = bin_boundaries[i], bin_boundaries[i + 1]
+            in_bin  = (confidences >= lo) & (confidences <= hi) if i == 0 else (confidences > lo) & (confidences <= hi)
+            bin_n   = int(np.sum(in_bin))
+            midpoint = float((lo + hi) / 2)
+            bin_centers.append(midpoint)
+            bin_accuracies.append(float(np.mean(accuracies[in_bin])) if bin_n > 0 else 0.0)
+            bin_counts.append(bin_n)
+
+        return (
+            np.array(bin_centers),
+            np.array(bin_accuracies),
+            np.array(bin_counts),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Temperature Scaling
+# ---------------------------------------------------------------------------
 
 class TemperatureScaler:
-    """Temperature scaling for model calibration."""
-    
+    """Post-hoc calibration via temperature scaling (Guo et al., 2017).
+
+    Learns a single scalar T on a held-out validation set, then divides
+    logits by T before softmax to improve calibration.
+    """
+
     def __init__(self):
-        self.temperature = 1.0
-        
+        self.temperature: float = 1.0
+        self._is_fitted: bool = False
+
     def fit(
         self,
         logits: np.ndarray,
         y_true: np.ndarray,
     ) -> float:
-        """Learn optimal temperature on validation set."""
-        import torch
+        """Learn the optimal temperature on a validation set.
+
+        Uses L-BFGS to minimise NLL w.r.t. temperature.
+
+        Args:
+            logits: Raw model logits, shape (N, num_classes).
+            y_true: Ground-truth integer labels, shape (N,).
+
+        Returns:
+            The learned temperature scalar T.
+        """
         from torch.optim import LBFGS
-        
-        # Convert to tensors
-        logits_tensor = torch.FloatTensor(logits)
-        labels_tensor = torch.LongTensor(y_true)
-        
-        # Initialize temperature
+
+        logits_t = torch.FloatTensor(logits)
+        labels_t = torch.LongTensor(y_true)
         temperature = torch.nn.Parameter(torch.ones(1) * 1.5)
-        
-        # Optimize
+
         def eval_fn():
             optimizer.zero_grad()
-            loss = torch.nn.CrossEntropyLoss()(logits_tensor / temperature, labels_tensor)
+            loss = torch.nn.CrossEntropyLoss()(logits_t / temperature, labels_t)
             loss.backward()
             return loss
-            
+
         optimizer = LBFGS([temperature], lr=0.01, max_iter=50)
         optimizer.step(eval_fn)
-        
-        self.temperature = temperature.item()
+
+        self.temperature = max(float(temperature.item()), 0.01)
+        self._is_fitted = True
+        logger.info(
+            f"Temperature scaling converged: T = {self.temperature:.4f}, "
+            f"NLL = {torch.nn.CrossEntropyLoss()(logits_t / self.temperature, labels_t).item():.4f}"
+        )
         return self.temperature
-    
+
     def scale(self, logits: np.ndarray) -> np.ndarray:
-        """Apply temperature scaling to logits."""
+        """Divide raw logits by the learned temperature.
+
+        Args:
+            logits: Raw model logits, shape (N, num_classes).
+
+        Returns:
+            Temperature-scaled logits (same shape).
+        """
+        if not self._is_fitted:
+            logger.warning(
+                "TemperatureScaler.scale() called before fit() – "
+                "returning unscaled logits (T=1.0)."
+            )
         return logits / self.temperature
-    
+
     def predict_proba(self, logits: np.ndarray) -> np.ndarray:
-        """Get calibrated probabilities."""
-        scaled_logits = self.scale(logits)
-        exp_logits = np.exp(scaled_logits - np.max(scaled_logits, axis=1, keepdims=True))
-        return exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+        """Return calibrated softmax probabilities.
+
+        Args:
+            logits: Raw model logits, shape (N, num_classes).
+
+        Returns:
+            Calibrated probabilities, shape (N, num_classes).
+        """
+        scaled = self.scale(logits)
+        # Numerically stable softmax
+        exp = np.exp(scaled - np.max(scaled, axis=1, keepdims=True))
+        return exp / np.sum(exp, axis=1, keepdims=True)
+
+    def save(self, path: str) -> None:
+        """Persist the learned temperature to disk."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as f:
+            json.dump({"temperature": self.temperature}, f, indent=2)
+        logger.info(f"TemperatureScaler saved to {p}")
+
+    def load(self, path: str) -> None:
+        """Load a previously saved temperature from disk."""
+        with open(path) as f:
+            data = json.load(f)
+        self.temperature = float(data["temperature"])
+        self._is_fitted = True
+        logger.info(f"TemperatureScaler loaded: T = {self.temperature:.4f}")
+
+        

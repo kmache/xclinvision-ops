@@ -1,3 +1,4 @@
+# Swin-T — model-specific overrides (merged on top of system.yaml)
 name: swin_t
 type: transformer
 
@@ -6,8 +7,6 @@ architecture:
   pretrained: true
   num_classes: 3
   dropout_rate: 0.2
-  
-  # Custom head for Swin Transformer
   head:
     type: sequential
     layers:
@@ -17,7 +16,7 @@ architecture:
       - type: dropout
         p: 0.2
       - type: linear
-        in_features: 768
+        in_features: 768  # Swin-T feature dim
         out_features: 256
       - type: gelu
       - type: dropout
@@ -26,7 +25,6 @@ architecture:
         in_features: 256
         out_features: 3
 
-# Transfer learning strategy
 transfer_learning:
   freeze_backbone: false
   differential_lr:
@@ -34,34 +32,20 @@ transfer_learning:
     backbone_lr: 5.0e-6
     head_lr: 5.0e-5
 
+# Override system defaults where this model differs
 input:
-  size: [224, 224]  # Swin is trained on 224x224
-  channels: 3
-  normalize:
-    mean: [0.485, 0.456, 0.406]
-    std: [0.229, 0.224, 0.225]
+  size: [224, 224]  # Swin is pre-trained at 224
 
 training:
-  batch_size: 16  # Smaller batch for transformer
-  epochs: 100
+  batch_size: 16  # Smaller batch for transformer memory
   gradient_accumulation_steps: 2
-  
   optimizer:
-    name: adamw
     lr: 5.0e-5
     weight_decay: 0.05
     betas: [0.9, 0.999]
-    
   scheduler:
-    name: cosine_warmup
     warmup_epochs: 10
     min_lr: 1.0e-7
-
-uncertainty:
-  temperature_scaling: true
-  mc_dropout:
-    enabled: true
-    num_samples: 10
 
 explainability:
   method: attention_rollout

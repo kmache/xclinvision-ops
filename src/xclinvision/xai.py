@@ -1,221 +1,621 @@
-"""Explainability (XAI) module for generating clinical heatmaps."""
+"""Explainability (XAI) module for generating clinical-grade heatmaps.
 
-from typing import Dict, List, Optional, Tuple, Union
+Provides Grad-CAM++ visualizations, anatomical region scoring, and a
+``ValidationXAI`` harness consumed by training callbacks.
+
+No external ``pytorch-grad-cam`` dependency — the Grad-CAM++ algorithm is
+implemented from scratch so the package stays lightweight in production.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import cv2
 import numpy as np
 import torch
-import cv2
-from PIL import Image
+import torch.nn as nn
+import torch.nn.functional as F
 
-try:
-    from pytorch_grad_cam import GradCAM, GradCAMPlusPlus
-    from pytorch_grad_cam.utils.image import show_cam_on_image
-    GRADCAM_AVAILABLE = True
-except ImportError:
-    GRADCAM_AVAILABLE = False
+logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Constants & Radiological Mappings
+# ---------------------------------------------------------------------------
+
+DEFAULT_CLASS_NAMES: List[str] = ["Normal", "Pneumonia", "Tuberculosis"]
+
+LUNG_REGIONS: Dict[str, Tuple[float, float, float, float]] = {
+    # Patient RIGHT lung is on the LEFT side of the image (x: 0.0 to 0.5)
+    "right_upper":  (0.00, 0.00, 0.50, 0.33),
+    "right_middle": (0.00, 0.33, 0.50, 0.66),
+    "right_lower":  (0.00, 0.66, 0.50, 1.00),
+
+    # Patient LEFT lung is on the RIGHT side of the image (x: 0.5 to 1.0)
+    "left_upper":   (0.50, 0.00, 1.00, 0.33),
+    "left_middle":  (0.50, 0.33, 1.00, 0.66),
+    "left_lower":   (0.50, 0.66, 1.00, 1.00),
+    
+    # Central and upper structures
+    "hilar":        (0.30, 0.30, 0.70, 0.70),
+    "cardiac":      (0.40, 0.40, 0.60, 0.80),
+    "apical":       (0.20, 0.00, 0.80, 0.25),
+}
+
+#: ImageNet statistics — used for normalization.
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+# =========================================================================
+# Grad-CAM++ (standalone implementation)
+# =========================================================================
+
+class GradCAMPlusPlus:
+    """Grad-CAM++: Generalized Gradient-based Visual Explanations."""
+
+    def __init__(self, model: nn.Module, target_layer: nn.Module) -> None:
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients: Optional[torch.Tensor] = None
+        self.activations: Optional[torch.Tensor] = None
+        self._fwd_handle: Optional[torch.utils.hooks.RemovableHandle] = None
+        self._bwd_handle: Optional[torch.utils.hooks.RemovableHandle] = None
+        self._register_hooks()
+
+    def _register_hooks(self) -> None:
+        def _fwd(module: nn.Module, inp: Any, output: torch.Tensor) -> None:
+            self.activations = output.detach()
+
+        def _bwd(module: nn.Module, grad_input: Any, grad_output: Any) -> None:
+            self.gradients = grad_output[0].detach()
+
+        self._fwd_handle = self.target_layer.register_forward_hook(_fwd)
+        self._bwd_handle = self.target_layer.register_full_backward_hook(_bwd)
+
+    def remove_hooks(self) -> None:
+        if self._fwd_handle is not None:
+            self._fwd_handle.remove()
+        if self._bwd_handle is not None:
+            self._bwd_handle.remove()
+
+    @torch.enable_grad()
+    def generate(
+        self,
+        input_tensor: torch.Tensor,
+        target_class: Optional[int] = None,
+    ) -> Tuple[np.ndarray, int]:
+        with torch.set_grad_enabled(True):
+            self.model.eval()
+            self.model.zero_grad()
+
+            # Input MUST require grad to build computation graph
+            input_tensor = input_tensor.clone().detach().requires_grad_(True)
+
+            output = self.model(input_tensor)
+
+            if target_class is None:
+                target_class = output.argmax(dim=1).item()
+
+            one_hot = torch.zeros_like(output)
+            one_hot[0, target_class] = 1.0
+            
+            # retain_graph=False prevents severe memory leaks
+            output.backward(gradient=one_hot, retain_graph=False)
+
+        if self.gradients is None or self.activations is None:
+            raise RuntimeError(
+                "Grad-CAM++ hooks did not fire. Verify that target_layer is part "
+                "of the computation graph for the given input."
+            )
+
+        grads = self.gradients[0]
+        acts = self.activations[0]
+
+        if acts.ndim != 3:
+            raise RuntimeError(
+                f"Expected 2D spatial feature map (C, H, W), got {acts.shape}. "
+                "Ensure target_layer points to a Conv2d or reshaped Swin layer."
+            )
+
+        grad_2 = grads ** 2
+        grad_3 = grads ** 3
+
+        alpha_denom = 2.0 * grad_2 + (acts * grad_3).sum(dim=(1, 2), keepdim=True)
+        alpha_denom = torch.where(
+            alpha_denom != 0.0,
+            alpha_denom,
+            torch.ones_like(alpha_denom),
+        )
+        alphas = grad_2 / (alpha_denom + 1e-8)
+        weights = (alphas * F.relu(grads)).sum(dim=(1, 2))
+
+        cam = F.relu((weights.view(-1, 1, 1) * acts).sum(dim=0))
+
+        cam_min, cam_max = cam.min(), cam.max()
+        cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
+
+        cam = F.interpolate(
+            cam.unsqueeze(0).unsqueeze(0),
+            size=input_tensor.shape[2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        return cam.squeeze().cpu().numpy(), target_class
+
+
+# =========================================================================
+# Overlay & Region Scoring
+# =========================================================================
+
+def create_overlay(
+    image: np.ndarray,
+    heatmap: np.ndarray,
+    alpha: float = 0.5,
+    colormap: int = cv2.COLORMAP_JET,
+) -> np.ndarray:
+    if image.dtype != np.uint8:
+        base = np.clip(image * 255, 0, 255).astype(np.uint8)
+    else:
+        base = image.copy()
+
+    if base.ndim == 3 and base.shape[2] == 3:
+        base = cv2.cvtColor(base, cv2.COLOR_RGB2BGR)
+
+    if heatmap.shape[:2] != base.shape[:2]:
+        heatmap = cv2.resize(heatmap, (base.shape[1], base.shape[0]))
+
+    coloured = cv2.applyColorMap(np.uint8(255 * np.clip(heatmap, 0, 1)), colormap)
+    return cv2.addWeighted(base, 1.0 - alpha, coloured, alpha, 0)
+
+
+def score_lung_regions(
+    cam: np.ndarray,
+    regions: Optional[Dict[str, Tuple[float, float, float, float]]] = None,
+) -> Dict[str, float]:
+    regions = regions or LUNG_REGIONS
+    h, w = cam.shape[:2]
+    scores: Dict[str, float] = {}
+
+    for name, (x1, y1, x2, y2) in regions.items():
+        r = cam[int(y1 * h):int(y2 * h), int(x1 * w):int(x2 * w)]
+        scores[name] = float(r.mean()) if r.size > 0 else 0.0
+
+    return scores
+
+
+# =========================================================================
+# Clinical findings & Plausibility
+# =========================================================================
+
+def extract_findings(
+    region_scores: Dict[str, float],
+    class_name: str,
+    confidence: float,
+    *,
+    high_threshold: float = 0.30,
+    center_threshold: float = 0.35,
+) -> List[str]:
+    findings: List[str] = []
+    if not region_scores:
+        return findings
+
+    top_region = max(region_scores, key=region_scores.get)
+    top_score = region_scores[top_region]
+    if top_score > high_threshold:
+        findings.append(
+            f"Highest activation in {top_region.replace('_', ' ')} "
+            f"(score {top_score:.2f})"
+        )
+
+    for key in ("hilar", "cardiac"):
+        if region_scores.get(key, 0.0) > center_threshold:
+            findings.append(f"Notable {key} activation ({region_scores[key]:.2f})")
+
+    left_sum = sum(region_scores.get(f"left_{z}", 0.0) for z in ("upper", "middle", "lower"))
+    right_sum = sum(region_scores.get(f"right_{z}", 0.0) for z in ("upper", "middle", "lower"))
+    total = left_sum + right_sum
+
+    if total > 0.3:
+        ratio = left_sum / (right_sum + 1e-8)
+        if 0.6 < ratio < 1.7:
+            findings.append("Bilateral distribution pattern")
+        elif ratio >= 1.7:
+            findings.append("Left-sided predominance")
+        else:
+            findings.append("Right-sided predominance")
+
+    apical = region_scores.get("apical", 0.0)
+    basal = (region_scores.get("left_lower", 0.0) + region_scores.get("right_lower", 0.0)) / 2.0
+    
+    if apical > basal * 1.5 and apical > high_threshold:
+        findings.append("Apical predominance (often associated with Tuberculosis)")
+    elif basal > apical * 1.5 and basal > high_threshold:
+        findings.append("Basal predominance (often associated with Pneumonia)")
+
+    if confidence < 0.5:
+        findings.append(f"Low confidence ({confidence:.0%}) for {class_name} — review recommended")
+
+    return findings
+
+
+def clinical_plausibility_score(
+    region_scores: Dict[str, float],
+    class_name: str,
+) -> float:
+    if not region_scores:
+        return 0.0
+
+    lung_scores = [v for k, v in region_scores.items() if k != "cardiac"]
+    mean_lung = float(np.mean(lung_scores)) if lung_scores else 0.0
+    activation_range = max(region_scores.values()) - min(region_scores.values())
+
+    score = 0.5
+    class_name_lower = class_name.lower()
+
+    if "normal" in class_name_lower:
+        if mean_lung < 0.15:
+            score += 0.3
+        elif mean_lung < 0.25:
+            score += 0.1
+    elif "pneumonia" in class_name_lower:
+        basal = (region_scores.get("left_lower", 0) + region_scores.get("right_lower", 0)) / 2
+        mid = (region_scores.get("left_middle", 0) + region_scores.get("right_middle", 0)) / 2
+        if basal > 0.2 or mid > 0.2:
+            score += 0.3
+    elif "tuberculosis" in class_name_lower or "tb" in class_name_lower:
+        apical = region_scores.get("apical", 0)
+        upper = (region_scores.get("left_upper", 0) + region_scores.get("right_upper", 0)) / 2
+        if apical > 0.2 or upper > 0.2:
+            score += 0.3
+
+    if activation_range > 0.1:
+        score += 0.15
+
+    return float(np.clip(score, 0.0, 1.0))
+
+
+# =========================================================================
+# CAM Quality Control
+# =========================================================================
+
+@dataclass
+class CAMQualityReport:
+    total_activation: float = 0.0
+    max_activation: float = 0.0
+    coverage: float = 0.0  
+    is_degenerate: bool = False  
+    lung_focus_ratio: float = 0.0  
+
+    @property
+    def passes_qc(self) -> bool:
+        return (not self.is_degenerate) and (self.lung_focus_ratio > 0.20)
+
+def assess_cam_quality(
+    cam: np.ndarray,
+    threshold: float = 0.15,
+    degenerate_low: float = 0.005,
+    degenerate_high: float = 0.995,
+) -> CAMQualityReport:
+    total = float(cam.mean())
+    mx = float(cam.max())
+    pixels_above = float((cam > threshold).mean())
+    is_deg = total < degenerate_low or total > degenerate_high
+
+    h, w = cam.shape[:2]
+    lung_mask = np.zeros((h, w), dtype=np.float32)
+    for name, (x1, y1, x2, y2) in LUNG_REGIONS.items():
+        if name == "cardiac":
+            continue 
+        lung_mask[int(y1 * h):int(y2 * h), int(x1 * w):int(x2 * w)] = 1.0
+    lung_mask = np.clip(lung_mask, 0, 1)
+
+    lung_act = float((cam * lung_mask).sum())
+    total_act = float(cam.sum()) + 1e-8
+    lung_ratio = lung_act / total_act
+
+    return CAMQualityReport(
+        total_activation=total,
+        max_activation=mx,
+        coverage=pixels_above,
+        is_degenerate=is_deg,
+        lung_focus_ratio=lung_ratio,
+    )
+
+
+# =========================================================================
+# ExplainabilityEngine
+# =========================================================================
 
 class ExplainabilityEngine:
     """Generate clinical explanations for model predictions."""
-    
+
     def __init__(
         self,
-        model: torch.nn.Module,
-        method: str = "gradcam++",
-        target_layer: Optional[str] = None,
-    ):
+        model: nn.Module,
+        class_names: List[str] = DEFAULT_CLASS_NAMES,
+        architecture: str = "unknown",
+        target_layer: Optional[nn.Module] = None,
+        device: str = "cpu",
+        img_size: int = 384,
+    ) -> None:
         self.model = model
-        self.method = method
-        self.target_layer = target_layer
-        
-        if not GRADCAM_AVAILABLE:
-            raise ImportError("pytorch-grad-cam is required for explainability")
-            
-    def _get_target_layer(self) -> torch.nn.Module:
-        """Get the target layer for gradient computation."""
-        if self.target_layer is None:
-            # Auto-detect based on model type
-            if hasattr(self.model, 'backbone'):
-                if 'efficientnet' in str(type(self.model.backbone)).lower():
-                    return self.model.backbone.blocks[-1]
-                elif 'resnet' in str(type(self.model.backbone)).lower():
-                    return self.model.backbone.layer4[-1]
-                elif 'swin' in str(type(self.model.backbone)).lower():
-                    return self.model.backbone.layers[-1]
-        
-        # Try to find layer by name
-        for name, module in self.model.named_modules():
-            if name == self.target_layer:
-                return module
-                
-        # Default: last convolutional layer
-        for m in reversed(list(self.model.modules())):
-            if isinstance(m, (torch.nn.Conv2d, torch.nn.ConvTranspose2d)):
-                return m
-                
-        raise ValueError("Could not find suitable target layer")
-    
+        self.class_names = class_names
+        self.architecture = architecture
+        self.device = device
+        self.img_size = img_size
+        self._target_layer = target_layer or self._resolve_target_layer()
+
+        if self._target_layer is None:
+            logger.warning("Could not auto-detect Grad-CAM target layer.")
+
+    def _resolve_target_layer(self) -> Optional[nn.Module]:
+        if hasattr(self.model, "get_gradcam_target"):
+            return self.model.get_gradcam_target()
+
+        last_conv: Optional[nn.Module] = None
+        for m in self.model.modules():
+            if isinstance(m, nn.Conv2d):
+                last_conv = m
+        return last_conv
+
+    def _preprocess(self, image: np.ndarray) -> torch.Tensor:
+        img = image.copy()
+        if img.dtype == np.uint8:
+            img = img.astype(np.float32) / 255.0
+
+        # Ensure 3-channel RGB
+        if img.ndim == 2:
+            img = np.stack([img, img, img], axis=-1)
+        elif img.ndim == 3 and img.shape[2] == 1:
+            img = np.concatenate([img, img, img], axis=-1)
+
+        if img.shape[:2] != (self.img_size, self.img_size):
+            img = cv2.resize(img, (self.img_size, self.img_size))
+
+        normalised = (img - IMAGENET_MEAN) / IMAGENET_STD
+        tensor = torch.from_numpy(normalised).permute(2, 0, 1).unsqueeze(0).float()
+        return tensor.to(self.device)
+
     def generate_heatmap(
         self,
-        image: np.ndarray,
+        input_data: Union[np.ndarray, torch.Tensor],
+        original_image: Optional[np.ndarray] = None,
         target_class: Optional[int] = None,
         alpha: float = 0.5,
-    ) -> Dict:
-        """Generate Grad-CAM++ heatmap for the image."""
-        target_layer = self._get_target_layer()
-        
-        # Initialize GradCAM
-        if self.method == "gradcam++":
-            cam = GradCAMPlusPlus(
-                model=self.model,
-                target_layers=[target_layer],
-            )
+    ) -> Dict[str, Any]:
+        """Generate heatmap. Accepts preprocessed Tensor or raw Numpy array."""
+        if self._target_layer is None:
+            raise RuntimeError("No target layer available.")
+
+        # Handle double forward-pass prevention
+        if isinstance(input_data, torch.Tensor):
+            if original_image is None:
+                raise ValueError("original_image required if passing a Tensor.")
+            input_tensor = input_data
+            vis_image = original_image.copy()
         else:
-            cam = GradCAM(
-                model=self.model,
-                target_layers=[target_layer],
-            )
-            
-        # Prepare input
-        if isinstance(image, np.ndarray):
-            if image.dtype == np.uint8:
-                image = image.astype(np.float32) / 255.0
-                
-        # Generate CAM
-        grayscale_cam = cam(
-            input_tensor=self._preprocess(image),
-            targets=self._get_cam_target(target_class),
-        )
-        
-        # Overlay on original image
-        heatmap = show_cam_on_image(
-            image,
-            grayscale_cam[0],
-            use_rgb=True,
-            colormap=cv2.COLORMAP_JET,
-        )
-        
-        # Compute region importance scores
-        region_scores = self._compute_region_scores(grayscale_cam[0])
-        
+            input_tensor = self._preprocess(input_data)
+            vis_image = input_data.copy()
+            # Ensure vis_image is 3-channel so create_overlay never receives a 2D array
+            if vis_image.ndim == 2:
+                vis_image = np.stack([vis_image, vis_image, vis_image], axis=-1)
+            elif vis_image.ndim == 3 and vis_image.shape[2] == 1:
+                vis_image = np.concatenate([vis_image, vis_image, vis_image], axis=-1)
+
+        cam_gen = GradCAMPlusPlus(self.model, self._target_layer)
+        try:
+            grayscale_cam, used_class = cam_gen.generate(input_tensor, target_class=target_class)
+        finally:
+            cam_gen.remove_hooks()
+
+        if vis_image.dtype == np.uint8:
+            vis_image = vis_image.astype(np.float32) / 255.0
+        if vis_image.shape[:2] != grayscale_cam.shape[:2]:
+            vis_image = cv2.resize(vis_image, (grayscale_cam.shape[1], grayscale_cam.shape[0]))
+
+        overlay = create_overlay(vis_image, grayscale_cam, alpha=alpha)
+        region_scores = score_lung_regions(grayscale_cam)
+        quality = assess_cam_quality(grayscale_cam)
+
         return {
-            "heatmap": heatmap,
-            "grayscale_cam": grayscale_cam[0],
+            "heatmap": overlay,
+            "grayscale_cam": grayscale_cam,
             "region_scores": region_scores,
-            "target_class": target_class,
-            "method": self.method,
+            "quality": quality,
+            "target_class": used_class,
+            "method": "gradcam++",
         }
-    
-    def _preprocess(self, image: np.ndarray) -> torch.Tensor:
-        """Preprocess image for CAM generation."""
-        # Resize if needed
-        if image.shape[:2] != (384, 384):
-            image = cv2.resize(image, (384, 384))
-            
-        # Normalize
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
-        normalized = (image - mean) / std
-        
-        # Convert to tensor
-        tensor = torch.from_numpy(normalized).permute(2, 0, 1).unsqueeze(0)
-        return tensor.float()
-    
-    def _get_cam_target(self, target_class: Optional[int]):
-        """Get CAM target for specified class."""
-        from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-        
-        if target_class is None:
-            # Use predicted class
-            return None
-        return [ClassifierOutputTarget(target_class)]
-    
-    def _compute_region_scores(self, grayscale_cam: np.ndarray) -> Dict:
-        """Compute importance scores for image regions."""
-        h, w = grayscale_cam.shape
-        
-        # Divide into regions
-        regions = {
-            "left_upper": grayscale_cam[:h//2, :w//2].mean(),
-            "right_upper": grayscale_cam[:h//2, w//2:].mean(),
-            "left_lower": grayscale_cam[h//2:, :w//2].mean(),
-            "right_lower": grayscale_cam[h//2:, w//2:].mean(),
-            "center": grayscale_cam[h//4:3*h//4, w//4:3*w//4].mean(),
-        }
-        
-        return regions
-    
-    def generate_attention_rollout(
-        self,
-        image: np.ndarray,
-        target_class: Optional[int] = None,
-    ) -> Dict:
-        """Generate attention rollout for transformer models."""
-        # Implementation for Swin/ViT models
-        # This requires specific attention extraction
-        
-        return {
-            "heatmap": None,
-            "method": "attention_rollout",
-            "note": "Attention rollout requires transformer-specific implementation",
-        }
-    
+
     def explain_prediction(
         self,
         image: np.ndarray,
         prediction: int,
         confidence: float,
-    ) -> Dict:
-        """Generate complete explanation for a prediction."""
-        # Generate heatmap
+    ) -> Dict[str, Any]:
         heatmap_result = self.generate_heatmap(image, target_class=prediction)
         
-        # Build explanation
-        explanation = {
-            "prediction": prediction,
-            "confidence": confidence,
-            "class_name": ["Normal", "Pneumonia", "Tuberculosis"][prediction],
-            "visualization": heatmap_result,
-            "key_findings": self._extract_key_findings(heatmap_result),
-        }
-        
-        return explanation
-    
-    def _extract_key_findings(self, heatmap_result: Dict) -> List[str]:
-        """Extract key findings from heatmap analysis."""
-        findings = []
-        scores = heatmap_result["region_scores"]
-        
-        # Find most activated regions
-        max_region = max(scores, key=scores.get)
-        max_score = scores[max_region]
-        
-        if max_score > 0.3:
-            findings.append(f"High activation in {max_region.replace('_', ' ')} region")
-            
-        if scores["center"] > 0.4:
-            findings.append("Significant findings in central lung fields")
-            
-        # Check for bilateral patterns
-        left_total = scores["left_upper"] + scores["left_lower"]
-        right_total = scores["right_upper"] + scores["right_lower"]
-        
-        if abs(left_total - right_total) < 0.1 and (left_total + right_total) > 0.5:
-            findings.append("Bilateral pattern detected")
-        elif left_total > right_total * 2:
-            findings.append("Left-sided predominance")
-        elif right_total > left_total * 2:
-            findings.append("Right-sided predominance")
-            
-        return findings
+        class_name = (
+            self.class_names[prediction] 
+            if prediction < len(self.class_names) 
+            else f"class_{prediction}"
+        )
 
+        findings = extract_findings(
+            heatmap_result["region_scores"],
+            class_name=class_name,
+            confidence=confidence,
+        )
+
+        plausibility = clinical_plausibility_score(
+            heatmap_result["region_scores"],
+            class_name=class_name,
+        )
+
+        return {
+            "prediction": prediction,
+            "class_name": class_name,
+            "confidence": confidence,
+            "visualization": heatmap_result,
+            "key_findings": findings,
+            "clinical_plausibility": plausibility,
+            "quality": heatmap_result["quality"],
+        }
+
+
+# =========================================================================
+# ValidationXAI — trainer integration
+# =========================================================================
+
+class ValidationXAI:
+    """Batch XAI validation for training-loop integration."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        architecture: str,
+        output_dir: Union[str, Path],
+        class_names: List[str] = DEFAULT_CLASS_NAMES,
+        img_size: int = 384,
+        device: Optional[str] = None,
+    ) -> None:
+        self.model = model
+        self.architecture = architecture
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.class_names = class_names
+        self.img_size = img_size
+
+        if device is None:
+            device = str(next(model.parameters()).device)
+        self.device = device
+
+        self.engine = ExplainabilityEngine(
+            model,
+            class_names=class_names,
+            architecture=architecture,
+            device=self.device,
+            img_size=img_size,
+        )
+
+    def process_dataset(
+        self,
+        dataloader: Any,
+        max_samples: int = 100,
+    ) -> Dict[str, Any]:
+        self.model.eval()
+        processed = 0
+        plausibility_scores: List[float] = []
+        qc_failures = 0
+        per_class: Dict[int, List[float]] = defaultdict(list)
+        region_accum: Dict[str, List[float]] = defaultdict(list)
+
+        for batch in dataloader:
+            if processed >= max_samples:
+                break
+
+            images, labels = batch[0], batch[1]
+
+            for i in range(images.size(0)):
+                if processed >= max_samples:
+                    break
+
+                try:
+                    img_np = self._tensor_to_numpy(images[i])
+                    label = int(labels[i].item())
+                    tensor_batch = images[i : i + 1].to(self.device)
+
+                    # Pass tensor directly to avoid double forward pass
+                    result = self.engine.generate_heatmap(
+                        input_data=tensor_batch,
+                        original_image=img_np,
+                        target_class=label,
+                    )
+                    
+                    region_scores = result["region_scores"]
+                    quality: CAMQualityReport = result["quality"]
+                    class_name = self.class_names[label] if label < len(self.class_names) else f"class_{label}"
+
+                    plaus = clinical_plausibility_score(region_scores, class_name)
+                    plausibility_scores.append(plaus)
+                    per_class[label].append(plaus)
+
+                    if not quality.passes_qc:
+                        qc_failures += 1
+
+                    for rname, rscore in region_scores.items():
+                        region_accum[rname].append(rscore)
+
+                except Exception as exc:
+                    logger.warning("XAI failed for sample %d: %s", processed, exc)
+                    qc_failures += 1
+
+                processed += 1
+
+        mean_plaus = float(np.mean(plausibility_scores)) if plausibility_scores else 0.0
+        qc_rate = qc_failures / max(processed, 1)
+        region_summary = {k: float(np.mean(v)) for k, v in region_accum.items()}
+
+        per_class_summary = {}
+        for cls_idx, scores in per_class.items():
+            cname = self.class_names[cls_idx] if cls_idx < len(self.class_names) else f"class_{cls_idx}"
+            per_class_summary[cname] = {
+                "mean_plausibility": float(np.mean(scores)),
+                "n_samples": len(scores),
+            }
+
+        metrics = {
+            "n_samples": processed,
+            "clinical_plausibility": {
+                "score": mean_plaus,
+                "is_acceptable": mean_plaus >= 0.5,
+            },
+            "qc_failure_rate": qc_rate,
+            "region_activation_summary": region_summary,
+            "per_class_stats": per_class_summary,
+        }
+
+        report_path = self.output_dir / "xai_report.json"
+        try:
+            with open(report_path, "w") as f:
+                json.dump(metrics, f, indent=2, default=str)
+        except Exception as exc:
+            logger.warning("Could not save XAI report: %s", exc)
+
+        return metrics
+
+    @staticmethod
+    def _tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
+        img = tensor.cpu().numpy().transpose(1, 2, 0)
+        img = img * IMAGENET_STD + IMAGENET_MEAN
+        img = np.clip(img * 255, 0, 255).astype(np.uint8)
+        return img
+
+
+# =========================================================================
+# Public convenience function 
+# =========================================================================
 
 def generate_explanation(
-    model: torch.nn.Module,
+    model: nn.Module,
     image: np.ndarray,
     prediction: int,
     confidence: float,
-    method: str = "gradcam++",
-) -> Dict:
-    """Convenience function to generate explanation."""
-    engine = ExplainabilityEngine(model, method=method)
+    class_names: List[str] = DEFAULT_CLASS_NAMES,
+    architecture: str = "unknown",
+    device: str = "cpu",
+    img_size: int = 384,
+) -> Dict[str, Any]:
+    engine = ExplainabilityEngine(
+        model,
+        class_names=class_names,
+        architecture=architecture,
+        device=device,
+        img_size=img_size,
+    )
     return engine.explain_prediction(image, prediction, confidence)

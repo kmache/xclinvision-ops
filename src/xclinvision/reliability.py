@@ -1,30 +1,79 @@
 """Reliability analysis and robustness testing."""
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
-from sklearn.metrics import pairwise_distances
+import cv2
+from xclinvision.dataset import get_val_transforms
 
 
 class ReliabilityAnalyzer:
     """Analyze model reliability and robustness."""
     
-    def __init__(self, model: torch.nn.Module, device: str = "cuda"):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    ):
         self.model = model
         self.device = device
         
     def compute_feature_embeddings(
         self,
-        images: np.ndarray,
+        images: Union[np.ndarray, List[np.ndarray]],
     ) -> np.ndarray:
         """Extract feature embeddings from model."""
         self.model.eval()
         embeddings = []
         
+        # Determine image size from model if possible, default to 224
+        img_size = 224
+        if hasattr(self.model, "default_cfg") and "input_size" in self.model.default_cfg:
+            img_size = self.model.default_cfg["input_size"][-1]
+            
+        transform = get_val_transforms(image_size=img_size)
+        
+        if isinstance(images, np.ndarray):
+            # If it's a single image, wrap it in a list. If it's a batch, list(images) will work too.
+            if images.ndim == 3 or images.ndim == 2:
+                images = [images]
+            else:
+                images = list(images)
+                
         with torch.no_grad():
             for img in images:
-                img_tensor = torch.from_numpy(img).unsqueeze(0).to(self.device)
-                features = self.model.get_features(img_tensor)
+                # Ensure input is an RGB image (H, W, 3) 
+                if img.ndim == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                elif img.ndim == 3 and img.shape[2] == 1:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                elif img.ndim == 3 and img.shape[2] == 4:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+                    
+                # Apply normalization and shape alignment [C, H, W]
+                transformed = transform(image=img)
+                img_tensor = transformed["image"].unsqueeze(0).to(self.device).float()
+                
+                # Extract features safely depending on the model's architecture
+                if hasattr(self.model, "vision_encoder"):
+                    # BiomedCLIP specific
+                    features = self.model.vision_encoder(img_tensor)
+                elif hasattr(self.model, "forward_features"):
+                    # Native timm models
+                    features = self.model.forward_features(img_tensor)
+                    if hasattr(self.model, "global_pool") and features.ndim > 2:
+                        features = self.model.global_pool(features)
+                    elif features.ndim > 2:
+                        features = features.mean(dim=[-2, -1]) if features.ndim == 4 else features.mean(dim=1)
+                elif hasattr(self.model, "get_features"):
+                    # General get_features method
+                    features = self.model.get_features(img_tensor)
+                else:
+                    # Fallback (returns output from base forward if no better method is found)
+                    features = self.model(img_tensor)
+                    if features.ndim > 2:
+                        features = features.mean(dim=[-2, -1]) if features.ndim == 4 else features.mean(dim=1)
+                        
                 embeddings.append(features.cpu().numpy().flatten())
                 
         return np.array(embeddings)
@@ -35,7 +84,11 @@ class ReliabilityAnalyzer:
         train_embeddings: np.ndarray,
         threshold_percentile: float = 95.0,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Detect OOD samples using Mahalanobis distance."""
+        """Detect OOD samples using Mahalanobis distance.
+
+        The decision threshold is derived from *training* distances so it
+        reflects the learned distribution rather than the test set itself.
+        """
         # Compute mean and covariance of training embeddings
         train_mean = np.mean(train_embeddings, axis=0)
         train_cov = np.cov(train_embeddings.T)
@@ -49,22 +102,20 @@ class ReliabilityAnalyzer:
         except np.linalg.LinAlgError:
             inv_cov = np.linalg.pinv(train_cov)
         
-        # Compute Mahalanobis distances
-        distances = []
-        for emb in test_embeddings:
-            diff = emb - train_mean
-            dist = np.sqrt(diff @ inv_cov @ diff)
-            distances.append(dist)
-            
-        distances = np.array(distances)
+        def _mahalanobis(embeddings: np.ndarray) -> np.ndarray:
+            diffs = embeddings - train_mean
+            # Vectorised: sqrt(diag(diffs @ inv_cov @ diffs.T))
+            return np.sqrt(np.einsum("ij,jk,ik->i", diffs, inv_cov, diffs))
+
+        # Threshold derived from the training set
+        train_distances = _mahalanobis(train_embeddings)
+        threshold = np.percentile(train_distances, threshold_percentile)
+
+        # Compute test distances and flag OOD samples
+        test_distances = _mahalanobis(test_embeddings)
+        is_ood = test_distances > threshold
         
-        # Determine threshold
-        threshold = np.percentile(distances, threshold_percentile)
-        
-        # Flag OOD samples
-        is_ood = distances > threshold
-        
-        return is_ood, distances
+        return is_ood, test_distances
     
     def compute_embedding_drift(
         self,
@@ -88,8 +139,12 @@ class ReliabilityAnalyzer:
         else:
             fid = np.sum(diff ** 2) + np.trace(sigma_train + sigma_test - 2 * covmean)
             
-        # Cosine distance between means
-        cosine_dist = 1 - np.dot(mu_train, mu_test) / (np.linalg.norm(mu_train) * np.linalg.norm(mu_test))
+        # Cosine distance between means (guarded against zero-norm)
+        norm_product = np.linalg.norm(mu_train) * np.linalg.norm(mu_test)
+        if norm_product == 0:
+            cosine_dist = 1.0  # maximally dissimilar when a mean is zero
+        else:
+            cosine_dist = 1 - np.dot(mu_train, mu_test) / norm_product
         
         return {
             "frechet_distance": float(fid),
@@ -107,7 +162,7 @@ class ReliabilityAnalyzer:
         self,
         image: np.ndarray,
         pipeline,
-        perturbations: List[str] = None,
+        perturbations: Optional[List[str]] = None,
     ) -> Dict:
         """Test model robustness to various perturbations."""
         if perturbations is None:
@@ -146,7 +201,13 @@ class ReliabilityAnalyzer:
         severity: float = 0.1,
     ) -> np.ndarray:
         """Apply perturbation to image."""
-        import cv2
+        try:
+            import cv2
+        except ImportError as exc:
+            raise ImportError(
+                "opencv-python is required for robustness perturbations. "
+                "Install it with: pip install opencv-python"
+            ) from exc
         
         perturbed = image.copy()
         
@@ -171,7 +232,7 @@ class ReliabilityAnalyzer:
 class FailureAnalyzer:
     """Analyze model failure modes."""
     
-    def __init__(self, class_names: List[str] = None):
+    def __init__(self, class_names: Optional[List[str]] = None):
         self.class_names = class_names or ["Normal", "Pneumonia", "Tuberculosis"]
         
     def analyze_failures(
@@ -179,13 +240,12 @@ class FailureAnalyzer:
         y_true: np.ndarray,
         y_pred: np.ndarray,
         y_probs: np.ndarray,
-        images: Optional[List] = None,
     ) -> Dict:
         """Analyze failure patterns."""
         failures = {
             "false_positives": {},
             "false_negatives": {},
-            "high_confidence_errors": [],
+            "high_confidence_errors": {},
         }
         
         for i, class_name in enumerate(self.class_names):

@@ -1,7 +1,7 @@
 """MLOps monitoring and experiment tracking."""
 
-from typing import Dict, List, Optional, Any
-import os
+from collections import Counter, deque
+from typing import Any, Deque, Dict, List, Optional
 import json
 from datetime import datetime
 from pathlib import Path
@@ -12,59 +12,6 @@ try:
     MLFLOW_AVAILABLE = True
 except ImportError:
     MLFLOW_AVAILABLE = False
-
-
-class ExperimentTracker:
-    """Track experiments with MLflow."""
-    
-    def __init__(
-        self,
-        experiment_name: str = "xclinvision",
-        tracking_uri: Optional[str] = None,
-        tags: Optional[Dict[str, str]] = None,
-    ):
-        self.experiment_name = experiment_name
-        self.tags = tags or {}
-        
-        if MLFLOW_AVAILABLE:
-            if tracking_uri:
-                mlflow.set_tracking_uri(tracking_uri)
-            mlflow.set_experiment(experiment_name)
-        else:
-            print("Warning: MLflow not available. Logging to local files only.")
-            
-    def start_run(self, run_name: Optional[str] = None):
-        """Start a new experiment run."""
-        if MLFLOW_AVAILABLE:
-            return mlflow.start_run(run_name=run_name)
-        return None
-        
-    def end_run(self):
-        """End current run."""
-        if MLFLOW_AVAILABLE:
-            mlflow.end_run()
-            
-    def log_params(self, params: Dict[str, Any]):
-        """Log parameters."""
-        if MLFLOW_AVAILABLE:
-            for key, value in params.items():
-                mlflow.log_param(key, value)
-                
-    def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None):
-        """Log metrics."""
-        if MLFLOW_AVAILABLE:
-            for key, value in metrics.items():
-                mlflow.log_metric(key, value, step=step)
-                
-    def log_model(self, model, artifact_path: str = "model"):
-        """Log model artifact."""
-        if MLFLOW_AVAILABLE:
-            mlflow.pytorch.log_model(model, artifact_path)
-            
-    def log_artifact(self, local_path: str, artifact_path: Optional[str] = None):
-        """Log file artifact."""
-        if MLFLOW_AVAILABLE:
-            mlflow.log_artifact(local_path, artifact_path)
 
 
 class ModelRegistry:
@@ -102,13 +49,24 @@ class ModelRegistry:
         self,
         name: str,
         version: int,
-        stage: str,  # Staging, Production, Archived
+        stage: str,  # "Staging", "Production", "Archived"
     ):
-        """Transition model to a new stage."""
+        """Transition model to a new stage.
+
+        Note: transition_model_version_stage is deprecated in MLflow >= 2.0.
+        For MLflow >= 2.0, prefer using aliases:
+            client.set_registered_model_alias(name, alias, version)
+        """
         if MLFLOW_AVAILABLE:
             from mlflow.tracking import MlflowClient
             client = MlflowClient()
-            client.transition_model_version_stage(name, version, stage)
+            try:
+                # MLflow >= 2.0 alias-based approach
+                alias = stage.lower()  # e.g. "production", "staging"
+                client.set_registered_model_alias(name, alias, str(version))
+            except AttributeError:
+                # Fallback for older MLflow versions
+                client.transition_model_version_stage(name, version, stage)
 
 
 class PredictionLogger:
@@ -129,9 +87,12 @@ class PredictionLogger:
         timestamp: Optional[str] = None,
     ):
         """Log a single prediction."""
+        # Use a single now() call to avoid a midnight race condition between
+        # the timestamp string and the daily log filename.
+        now = datetime.now()
         if timestamp is None:
-            timestamp = datetime.now().isoformat()
-            
+            timestamp = now.isoformat()
+
         entry = {
             "timestamp": timestamp,
             "image_hash": image_hash,
@@ -141,9 +102,9 @@ class PredictionLogger:
             "uncertainty": uncertainty,
             "model_version": model_version,
         }
-        
+
         # Append to daily log file
-        date_str = datetime.now().strftime("%Y-%m-%d")
+        date_str = now.strftime("%Y-%m-%d")
         log_file = self.log_dir / f"predictions_{date_str}.jsonl"
         
         with open(log_file, "a") as f:
@@ -174,63 +135,88 @@ class PredictionLogger:
 
 
 class DriftDetector:
-    """Detect data and performance drift."""
-    
+    """Detect feature-space drift using a two-sample Kolmogorov-Smirnov test.
+
+    Pass *feature embeddings* (not raw pixels) for meaningful semantic drift
+    detection.  Use ReliabilityAnalyzer.compute_feature_embeddings() to
+    extract them before calling set_baseline / detect_drift.
+    """
+
     def __init__(self, alert_threshold: float = 0.05):
         self.alert_threshold = alert_threshold
-        self.baseline_stats = None
-        
-    def set_baseline(self, reference_data: Any):
-        """Set baseline distribution from reference data."""
+        self._baseline_samples: Optional[Any] = None  # stores actual baseline array
+
+    def set_baseline(self, reference_data: Any) -> None:
+        """Store reference feature embeddings as the drift baseline.
+
+        Args:
+            reference_data: 2-D numpy array of shape (N, feature_dim).
+        """
         import numpy as np
-        
-        if isinstance(reference_data, np.ndarray):
-            self.baseline_stats = {
-                "mean": np.mean(reference_data, axis=0),
-                "std": np.std(reference_data, axis=0),
-                "percentiles": np.percentile(reference_data, [10, 25, 50, 75, 90], axis=0),
-            }
-            
+
+        if not isinstance(reference_data, np.ndarray):
+            raise TypeError(
+                f"reference_data must be a numpy array, got {type(reference_data).__name__}"
+            )
+        if reference_data.ndim != 2:
+            raise ValueError(
+                f"reference_data must be 2-D (N, feature_dim), got shape {reference_data.shape}"
+            )
+        self._baseline_samples = reference_data.copy()
+
     def detect_drift(self, new_data: Any) -> Dict[str, Any]:
-        """Detect drift in new data."""
+        """Run a per-feature two-sample KS test between baseline and new data.
+
+        Args:
+            new_data: 2-D numpy array of shape (M, feature_dim).
+
+        Returns:
+            Dict with keys: drift_detected, drift_score, threshold,
+            per_feature_ks, per_feature_pvalue.
+        """
         import numpy as np
         from scipy import stats
-        
-        if self.baseline_stats is None:
-            return {"error": "Baseline not set"}
-            
-        if isinstance(new_data, np.ndarray):
-            # Compute KS test for each feature
-            drift_scores = []
-            
-            for i in range(new_data.shape[1]):
-                # Two-sample KS test
-                baseline_samples = np.random.normal(
-                    self.baseline_stats["mean"][i],
-                    self.baseline_stats["std"][i],
-                    1000,
-                )
-                ks_stat, p_value = stats.ks_2samp(baseline_samples, new_data[:, i])
-                drift_scores.append(ks_stat)
-                
-            avg_drift = np.mean(drift_scores)
-            
-            return {
-                "drift_detected": avg_drift > self.alert_threshold,
-                "drift_score": float(avg_drift),
-                "threshold": self.alert_threshold,
-            }
-            
-        return {"error": "Unsupported data type"}
+
+        if self._baseline_samples is None:
+            raise RuntimeError("Baseline not set — call set_baseline() first")
+
+        if not isinstance(new_data, np.ndarray) or new_data.ndim != 2:
+            raise TypeError("new_data must be a 2-D numpy array")
+
+        if new_data.shape[1] != self._baseline_samples.shape[1]:
+            raise ValueError(
+                f"Feature dimension mismatch: baseline has {self._baseline_samples.shape[1]} "
+                f"features but new_data has {new_data.shape[1]}"
+            )
+
+        n_features = self._baseline_samples.shape[1]
+        ks_stats: List[float] = []
+        p_values: List[float] = []
+
+        for i in range(n_features):
+            ks_stat, p_value = stats.ks_2samp(
+                self._baseline_samples[:, i], new_data[:, i]
+            )
+            ks_stats.append(float(ks_stat))
+            p_values.append(float(p_value))
+
+        avg_drift = float(np.mean(ks_stats))
+
+        return {
+            "drift_detected": avg_drift > self.alert_threshold,
+            "drift_score": avg_drift,
+            "threshold": self.alert_threshold,
+            "per_feature_ks": ks_stats,
+            "per_feature_pvalue": p_values,
+        }
 
 
 class PerformanceMonitor:
     """Monitor model performance over time."""
-    
+
     def __init__(self, window_size: int = 100):
         self.window_size = window_size
-        self.predictions = []
-        self.ground_truth = []
+        self.predictions: Deque[Dict] = deque(maxlen=window_size)
         
     def add_prediction(
         self,
@@ -245,12 +231,9 @@ class PerformanceMonitor:
             "confidence": confidence,
             "timestamp": datetime.now().isoformat(),
         })
-        
-        # Keep only recent predictions
-        if len(self.predictions) > self.window_size:
-            self.predictions.pop(0)
+        # deque(maxlen=window_size) evicts the oldest entry automatically
             
-    def get_window_metrics(self) -> Dict[str, float]:
+    def get_window_metrics(self) -> Dict[str, Any]:
         """Compute metrics for the current window."""
         if not self.predictions:
             return {}
@@ -261,7 +244,6 @@ class PerformanceMonitor:
         
         # Prediction distribution
         predictions = [p["prediction"] for p in self.predictions]
-        from collections import Counter
         distribution = Counter(predictions)
         
         metrics = {

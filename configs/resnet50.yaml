@@ -1,3 +1,4 @@
+# ResNet-50 — model-specific overrides (merged on top of system.yaml)
 name: resnet50
 type: cnn
 
@@ -6,8 +7,6 @@ architecture:
   pretrained: true
   num_classes: 3
   dropout_rate: 0.3
-  
-  # Custom head configuration
   head:
     type: sequential
     layers:
@@ -15,7 +14,7 @@ architecture:
         output_size: [1, 1]
       - type: flatten
       - type: linear
-        in_features: 2048
+        in_features: 2048  # ResNet-50 feature dim
         out_features: 512
       - type: relu
       - type: dropout
@@ -24,7 +23,6 @@ architecture:
         in_features: 512
         out_features: 3
 
-# Transfer learning strategy
 transfer_learning:
   freeze_backbone: false
   differential_lr:
@@ -32,32 +30,9 @@ transfer_learning:
     backbone_lr: 1.0e-5
     head_lr: 1.0e-4
 
+# Override system defaults only where this model differs
 input:
   size: [384, 384]
-  channels: 3
-  normalize:
-    mean: [0.485, 0.456, 0.406]
-    std: [0.229, 0.224, 0.225]
-
-training:
-  batch_size: 32
-  epochs: 100
-  
-  optimizer:
-    name: adamw
-    lr: 1.0e-4
-    weight_decay: 1.0e-4
-    
-  scheduler:
-    name: cosine_warmup
-    warmup_epochs: 5
-    min_lr: 1.0e-6
-
-uncertainty:
-  temperature_scaling: true
-  mc_dropout:
-    enabled: true
-    num_samples: 10
 
 explainability:
   method: gradcam++

@@ -16,15 +16,8 @@ import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
-
-def compute_image_hash(image_path: Path) -> str:
-    """Compute MD5 hash of image file for duplicate detection."""
-    hasher = hashlib.md5()
-    with open(image_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+from typing import List, Optional, Tuple, Union
+from sklearn.model_selection import train_test_split
 
 import cv2
 import numpy as np
@@ -34,57 +27,49 @@ from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 DEFAULT_MIN_AREA_RATIO = 0.15
 MIN_ASPECT_RATIO = 0.35
 MAX_ASPECT_RATIO = 3.0
 
+def compute_image_hash(image_path: Path) -> str:
+    """Compute MD5 hash of image file for duplicate detection."""
+    hasher = hashlib.md5()
+    try:
+        with open(image_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except Exception as e:
+        logging.error(f"Failed to hash {image_path}: {e}")
+        return ""
+
 # ---------------------------------------------------------------------------
 # 1. Core Processing & Filtering Function
 # ---------------------------------------------------------------------------
-
 def is_side_by_side_double(img: np.ndarray, min_aspect: float = 1.5) -> bool:
-    """Detect side-by-side duplicate X-rays (two views stitched horizontally).
-
-    Strategy:
-    1. Only consider images whose aspect ratio is wide enough to plausibly
-       contain two views (width >= 1.5 * height).
-    2. Look at the vertical intensity strip in the middle 10% of the image.
-       Side-by-side doubles have a dark vertical gap (or seam) between the
-       two views, so the mean intensity of the centre strip is significantly
-       lower than the overall mean.
-    3. Also check for a sharp intensity *dip* in the horizontal projection
-       (column-wise mean) near the centre — a telltale sign of a separator.
-    """
+    """Detect side-by-side duplicate X-rays (two views stitched horizontally)."""
     h, w = img.shape[:2]
     aspect = w / h
     if aspect < min_aspect:
         return False
 
-    # --- Check 1: dark centre strip ---
-    strip_w = max(int(w * 0.05), 3)  # 10% of width, centred
+    # Check 1: dark centre strip
+    strip_w = max(int(w * 0.05), 3)
     cx = w // 2
     centre_strip = img[:, cx - strip_w : cx + strip_w]
     strip_mean = centre_strip.mean()
     overall_mean = img.mean()
 
-    # The centre gap is typically much darker than the lung fields
     if overall_mean > 10 and strip_mean < overall_mean * 0.45:
         return True
 
-    # --- Check 2: horizontal projection dip ---
+    # Check 2: horizontal projection dip
     col_means = img.mean(axis=0).astype(np.float64)
-    # Smooth to avoid pixel noise triggering false positives
-    kernel_size = max(w // 40, 3) | 1  # ensure odd
+    kernel_size = max(w // 40, 3) | 1
     smoothed = np.convolve(col_means, np.ones(kernel_size) / kernel_size, mode='same')
 
-    # Only inspect the middle 30% of the image
-    left_bound = int(w * 0.35)
-    right_bound = int(w * 0.65)
+    left_bound, right_bound = int(w * 0.35), int(w * 0.65)
     centre_region = smoothed[left_bound:right_bound]
 
     if len(centre_region) == 0:
@@ -93,90 +78,67 @@ def is_side_by_side_double(img: np.ndarray, min_aspect: float = 1.5) -> bool:
     dip_val = centre_region.min()
     side_val = max(smoothed[:left_bound].mean(), smoothed[right_bound:].mean(), 1.0)
 
-    # A strong dip (< 50% of the flanking brightness) signals a separator
     if dip_val < side_val * 0.50:
         return True
 
     return False
 
 
-def clean_dark_overlays(image, dark_thresh=30, min_area_ratio=0.005, border_margin_ratio=0.15):
-    """
-    Detects and removes dark rectangular clinical markers/annotations near borders.
-    Optimized for grayscale X-ray processing.
-    """
+def clean_dark_overlays(image: np.ndarray, dark_thresh: int = 30, min_area_ratio: float = 0.005, border_margin_ratio: float = 0.15) -> np.ndarray:
+    """Detects and removes dark rectangular clinical markers/annotations near borders."""
+    if len(image.shape) == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
     h, w = image.shape[:2]
     total_area = h * w
     
-    # 1. Threshold for dark regions (Markers are usually near-black)
     _, thresh = cv2.threshold(image, dark_thresh, 255, cv2.THRESH_BINARY_INV)
-    
-    # 2. Cleanup noise (small dots)
     kernel = np.ones((5,5), np.uint8)
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     
-    # 3. Find potential marker contours
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
     mask = np.zeros((h, w), dtype=np.uint8)
     found_any = False
     
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        
-        # Filter: Must be large enough to be a marker, but not half the image
         if area < (min_area_ratio * total_area) or area > (0.1 * total_area):
             continue
         
         x, y, cw, ch = cv2.boundingRect(cnt)
-        
-        # Filter: Must be near the border (where tags usually live)
         margin_h, margin_w = int(border_margin_ratio * h), int(border_margin_ratio * w)
-        near_border = (y < margin_h or y + ch > h - margin_h or 
-                       x < margin_w or x + cw > w - margin_w)
+        near_border = (y < margin_h or y + ch > h - margin_h or x < margin_w or x + cw > w - margin_w)
         
         if not near_border:
             continue
         
-        # Filter: Must be roughly rectangular (0.6 fill ratio)
         if area / (cw * ch) > 0.6:
             cv2.drawContours(mask, [cnt], -1, 255, -1)
             found_any = True
-    
-    # 4. Only inpaint if we actually found something to fix
+            
     if found_any:
-        # INPAINT_TELEA is generally faster for small text/marker removal
         return cv2.inpaint(image, mask, 3, cv2.INPAINT_TELEA)
-    
     return image
 
-def process_and_filter_xray(input_data, target_size=224, min_area_ratio=DEFAULT_MIN_AREA_RATIO) -> Tuple[Optional[np.ndarray], str]:
-    """
-    Advanced processing for Chest X-rays:
-    - Removes large white or black margins (Auto-Crop)
-    - Filters images where the X-ray is too small (Quality Check)
-    - Contrast Enhancement (CLAHE)
-    - Square Resizing (Letterboxing)
-    """
-    # 1. Load Input
+
+def process_and_filter_xray(input_data: Union[str, Path, np.ndarray], target_size: int = 384, min_area_ratio: float = DEFAULT_MIN_AREA_RATIO) -> Tuple[Optional[np.ndarray], str]:
+    """Smart cropping, artifact cleaning, CLAHE, and resizing to square."""
     if isinstance(input_data, (str, Path)):
         img = cv2.imread(str(input_data), cv2.IMREAD_GRAYSCALE)
     else:
-        img = input_data
-        if len(img.shape) == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        img = input_data if len(input_data.shape) == 2 else cv2.cvtColor(input_data, cv2.COLOR_BGR2GRAY)
             
-    # --- INTEGRITY CHECKS ---
-    if img is None: return None, "Error: Load Failed (Corrupted or empty file)"
-    if img.std() < 2.0: return None, f"Error: Image is blank or near-uniform (std={img.std():.2f})"
+    if img is None: 
+        return None, "Error: Load Failed (Corrupted or empty file)"
+    if img.std() < 2.0: 
+        return None, f"Error: Image is blank or near-uniform (std={img.std():.2f})"
 
     img = clean_dark_overlays(img)
 
-    # --- SIDE-BY-SIDE DOUBLE CHECK ---
     if is_side_by_side_double(img):
         return None, "Filtered: Side-by-side double image detected"
 
-    # 2. Smart Cropping (Handles BOTH white and black margins)
+    # Smart Crop
     mask = cv2.threshold(img, 10, 255, cv2.THRESH_BINARY)[1]
     mask_white = cv2.threshold(img, 253, 255, cv2.THRESH_BINARY_INV)[1]
     combined_mask = cv2.bitwise_and(mask, mask_white)
@@ -184,11 +146,7 @@ def process_and_filter_xray(input_data, target_size=224, min_area_ratio=DEFAULT_
     coords = cv2.findNonZero(combined_mask)
     if coords is not None:
         x, y, w, h = cv2.boundingRect(coords)
-        
-        # QUALITY CHECK: Ratio of useful content vs total image
-        total_area = img.shape[0] * img.shape[1]
-        useful_area = w * h
-        area_ratio = useful_area / total_area
+        area_ratio = (w * h) / (img.shape[0] * img.shape[1])
         
         if area_ratio < min_area_ratio:
             return None, f"Filtered: X-ray area too small ({area_ratio:.2f})"
@@ -197,16 +155,14 @@ def process_and_filter_xray(input_data, target_size=224, min_area_ratio=DEFAULT_
         if crop_ar < MIN_ASPECT_RATIO or crop_ar > MAX_ASPECT_RATIO:
             return None, f"Filtered: Abnormal Aspect Ratio ({crop_ar:.2f})"
         
-        # Apply the crop
         img = img[y:y+h, x:x+w]
     else:
         return None, "Filtered: No content detected (Blank image)"
 
-    # 3. CLAHE (Essential for Pneumonia/TB features)
+    # CLAHE & Letterbox
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     img = clahe.apply(img)
 
-    # 4. Aspect-Ratio Aware Resize (Letterboxing)
     old_h, old_w = img.shape[:2]
     scale = target_size / max(old_h, old_w)
     new_w, new_h = int(old_w * scale), int(old_h * scale)
@@ -214,9 +170,7 @@ def process_and_filter_xray(input_data, target_size=224, min_area_ratio=DEFAULT_
     interp = cv2.INTER_LANCZOS4 if scale > 1 else cv2.INTER_AREA
     img = cv2.resize(img, (new_w, new_h), interpolation=interp)
 
-    # 5. Padding to Square
-    delta_w = target_size - new_w
-    delta_h = target_size - new_h
+    delta_w, delta_h = target_size - new_w, target_size - new_h
     top, bottom = delta_h // 2, delta_h - (delta_h // 2)
     left, right = delta_w // 2, delta_w - (delta_w // 2)
     img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
@@ -226,7 +180,6 @@ def process_and_filter_xray(input_data, target_size=224, min_area_ratio=DEFAULT_
 # ---------------------------------------------------------------------------
 # 2. Visualization Tool
 # ---------------------------------------------------------------------------
-
 def visualize_crop_step(image_path):
     """Visualizes the auto-cropping logic for EDA and debugging."""
     img = cv2.imread(str(image_path))
@@ -290,8 +243,7 @@ def visualize_advanced_processing(image_path):
 # ---------------------------------------------------------------------------
 # 3. Pipeline Orchestrator
 # ---------------------------------------------------------------------------
-
-def load_dataset_metadata(raw_dir: Path | str) -> pd.DataFrame:
+def load_dataset_metadata(raw_dir: Union[Path, str]) -> pd.DataFrame:
     """Load metadata by scanning raw_dir/{split}/{class}/ for images."""
     raw_dir = Path(raw_dir)
     records =[]
@@ -329,6 +281,134 @@ def load_dataset_metadata(raw_dir: Path | str) -> pd.DataFrame:
         
     return df
 
+# This allows creating proper train/val/test splits when raw data is just class folders
+def create_stratified_split(
+    data_dir: str,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42
+) -> Tuple[List[str], List[str], List[str], List[str], List[str], List[str]]:
+    """
+    Create stratified train/val/test splits from a directory of images.
+    
+    This function is useful when the original dataset doesn't have proper splits
+    or when you want to create custom splits with specific ratios.
+    
+    Args:
+        data_dir: Root directory containing class subdirectories
+        train_ratio: Proportion of data for training
+        val_ratio: Proportion of data for validation
+        test_ratio: Proportion of data for testing
+        seed: Random seed for reproducibility
+        
+    Returns:
+        Tuple of (train_paths, val_paths, test_paths, 
+                 train_labels, val_labels, test_labels)
+    """
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-5, \
+        "Split ratios must sum to 1.0"
+    
+    data_dir = Path(data_dir)
+    all_images = []
+    all_labels = []
+    
+    # Collect all images and labels
+    for class_dir in sorted(data_dir.iterdir()):
+        if not class_dir.is_dir():
+            continue
+            
+        class_name = class_dir.name.lower()
+        
+        # Load all images in this class (supporting multiple extensions)
+        for ext in IMAGE_EXTS:
+            for img_path in class_dir.glob(f'*{ext}'):
+                all_images.append(str(img_path))
+                all_labels.append(class_name)
+    
+    if len(all_images) == 0:
+        raise ValueError(f"No images found in {data_dir}")
+    
+    # Encode labels for stratification
+    from sklearn.preprocessing import LabelEncoder
+    le = LabelEncoder()
+    label_indices = le.fit_transform(all_labels)
+    
+    # First split: train vs (val + test)
+    train_imgs, temp_imgs, train_lbls, temp_lbls = train_test_split(
+        all_images,
+        all_labels,
+        test_size=(val_ratio + test_ratio),
+        stratify=label_indices,
+        random_state=seed
+    )
+    
+    # Second split: val vs test
+    val_ratio_adjusted = val_ratio / (val_ratio + test_ratio)
+    
+    # Re-encode temp labels for second stratification
+    temp_indices = le.transform(temp_lbls)
+    val_imgs, test_imgs, val_lbls, test_lbls = train_test_split(
+        temp_imgs,
+        temp_lbls,
+        test_size=(1 - val_ratio_adjusted),
+        stratify=temp_indices,
+        random_state=seed
+    )
+    
+    logger.info(f"Created stratified split: {len(train_imgs)} train, {len(val_imgs)} val, {len(test_imgs)} test")
+    return train_imgs, val_imgs, test_imgs, train_lbls, val_lbls, test_lbls
+
+
+def save_split_metadata(
+    train_paths: List[str],
+    val_paths: List[str],
+    test_paths: List[str],
+    train_labels: List[str],
+    val_labels: List[str],
+    test_labels: List[str],
+    output_dir: str
+):
+    """
+    Save split information to CSV files for reproducibility.
+    
+    Args:
+        train_paths: Training image paths
+        val_paths: Validation image paths
+        test_paths: Test image paths
+        train_labels: Training labels
+        val_labels: Validation labels
+        test_labels: Test labels
+        output_dir: Directory to save metadata
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    all_data = []
+    # Save each split
+    for split_name, paths, labels in [
+        ('train', train_paths, train_labels),
+        ('val', val_paths, val_labels),
+        ('test', test_paths, test_labels)
+    ]:
+        df = pd.DataFrame({
+            'filepath_processed': paths, # Added for dataset.py compatibility
+            'class': labels,             # Added for dataset.py compatibility
+            'split': [split_name] * len(paths), # Added for dataset.py compatibility
+            'image_path': paths,         # Left for backward compatibility
+            'label': labels
+        })
+        df.to_csv(output_dir / f'{split_name}_split.csv', index=False)
+        all_data.append(df)
+        
+    # Attempt to unify for users loading straight into ChestXrayDataModule 
+    if all_data:
+        combined_df = pd.concat(all_data, ignore_index=True)
+        combined_df.to_csv(output_dir / 'manifest_splits.csv', index=False)
+        
+    logger.info(f"Split metadata saved to {output_dir}")
+
+
 @dataclass
 class PipelineReport:
     total_images: int = 0
@@ -339,11 +419,11 @@ class PipelineReport:
     duplicates_cross_class: int = 0
 
 def run_processing_pipeline(
-    raw_dir: str | Path,
-    processed_dir: str | Path,
-    quarantine_dir: str | Path,
-    duplicate_dir: str | Path = None,
-    target_size: int = 224,
+    raw_dir: Union[str, Path],
+    processed_dir: Union[str, Path],
+    quarantine_dir: Union[str, Path],
+    duplicate_dir: Optional[Union[str, Path]] = None,
+    target_size: int = 384,
     min_area_ratio: float = DEFAULT_MIN_AREA_RATIO,
     output_format: str = "png",
     detect_duplicates: bool = True,
@@ -364,9 +444,9 @@ def run_processing_pipeline(
     # -------------------------------------------------------------------
     # PHASE 1: Scan, hash, and resolve duplicates BEFORE processing
     # -------------------------------------------------------------------
-    cross_class_hashes: set = set()       # hashes to quarantine entirely
-    keeper_filepaths: set = set()          # filepaths we will actually process
-    hash_to_entries: dict = {}             # hash -> list of row-dicts
+    cross_class_hashes: set = set()       
+    keeper_filepaths: set = set()          
+    hash_to_entries: dict = {}             
 
     processed_records = []
     quarantine_records = []
@@ -404,7 +484,7 @@ def run_processing_pipeline(
                         "class": entry['class'],
                         "reason": f"Cross-class conflict (classes: {', '.join(sorted(unique_classes))})"
                     })
-                continue  # none of these go to processing
+                continue 
 
             # --- Same-class duplicates: keep first, move rest ---
             if len(entries) > 1:
@@ -426,7 +506,6 @@ def run_processing_pipeline(
             else:
                 keeper_filepaths.add(entries[0]['filepath'])
     else:
-        # No dedup — every file is a keeper
         keeper_filepaths = set(df['filepath'].tolist())
 
     # -------------------------------------------------------------------
@@ -464,7 +543,7 @@ def run_processing_pipeline(
 
             dest = quarantine_dir / q_folder / row["split"] / row["class"] / row["filename"]
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(filepath, dest) # Copy the original bad file
+            shutil.copy2(filepath, dest) 
             
             quarantine_records.append({
                 "filepath_original": filepath,
@@ -515,14 +594,42 @@ def main() -> None:
     parser.add_argument("--raw-dir", type=str, default="data/raw", help="Raw data root")
     parser.add_argument("--processed-dir", type=str, default="data/processed", help="Output dir for clean images")
     parser.add_argument("--quarantine-dir", type=str, default="data/quarantine", help="Output dir for bad images")
-    parser.add_argument("--target-size", type=int, default=224, help="Target H=W in pixels")
+    parser.add_argument("--target-size", type=int, default=384, help="Target H=W in pixels")
     parser.add_argument("--min-area", type=float, default=DEFAULT_MIN_AREA_RATIO, help="Minimum acceptable X-ray area ratio")
     parser.add_argument("--output-format", type=str, default="png", choices=["png", "jpg"])
     parser.add_argument("--duplicate-dir", type=str, default="data/duplicate", help="Output dir for cross-class duplicate images")
     parser.add_argument("--skip-duplicate-check", action="store_true", help="Skip duplicate detection across splits")
+    
+    parser.add_argument("--create-splits", action="store_true", 
+                       help="Create stratified train/val/test splits from flat class folders")
+    parser.add_argument("--train-ratio", type=float, default=0.7, help="Training set ratio")
+    parser.add_argument("--val-ratio", type=float, default=0.15, help="Validation set ratio")
+    parser.add_argument("--test-ratio", type=float, default=0.15, help="Test set ratio")
+    parser.add_argument("--split-seed", type=int, default=42, help="Random seed for split creation")
+    
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+
+    if args.create_splits:
+        logging.info("Creating stratified splits from %s", args.raw_dir)
+        train_imgs, val_imgs, test_imgs, train_lbls, val_lbls, test_lbls = create_stratified_split(
+            args.raw_dir,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            seed=args.split_seed
+        )
+        
+        # Save metadata for reproducibility
+        save_split_metadata(
+            train_imgs, val_imgs, test_imgs,
+            train_lbls, val_lbls, test_lbls,
+            args.raw_dir
+        )
+        
+        logging.info("Stratified splits created. Run again without --create-splits to process.")
+        return
 
     run_processing_pipeline(
         raw_dir=args.raw_dir,
@@ -537,4 +644,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

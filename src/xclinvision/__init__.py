@@ -12,9 +12,9 @@ __license__ = "MIT"
 
 def __getattr__(name: str):
     """Lazy imports so lightweight modules (e.g. processing) load without heavy deps."""
-    if name == "create_model":
-        from xclinvision.architecture import create_model
-        return create_model
+    if name == "build_model":
+        from xclinvision.modeling import build_model
+        return build_model
     if name == "predict":
         from xclinvision.inference import predict
         return predict
@@ -25,7 +25,7 @@ def __getattr__(name: str):
 
 
 __all__ = [
-    "create_model",
+    "build_model",
     "predict",
     "generate_explanation",
 ]

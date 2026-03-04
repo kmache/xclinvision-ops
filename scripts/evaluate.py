@@ -1,54 +1,340 @@
-"""Evaluation script for XClinVision models."""
+#!/usr/bin/env python
+"""Evaluation script for XClinVision models.
 
-import os
+Performs detailed metrics, calibration, failure analysis, and saves a full
+evaluation report (JSON + text classification report + per-sample CSV).
+
+Usage
+-----
+python scripts/evaluate.py \
+    --checkpoint-path models/efficientnet_b2_best.ckpt \
+    --model-name efficientnet_b2 \
+    --manifest data/processed/manifest.csv \
+    --output-dir outputs/evaluation \
+    --calibrate
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
 import sys
+import warnings
 from pathlib import Path
+
+# Silence Lightning deprecation warnings
+warnings.filterwarnings("ignore", message=r".*isinstance\(treespec, LeafSpec\).*")
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+
+import numpy as np
+import pandas as pd
+import torch
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-import torch
-import numpy as np
-import argparse
-import yaml
-from pathlib import Path
-
-from xclinvision.architecture import create_model
-from xclinvision.evaluator import MetricsComputer, CalibrationAnalyzer, TemperatureScaler
+from xclinvision.dataset import ChestXrayDataModule
+from xclinvision.evaluator import (
+    CalibrationAnalyzer,
+    MetricsComputer,
+    TemperatureScaler,
+)
+from xclinvision.modeling import build_model
 from xclinvision.reliability import FailureAnalyzer
+from xclinvision.trainer import XClinVisionModel
+from xclinvision.xai import DEFAULT_CLASS_NAMES
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("xclinvision.evaluate")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate XClinVision model")
-    parser.add_argument("--model-path", type=str, required=True)
-    parser.add_argument("--model-name", type=str, default="efficientnet_b2")
-    parser.add_argument("--data-dir", type=str, default="data/processed/test")
-    parser.add_argument("--output-dir", type=str, default="outputs/evaluation")
-    parser.add_argument("--calibrate", action="store_true")
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Evaluate an XClinVision model checkpoint on the test split."
+    )
+    parser.add_argument(
+        "--checkpoint-path", type=str, required=True,
+        help="Path to the Lightning .ckpt checkpoint file."
+    )
+    parser.add_argument(
+        "--model-name", type=str, default="efficientnet_b2",
+        help="Architecture name (must match the checkpoint). Default: efficientnet_b2."
+    )
+    parser.add_argument(
+        "--manifest", type=str, default="data/processed/manifest.csv",
+        help="Path to the processed dataset manifest CSV. Default: data/processed/manifest.csv."
+    )
+    parser.add_argument(
+        "--output-dir", type=str, default="outputs/evaluation",
+        help="Directory to write evaluation artefacts. Default: outputs/evaluation."
+    )
+    parser.add_argument(
+        "--image-size", type=int, default=224,
+        help="Image resolution (must match training). Default: 224."
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=32,
+        help="Batch size for inference. Default: 32."
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=4,
+        help="DataLoader worker processes. Default: 4."
+    )
+    parser.add_argument(
+        "--calibrate", action="store_true",
+        help="Run temperature scaling calibration using the validation set."
+    )
+    parser.add_argument(
+        "--split", type=str, default="test", choices=["test", "val"],
+        help="Dataset split to evaluate on. Default: test."
+    )
     return parser.parse_args()
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Inference helpers
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def collect_predictions(
+    model: torch.nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    desc: str = "Inference",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run model over all batches and collect arrays.
+
+    Returns:
+        y_true   (N,)   – ground-truth integer labels
+        logits   (N, C) – raw unnormalised logits
+        y_probs  (N, C) – softmax probabilities
+    """
+    all_targets, all_logits = [], []
+
+    model.eval()
+    for x, y in tqdm(loader, desc=desc, leave=False):
+        x = x.to(device)
+        logits = model(x)
+        all_targets.append(y.cpu().numpy())
+        all_logits.append(logits.cpu().numpy())
+
+    y_true  = np.concatenate(all_targets, axis=0)
+    logits  = np.concatenate(all_logits,  axis=0)
+    y_probs = _softmax(logits)
+    return y_true, logits, y_probs
+
+
+def _softmax(logits: np.ndarray) -> np.ndarray:
+    exp = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+    return exp / np.sum(exp, axis=1, keepdims=True)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
     args = parse_args()
     
-    print(f"Evaluating {args.model_name} model...")
-    
-    # Create model
-    model = create_model(args.model_name, num_classes=3, pretrained=False)
-    
-    # Load weights
-    checkpoint = torch.load(args.model_path, map_location="cpu")
-    model.load_state_dict(checkpoint.get("state_dict", checkpoint))
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Device: {device}")
+    logger.info(f"Model:  {args.model_name}")
+    logger.info(f"Split:  {args.split}")
+
+    # ------------------------------------------------------------------
+    # 1. Data
+    # ------------------------------------------------------------------
+    logger.info("Initialising DataModule …")
+    data_module = ChestXrayDataModule(
+        manifest_path=args.manifest,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        image_size=args.image_size,
+    )
+
+    if args.split == "test":
+        data_module.setup(stage="test")
+        eval_loader = data_module.test_dataloader()
+    else:
+        data_module.setup(stage="fit")
+        eval_loader = data_module.val_dataloader()
+
+    n_eval = len(eval_loader.dataset)
+    logger.info(f"Evaluation dataset: {n_eval} samples")
+
+    # ------------------------------------------------------------------
+    # 2. Model
+    # ------------------------------------------------------------------
+    logger.info(f"Loading checkpoint: {args.checkpoint_path}")
+    base_model = build_model(
+        model_name=args.model_name,
+        num_classes=3,
+        pretrained=False,
+        img_size=args.image_size,
+    )
+
+    pl_module = XClinVisionModel.load_from_checkpoint(
+        args.checkpoint_path,
+        model=base_model,
+        map_location="cpu",
+    )
+    model = pl_module.model
+    model.to(device)
     model.eval()
-    
-    print("Note: Actual data loading and evaluation not yet implemented.")
-    print("Placeholder for evaluation metrics computation.")
-    
-    # Initialize evaluators
-    metrics_computer = MetricsComputer()
-    calibrator = CalibrationAnalyzer()
-    failure_analyzer = FailureAnalyzer()
-    
-    print("Evaluation pipeline ready. Integrate with test dataset for full evaluation.")
+    logger.info("Checkpoint loaded.")
+
+    # ------------------------------------------------------------------
+    # 3. Test-set predictions
+    # ------------------------------------------------------------------
+    logger.info("Running inference …")
+    y_true, logits_eval, y_probs = collect_predictions(
+        model, eval_loader, device, desc=f"Eval ({args.split})"
+    )
+    y_pred = np.argmax(y_probs, axis=1)
+
+    # ------------------------------------------------------------------
+    # 4. Optional: Temperature Scaling (calibration)
+    # ------------------------------------------------------------------
+    temperature_scaler: TemperatureScaler | None = None
+    learned_temperature: float = 1.0
+
+    if args.calibrate:
+        logger.info("Collecting validation logits for temperature scaling …")
+        if args.split == "test":
+            data_module.setup(stage="fit")
+        val_loader = data_module.val_dataloader()
+
+        y_val, logits_val, _ = collect_predictions(
+            model, val_loader, device, desc="Calibration (val)"
+        )
+
+        temperature_scaler = TemperatureScaler()
+        learned_temperature = temperature_scaler.fit(logits_val, y_val)
+        logger.info(f"Optimal temperature: T = {learned_temperature:.4f}")
+
+        # Re-calibrate eval predictions
+        y_probs = temperature_scaler.predict_proba(logits_eval)
+        y_pred  = np.argmax(y_probs, axis=1)
+
+        # Persist scaler
+        temp_path = output_dir / f"{args.model_name}_temperature.json"
+        temperature_scaler.save(str(temp_path))
+
+    # ------------------------------------------------------------------
+    # 5. Metrics
+    # ------------------------------------------------------------------
+    logger.info("Computing metrics …")
+    metrics_computer = MetricsComputer(class_names=DEFAULT_CLASS_NAMES)
+
+    metrics = metrics_computer.compute_all_metrics(y_true, y_pred, y_probs)
+    cm      = metrics_computer.compute_confusion_matrix(y_true, y_pred)
+
+    metrics["confusion_matrix"] = {
+        "matrix": cm.tolist(),
+        "labels": DEFAULT_CLASS_NAMES,
+    }
+
+    # Print summary table
+    metrics_computer.print_summary(metrics, y_true=y_true, y_pred=y_pred)
+
+    # ------------------------------------------------------------------
+    # 6. Calibration analysis
+    # ------------------------------------------------------------------
+    logger.info("Computing calibration metrics …")
+    calibrator = CalibrationAnalyzer(num_bins=15)
+    ece = calibrator.compute_ece(y_true, y_probs)
+    bin_centers, bin_accs, bin_counts = calibrator.compute_calibration_curve(
+        y_true, y_probs
+    )
+
+    metrics["calibration"] = {
+        "expected_calibration_error": float(ece),
+        "temperature": float(learned_temperature),
+        "curve_data": {
+            "bin_centers":    bin_centers.tolist(),
+            "bin_accuracies": bin_accs.tolist(),
+            "bin_counts":     bin_counts.tolist(),
+        },
+    }
+    logger.info(f"ECE: {ece:.4f}")
+
+    # ------------------------------------------------------------------
+    # 7. Failure analysis
+    # ------------------------------------------------------------------
+    logger.info("Analysing failures …")
+    failure_analyzer = FailureAnalyzer(class_names=DEFAULT_CLASS_NAMES)
+    failures = failure_analyzer.analyze_failures(y_true, y_pred, y_probs)
+    metrics["failure_analysis"] = failures
+
+    for cls, fp in failures["false_positives"].items():
+        logger.info(f"  False positives  [{cls}]: {fp['count']}")
+    for cls, fn in failures["false_negatives"].items():
+        logger.info(f"  False negatives  [{cls}]: {fn['count']}")
+    hce = failures["high_confidence_errors"]
+    logger.info(
+        f"  High-confidence errors: {hce['count']} "
+        f"(avg conf = {hce['avg_confidence']:.3f})"
+    )
+
+    # ------------------------------------------------------------------
+    # 8. Per-sample CSV
+    # ------------------------------------------------------------------
+    logger.info("Writing per-sample predictions …")
+    prob_cols = {
+        f"prob_{name}": y_probs[:, i]
+        for i, name in enumerate(DEFAULT_CLASS_NAMES)
+    }
+    df_preds = pd.DataFrame(
+        {
+            "true_label":       y_true,
+            "true_class":       [DEFAULT_CLASS_NAMES[lbl] for lbl in y_true],
+            "predicted_label":  y_pred,
+            "predicted_class":  [DEFAULT_CLASS_NAMES[p] for p in y_pred],
+            "confidence":       np.max(y_probs, axis=1),
+            "correct":          (y_true == y_pred),
+            **prob_cols,
+        }
+    )
+    csv_path = output_dir / f"{args.model_name}_{args.split}_predictions.csv"
+    df_preds.to_csv(csv_path, index=False)
+    logger.info(f"Per-sample CSV saved to {csv_path}")
+
+    # ------------------------------------------------------------------
+    # 9. Text classification report
+    # ------------------------------------------------------------------
+    report_str = metrics_computer.generate_classification_report(y_true, y_pred)
+    report_txt_path = output_dir / f"{args.model_name}_{args.split}_classification_report.txt"
+    report_txt_path.write_text(report_str)
+    logger.info("\nClassification Report:\n" + report_str)
+
+    # ------------------------------------------------------------------
+    # 10. JSON report
+    # ------------------------------------------------------------------
+    report_path = output_dir / f"{args.model_name}_{args.split}_evaluation_report.json"
+    metrics_computer.save_results(metrics, str(report_path))
+    logger.info(f"Full report saved to {report_path}")
+
+    # Final summary line
+    logger.info(
+        f"Done — Accuracy={metrics['accuracy']:.4f}  "
+        f"MacroF1={metrics['macro_f1']:.4f}  "
+        f"MacroAUC={metrics['macro_auc']:.4f}  "
+        f"ECE={ece:.4f}"
+    )
 
 
 if __name__ == "__main__":
