@@ -1,8 +1,17 @@
 """FastAPI backend for XClinVision inference and feedback."""
 
+import logging
 import os
 import sys
+from functools import lru_cache
 from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
@@ -22,13 +31,18 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# CORS
+# H-4 fix: restrict origins to the configured frontend URL(s) rather than
+# allowing all origins with "*".  Set XCLINVISION_CORS_ORIGINS as a
+# comma-separated list of allowed origins (default: localhost Streamlit).
+_raw_origins = os.getenv("XCLINVISION_CORS_ORIGINS", "http://localhost:8501")
+ALLOWED_ORIGINS: list = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # Request/Response models
@@ -61,6 +75,125 @@ class ReportRequest(BaseModel):
     patient_sex: Optional[str] = None
 
 
+# ---------------------------------------------------------------------------
+# Model loading  (C-1 fix)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=None)
+def _build_pipeline(model_path: str, architecture: str, image_size: int):
+    """Load a trained checkpoint once and cache the InferencePipeline.
+
+    Parameters are read from environment variables:
+      XCLINVISION_MODEL_PATH   - path to a .ckpt PyTorch Lightning checkpoint
+      XCLINVISION_ARCHITECTURE - model architecture name (default: efficientnet_b2)
+      XCLINVISION_IMAGE_SIZE   - input image size used during training (default: 384)
+    """
+    import torch
+    from xclinvision.modeling import build_model
+    from xclinvision.trainer import XClinVisionModel
+    from xclinvision.inference import InferencePipeline
+
+    base_model = build_model(architecture, num_classes=3, pretrained=False, img_size=image_size)
+    pl_module = XClinVisionModel.load_from_checkpoint(
+        model_path, model=base_model, strict=False,
+        map_location="cpu",
+    )
+    pl_module.eval()
+    return InferencePipeline(
+        model=pl_module.model,
+        architecture=architecture,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        image_size=image_size,
+    )
+
+
+def get_pipeline():
+    """Return the cached InferencePipeline or None if not configured."""
+    model_path = os.getenv("XCLINVISION_MODEL_PATH", "")
+    if not model_path or not Path(model_path).exists():
+        return None
+    architecture = os.getenv("XCLINVISION_ARCHITECTURE", "efficientnet_b2")
+    image_size = int(os.getenv("XCLINVISION_IMAGE_SIZE", "384"))
+    return _build_pipeline(model_path, architecture, image_size)
+
+
+# ---------------------------------------------------------------------------
+# Dataset helpers
+# ---------------------------------------------------------------------------
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+
+
+def _count_images(directory: Path) -> int:
+    """Return the number of image files directly inside *directory*."""
+    if not directory.is_dir():
+        return 0
+    return sum(1 for f in directory.iterdir() if f.suffix.lower() in IMAGE_EXTENSIONS)
+
+
+def _dataset_stats(data_dir: Path) -> dict:
+    """Build a nested dict with per-split, per-class image counts."""
+    splits = ["train", "val", "test"]
+    stats: dict = {}
+    for split in splits:
+        split_path = data_dir / split
+        if not split_path.is_dir():
+            continue
+        class_counts: dict = {}
+        class_dirs = sorted(p for p in split_path.iterdir() if p.is_dir())
+        for class_dir in class_dirs:
+            class_counts[class_dir.name] = _count_images(class_dir)
+        stats[split] = {
+            "path": str(split_path.resolve()),
+            "classes": class_counts,
+            "total": sum(class_counts.values()),
+        }
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Application startup: log dataset summary
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def log_dataset_info() -> None:
+    """Log dataset directories and image counts on server startup."""
+    raw_data_dir = os.getenv("XCLINVISION_DATA_DIR", "data/processed")
+    data_dir = Path(raw_data_dir)
+    if not data_dir.is_absolute():
+        # Resolve relative paths against the repository root (three levels up
+        # from app/backend/main.py)
+        data_dir = (Path(__file__).parent.parent.parent / data_dir).resolve()
+
+    logger.info("=" * 60)
+    logger.info("XClinVision  –  Dataset Summary")
+    logger.info("=" * 60)
+    logger.info("Data root : %s", data_dir)
+
+    if not data_dir.is_dir():
+        logger.warning("Data directory not found: %s", data_dir)
+        logger.info("=" * 60)
+        return
+
+    stats = _dataset_stats(data_dir)
+    if not stats:
+        logger.warning("No train/val/test splits found under %s", data_dir)
+        logger.info("=" * 60)
+        return
+
+    grand_total = 0
+    for split, info in stats.items():
+        logger.info("-" * 40)
+        logger.info("Split : %-6s  |  path: %s", split.upper(), info["path"])
+        for cls_name, count in info["classes"].items():
+            logger.info("  %-16s : %d images", cls_name, count)
+        logger.info("  %-16s : %d images", "TOTAL", info["total"])
+        grand_total += info["total"]
+    logger.info("-" * 40)
+    logger.info("Grand total          : %d images", grand_total)
+    logger.info("=" * 60)
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
@@ -71,19 +204,42 @@ async def health_check():
     }
 
 
+@app.get("/api/v1/dataset/info")
+async def dataset_info():
+    """Return dataset directories and image counts for each split."""
+    raw_data_dir = os.getenv("XCLINVISION_DATA_DIR", "data/processed")
+    data_dir = Path(raw_data_dir)
+    if not data_dir.is_absolute():
+        data_dir = (Path(__file__).parent.parent.parent / data_dir).resolve()
+
+    if not data_dir.is_dir():
+        raise HTTPException(404, detail=f"Data directory not found: {data_dir}")
+
+    stats = _dataset_stats(data_dir)
+    grand_total = sum(info["total"] for info in stats.values())
+    return {
+        "data_root": str(data_dir),
+        "splits": stats,
+        "grand_total": grand_total,
+    }
+
+
 @app.get("/api/v1/models")
 async def list_models():
-    """List available models."""
-    from xclinvision.architecture import MODEL_REGISTRY, get_model_info
-    
-    models = []
-    for name in MODEL_REGISTRY.keys():
-        info = get_model_info(name)
-        models.append({
-            "name": name,
-            **info,
-        })
-        
+    """List available model architectures.
+
+    C-2 fix: the previous implementation imported xclinvision.architecture
+    which does not exist.  Model metadata is now read from xclinvision.modeling.
+    """
+    from xclinvision.modeling import TIMM_MODEL_MAP
+
+    models = [
+        {"name": name, "timm_id": timm_id, "type": "cnn" if any(
+            k in name for k in ("resnet", "densenet", "efficientnet", "convnext")
+        ) else "transformer"}
+        for name, timm_id in TIMM_MODEL_MAP.items()
+    ]
+    models.append({"name": "biomedclip", "timm_id": "hf-hub:microsoft/BiomedCLIP-...", "type": "vit"})
     return {"models": models}
 
 
@@ -96,37 +252,66 @@ async def predict(
     """Predict class for uploaded chest X-ray image."""
     import time
     start_time = time.time()
-    
+
     # Validate file
     if not file.content_type.startswith("image/"):
         raise HTTPException(400, "Invalid file type. Please upload an image.")
-        
+
     # Read image
     contents = await file.read()
     image_hash = hashlib.md5(contents).hexdigest()
-    
+
     try:
         image = Image.open(io.BytesIO(contents)).convert("RGB")
     except Exception as e:
         raise HTTPException(400, f"Could not process image: {str(e)}")
-        
-    # Convert to numpy
+
     image_np = np.array(image)
-    
-    # Run inference (placeholder - integrate with actual model)
-    # result = pipeline.predict(image_np)
-    
+
+    # C-1 fix: run actual inference via the configured InferencePipeline.
+    pipeline = get_pipeline()
+    if pipeline is None:
+        raise HTTPException(
+            503,
+            detail=(
+                "No model is loaded. Set the XCLINVISION_MODEL_PATH environment "
+                "variable to the path of a trained .ckpt checkpoint and restart "
+                "the server.  Optionally set XCLINVISION_ARCHITECTURE and "
+                "XCLINVISION_IMAGE_SIZE to match the checkpoint."
+            ),
+        )
+
+    try:
+        result = pipeline.predict(
+            image_np,
+            return_uncertainty=True,
+            return_explanation=return_explanation,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Inference failed: {str(e)}")
+
     processing_time = (time.time() - start_time) * 1000
-    
-    # Placeholder response
+
+    explanation_out = None
+    if return_explanation and "explanation" in result:
+        exp = result["explanation"]
+        if exp:
+            # Convert numpy heatmap to a serialisable form (region scores only)
+            explanation_out = {
+                "key_findings": exp.get("key_findings", []),
+                "clinical_plausibility": exp.get("clinical_plausibility"),
+                "region_scores": exp.get("visualization", {}).get("region_scores"),
+                "method": exp.get("visualization", {}).get("method"),
+            }
+
     return PredictionResponse(
-        prediction=0,
-        class_name="Normal",
-        probabilities=[0.8, 0.15, 0.05],
-        confidence=0.8,
-        uncertainty={"epistemic": 0.02, "predictive_entropy": 0.5},
-        uncertainty_level="low",
-        explanation=None,
+        prediction=result["prediction"],
+        class_name=result["class_name"],
+        probabilities=result["probabilities"],
+        confidence=result["confidence"],
+        uncertainty=result.get("uncertainty"),
+        uncertainty_level=result.get("uncertainty_level"),
+        explanation=explanation_out,
         processing_time_ms=processing_time,
     )
 
@@ -138,28 +323,38 @@ async def explain(
     target_class: Optional[int] = None,
 ):
     """Generate Grad-CAM++ explanation for image."""
-    # Validate file
     if not file.content_type.startswith("image/"):
         raise HTTPException(400, "Invalid file type")
-        
+
     contents = await file.read()
-    
     try:
         image = Image.open(io.BytesIO(contents)).convert("RGB")
     except Exception as e:
         raise HTTPException(400, f"Could not process image: {str(e)}")
-        
-    # Placeholder - integrate with actual explanation generation
+
+    pipeline = get_pipeline()
+    if pipeline is None:
+        raise HTTPException(
+            503,
+            detail="No model loaded. Set XCLINVISION_MODEL_PATH and restart the server.",
+        )
+
+    image_np = np.array(image)
+    try:
+        result = pipeline.predict(image_np, return_uncertainty=False, return_explanation=True)
+    except Exception as e:
+        raise HTTPException(500, f"Explanation generation failed: {str(e)}")
+
+    exp = result.get("explanation") or {}
+    vis = exp.get("visualization") or {}
     return {
-        "heatmap_url": None,
-        "region_scores": {
-            "left_upper": 0.3,
-            "right_upper": 0.4,
-            "left_lower": 0.2,
-            "right_lower": 0.1,
-            "center": 0.5,
-        },
-        "method": "gradcam++",
+        "heatmap_url": None,  # heatmap image serving not yet implemented
+        "region_scores": vis.get("region_scores"),
+        "key_findings": exp.get("key_findings", []),
+        "clinical_plausibility": exp.get("clinical_plausibility"),
+        "method": vis.get("method", "gradcam++"),
+        "target_class": result.get("prediction"),
+        "target_class_name": result.get("class_name"),
     }
 
 

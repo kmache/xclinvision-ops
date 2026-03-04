@@ -1,67 +1,37 @@
-# Swin-T — model-specific overrides (merged on top of system.yaml)
 name: swin_t
 type: transformer
 
 architecture:
-  backbone: swin_tiny_patch4_window7_224
+  backbone: swin_t
   pretrained: true
   num_classes: 3
-  dropout_rate: 0.2
+  dropout_rate: 0.3
   head:
     type: sequential
     layers:
-      - type: layernorm
-        normalized_shape: 768
+      - type: adaptive_avg_pool2d
+        output_size: [1, 1]
       - type: flatten
-      - type: dropout
-        p: 0.2
       - type: linear
-        in_features: 768  # Swin-T feature dim
-        out_features: 256
-      - type: gelu
+        in_features: 768
+        out_features: 512
+      - type: relu
       - type: dropout
-        p: 0.2
+        p: 0.3
       - type: linear
-        in_features: 256
+        in_features: 512
         out_features: 3
 
 transfer_learning:
   freeze_backbone: false
   differential_lr:
     enabled: true
-    backbone_lr: 5.0e-6
-    head_lr: 5.0e-5
+    backbone_lr: 1.0e-5
+    head_lr: 1.0e-4
 
-# Override system defaults where this model differs
 input:
-  size: [224, 224]  # Swin is pre-trained at 224
-
-training:
-  batch_size: 16  # Smaller batch for transformer memory
-  gradient_accumulation_steps: 2
-  optimizer:
-    lr: 5.0e-5
-    weight_decay: 0.05
-    betas: [0.9, 0.999]
-  scheduler:
-    warmup_epochs: 10
-    min_lr: 1.0e-7
+  size: [384, 384]
 
 explainability:
-  method: attention_rollout
-  target_layer: layers
-  discard_ratio: 0.9
-
-comparison:
-  category: Hierarchical Vision Transformer
-  strengths:
-    - Excellent localization
-    - State-of-the-art for pneumonia detection
-    - Captures global context
-  weaknesses:
-    - Complex architecture
-    - Needs more data
-    - Higher latency
-  expected_performance:
-    recall_pneumonia: 0.91
-    ece: 0.18
+  method: gradcam++
+  target_layer: layers.3

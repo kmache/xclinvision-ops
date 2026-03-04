@@ -1,4 +1,3 @@
-# EfficientNet-B2 — model-specific overrides (merged on top of system.yaml)
 name: efficientnet_b2
 type: cnn
 
@@ -13,13 +12,9 @@ architecture:
       - type: adaptive_avg_pool2d
         output_size: [1, 1]
       - type: flatten
-      - type: dropout
-        p: 0.3
       - type: linear
-        in_features: 1408  # EfficientNet-B2 feature dim
+        in_features: 1408
         out_features: 512
-      - type: batch_norm1d
-        num_features: 512
       - type: relu
       - type: dropout
         p: 0.3
@@ -29,32 +24,14 @@ architecture:
 
 transfer_learning:
   freeze_backbone: false
-  freeze_bn: true
   differential_lr:
     enabled: true
     backbone_lr: 1.0e-5
     head_lr: 1.0e-4
 
-# Override system defaults only where this model differs
 input:
   size: [384, 384]
 
-uncertainty:
-  mc_dropout:
-    dropout_rate: 0.3
-
 explainability:
   method: gradcam++
-  target_layer: features
-
-comparison:
-  category: CNN (Modern)
-  strengths:
-    - Best accuracy-compute trade-off
-    - Commonly used in production
-    - Efficient architecture
-  weaknesses:
-    - Slightly slower than ResNet-50
-  expected_performance:
-    recall_pneumonia: 0.92
-    ece: 0.05
+  target_layer: blocks.6

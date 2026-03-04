@@ -31,20 +31,30 @@ logger = logging.getLogger(__name__)
 DEFAULT_CLASS_NAMES: List[str] = ["Normal", "Pneumonia", "Tuberculosis"]
 
 LUNG_REGIONS: Dict[str, Tuple[float, float, float, float]] = {
-    # Patient RIGHT lung is on the LEFT side of the image (x: 0.0 to 0.5)
-    "right_upper":  (0.00, 0.00, 0.50, 0.33),
-    "right_middle": (0.00, 0.33, 0.50, 0.66),
-    "right_lower":  (0.00, 0.66, 0.50, 1.00),
-
-    # Patient LEFT lung is on the RIGHT side of the image (x: 0.5 to 1.0)
-    "left_upper":   (0.50, 0.00, 1.00, 0.33),
-    "left_middle":  (0.50, 0.33, 1.00, 0.66),
-    "left_lower":   (0.50, 0.66, 1.00, 1.00),
-    
-    # Central and upper structures
-    "hilar":        (0.30, 0.30, 0.70, 0.70),
-    "cardiac":      (0.40, 0.40, 0.60, 0.80),
-    "apical":       (0.20, 0.00, 0.80, 0.25),
+    # ---------------------------------------------------------------
+    # Mutually-exclusive lateral lung zones (relative x,y in [0,1]).
+    # Patient RIGHT lung is on LEFT of image (x: 0.00–0.45)
+    # Patient LEFT lung is on RIGHT of image (x: 0.55–1.00)
+    # A deliberate 0.10-wide central corridor (x: 0.45–0.55) is left
+    # unassigned to avoid double-counting mediastinal structures.
+    # ---------------------------------------------------------------
+    "right_upper":  (0.00, 0.00, 0.45, 0.33),
+    "right_middle": (0.00, 0.33, 0.45, 0.66),
+    "right_lower":  (0.00, 0.66, 0.45, 1.00),
+    "left_upper":   (0.55, 0.00, 1.00, 0.33),
+    "left_middle":  (0.55, 0.33, 1.00, 0.66),
+    "left_lower":   (0.55, 0.66, 1.00, 1.00),
+    # ---------------------------------------------------------------
+    # Anatomical marker regions – intentionally overlap lateral zones
+    # because these structures are physically located in those areas.
+    # Treat scores here as supplementary, not exclusive.
+    # ---------------------------------------------------------------
+    # Hilar: para-mediastinal, strictly central-middle strip
+    "hilar":   (0.35, 0.33, 0.65, 0.60),
+    # Cardiac: lower-central, slightly above the diaphragm
+    "cardiac": (0.38, 0.45, 0.62, 0.72),
+    # Apical: uppermost dome — narrowed to reduce overlap with upper zones
+    "apical":  (0.20, 0.00, 0.80, 0.20),
 }
 
 #: ImageNet statistics — used for normalization.
@@ -117,7 +127,30 @@ class GradCAMPlusPlus:
         grads = self.gradients[0]
         acts = self.activations[0]
 
-        if acts.ndim != 3:
+        # Transformers (Swin, ViT) produce (num_patches, C) — reshape to (C, H, W)
+        if acts.ndim == 2:
+            num_patches, C = acts.shape
+            # L-3 fix: handle non-square patch grids (e.g. Swin with non-power-of-2
+            # image sizes) instead of blindly assuming a perfect square.
+            H_sq = int(num_patches ** 0.5)
+            if H_sq * H_sq == num_patches:
+                H = W = H_sq
+            else:
+                # Find the largest factor <= sqrt(num_patches) for the most
+                # square-like grid, then set W = num_patches // H.
+                H, W = 1, num_patches
+                for f in range(H_sq, 0, -1):
+                    if num_patches % f == 0:
+                        H, W = f, num_patches // f
+                        break
+            if H * W != num_patches:
+                raise RuntimeError(
+                    f"Cannot reshape transformer activations {acts.shape} into any "
+                    f"rectangular spatial grid. num_patches={num_patches}."
+                )
+            acts = acts.permute(1, 0).reshape(C, H, W)
+            grads = grads.permute(1, 0).reshape(C, H, W)
+        elif acts.ndim != 3:
             raise RuntimeError(
                 f"Expected 2D spatial feature map (C, H, W), got {acts.shape}. "
                 "Ensure target_layer points to a Conv2d or reshaped Swin layer."
@@ -573,7 +606,12 @@ class ValidationXAI:
             "n_samples": processed,
             "clinical_plausibility": {
                 "score": mean_plaus,
-                "is_acceptable": mean_plaus >= 0.5,
+                # M-2 fix: threshold raised from 0.5 to 0.65.
+                # 0.5 was the uninformative base score — a model with completely
+                # uniform CAM activation would pass.  0.65 requires at least one
+                # clinically meaningful bonus (e.g. activation_range > 0.1 AND
+                # a class-appropriate spatial pattern).
+                "is_acceptable": mean_plaus >= 0.65,
             },
             "qc_failure_rate": qc_rate,
             "region_activation_summary": region_summary,

@@ -1,5 +1,7 @@
 """MLOps monitoring and experiment tracking."""
 
+import numpy as np
+from scipy import stats
 from collections import Counter, deque
 from typing import Any, Deque, Dict, List, Optional
 import json
@@ -53,20 +55,23 @@ class ModelRegistry:
     ):
         """Transition model to a new stage.
 
-        Note: transition_model_version_stage is deprecated in MLflow >= 2.0.
-        For MLflow >= 2.0, prefer using aliases:
-            client.set_registered_model_alias(name, alias, version)
+        L-1 fix: The new alias API (MLflow >= 2.0) and the old stage API use
+        different casing conventions.  We normalise to lowercase for aliases
+        and preserve the original casing for the legacy fallback so that model
+        lookups remain consistent regardless of MLflow version.
         """
         if MLFLOW_AVAILABLE:
             from mlflow.tracking import MlflowClient
             client = MlflowClient()
             try:
-                # MLflow >= 2.0 alias-based approach
-                alias = stage.lower()  # e.g. "production", "staging"
+                # MLflow >= 2.0: use lowercase alias (e.g. "production")
+                alias = stage.lower()
                 client.set_registered_model_alias(name, alias, str(version))
             except AttributeError:
-                # Fallback for older MLflow versions
-                client.transition_model_version_stage(name, version, stage)
+                # Fallback for MLflow < 2.0: requires title-cased stage name
+                # (e.g. "Production", "Staging", "Archived")
+                legacy_stage = stage.capitalize()
+                client.transition_model_version_stage(name, version, legacy_stage)
 
 
 class PredictionLogger:
@@ -174,8 +179,6 @@ class DriftDetector:
             Dict with keys: drift_detected, drift_score, threshold,
             per_feature_ks, per_feature_pvalue.
         """
-        import numpy as np
-        from scipy import stats
 
         if self._baseline_samples is None:
             raise RuntimeError("Baseline not set — call set_baseline() first")

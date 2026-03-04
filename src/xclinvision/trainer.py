@@ -24,6 +24,10 @@ from sklearn.metrics import classification_report, confusion_matrix
 
 from .modeling import freeze_backbone, unfreeze_layers, get_param_counts
 
+# Determine PL major version once at import time so _apply_unfreeze_schedule
+# can branch without repeated string parsing.
+_PL_MAJOR = int(pl.__version__.split(".")[0])
+
 
 # ---------------------------------------------------------------------------
 # Loss
@@ -50,7 +54,12 @@ class FocalLoss(nn.Module):
             n_classes = inputs.size(-1)
             targets_oh = F.one_hot(targets, n_classes).float()
             targets_oh = targets_oh * (1 - self.label_smoothing) + (self.label_smoothing / n_classes)
-            ce_loss = F.cross_entropy(inputs, targets_oh, weight=self.weight, reduction="none")
+            # F.cross_entropy ignores the `weight` tensor when targets are float
+            # (soft labels). Apply class weights manually via the hard label index.
+            ce_loss = F.cross_entropy(inputs, targets_oh, reduction="none")
+            if self.weight is not None:
+                sample_weights = self.weight[targets]  # (B,)
+                ce_loss = ce_loss * sample_weights
         else:
             ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction="none")
 
@@ -97,6 +106,7 @@ class XClinVisionModel(pl.LightningModule):
         self.unfreeze_schedule = unfreeze_schedule or [0, 5, 10, 20]
         self.current_phase = 0
         self.label_smoothing = label_smoothing
+        self._oom_steps = 0  # L-2: track OOM-skipped batches per epoch
 
         # Loss function
         weight_tensor = (
@@ -108,7 +118,7 @@ class XClinVisionModel(pl.LightningModule):
         metrics = MetricCollection({
             "acc": Accuracy(task="multiclass", num_classes=num_classes),
             "f1_macro": F1Score(task="multiclass", num_classes=num_classes, average="macro"),
-            "auc": AUROC(task="multiclass", num_classes=num_classes),
+            "auc": AUROC(task="multiclass", num_classes=num_classes, average="macro"),
         })
         self.train_metrics = metrics.clone(prefix="train_")
         self.val_metrics = metrics.clone(prefix="val_")
@@ -163,25 +173,46 @@ class XClinVisionModel(pl.LightningModule):
                 
             self.print(f"Epoch {self.current_epoch}: Phase {target_phase} - {msg}")
 
-            # Rebuild optimizer so newly unfrozen params are included.
-            # configure_optimizers filters by requires_grad, so this is necessary.
+            # Rebuild / extend the optimizer so newly unfrozen parameters
+            # are included in gradient updates.
             if self.trainer is not None:
-                try:
-                    # PL 1.x API
-                    self.trainer.strategy.setup_optimizers(self.trainer)
-                except (AttributeError, TypeError):
-                    # PL 2.x: add newly unfrozen params directly to existing optimizer
-                    optimizers = self.optimizers()
-                    if not isinstance(optimizers, list):
-                        optimizers = [optimizers]
-                    opt = optimizers[0]
+                if _PL_MAJOR >= 2:
+                    # PL 2.x: add each new param individually with the same
+                    # backbone/head discriminative LR used in configure_optimizers.
+                    opt = self.optimizers()
+                    if isinstance(opt, list):
+                        opt = opt[0]
                     existing_ids = {id(p) for group in opt.param_groups for p in group["params"]}
-                    new_params = [
-                        p for p in self.model.parameters()
-                        if p.requires_grad and id(p) not in existing_ids
-                    ]
-                    if new_params:
-                        opt.add_param_group({"params": new_params, "lr": self.learning_rate * 0.1, "name": "progressive"})
+                    named_params = list(self.model.named_parameters())
+                    head_cutoff = int(len(named_params) * 0.9)
+                    new_backbone, new_head = [], []
+                    for i, (name, param) in enumerate(named_params):
+                        if not param.requires_grad or id(param) in existing_ids:
+                            continue
+                        is_head = i >= head_cutoff or any(
+                            k in name for k in ("head", "fc", "classifier")
+                        )
+                        (new_head if is_head else new_backbone).append(param)
+                    if new_backbone:
+                        opt.add_param_group({
+                            "params": new_backbone,
+                            "lr": self.learning_rate * 0.1,
+                            "name": "progressive_backbone",
+                        })
+                    if new_head:
+                        opt.add_param_group({
+                            "params": new_head,
+                            "lr": self.learning_rate,
+                            "name": "progressive_head",
+                        })
+                else:
+                    # PL 1.x: fully rebuild the optimizer from scratch via strategy.
+                    try:
+                        self.trainer.strategy.setup_optimizers(self.trainer)
+                    except Exception as exc:
+                        logger.warning(
+                            f"Could not rebuild optimizer after unfreeze (PL 1.x): {exc}"
+                        )
 
     # ---- forward / steps --------------------------------------------------
 
@@ -194,21 +225,50 @@ class XClinVisionModel(pl.LightningModule):
 
     def training_step(self, batch, _batch_idx):
         x, y = batch
-        logits = self(x)
-        loss = self.criterion(logits, y)
+        try:
+            logits = self(x)
+            loss = self.criterion(logits, y)
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            self._oom_steps += 1
+            logger.warning(
+                f"[OOM] training_step skipped (batch_size={x.shape[0]}, "
+                f"img_size={x.shape[-1]}). Consider reducing --batch-size."
+            )
+            return None
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.train_metrics.update(logits, y)
         return loss
 
     def on_train_epoch_end(self):
-        self.log_dict(self.train_metrics.compute(), prog_bar=True)
-        self.train_metrics.reset()
+        try:
+            self.log_dict(self.train_metrics.compute(), prog_bar=True)
+        except ValueError:
+            logger.warning("[OOM] Entire train epoch was skipped — no samples to compute metrics.")
+        finally:
+            if self._oom_steps > 0:
+                self.log("train_oom_steps", float(self._oom_steps), prog_bar=False)
+                logger.warning(
+                    f"Epoch {self.current_epoch}: {self._oom_steps} training "
+                    f"batch(es) were skipped due to OOM — metrics are computed "
+                    f"over the remaining batches only."
+                )
+                self._oom_steps = 0
+            self.train_metrics.reset()
 
     def validation_step(self, batch, _batch_idx):
         x, y = batch
-        logits = self(x)
-        loss = self.criterion(logits, y)
+        try:
+            logits = self(x)
+            loss = self.criterion(logits, y)
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            logger.warning(
+                f"[OOM] validation_step skipped (batch_size={x.shape[0]}, "
+                f"img_size={x.shape[-1]}). Consider reducing --batch-size."
+            )
+            return None
         probs = F.softmax(logits, dim=1)
         preds = torch.argmax(logits, dim=1)
 
@@ -220,8 +280,12 @@ class XClinVisionModel(pl.LightningModule):
         return {"val_loss": loss.detach(), "preds": preds, "targets": y, "probs": probs}
 
     def on_validation_epoch_end(self):
-        self.log_dict(self.val_metrics.compute(), prog_bar=True)
-        self.val_metrics.reset()
+        try:
+            self.log_dict(self.val_metrics.compute(), prog_bar=True)
+        except ValueError:
+            logger.warning("[OOM] Entire validation epoch was skipped — no samples to compute metrics.")
+        finally:
+            self.val_metrics.reset()
 
     def test_step(self, batch, _batch_idx):
         x, y = batch
@@ -235,8 +299,12 @@ class XClinVisionModel(pl.LightningModule):
         return {"test_loss": loss.detach(), "preds": preds, "targets": y, "probs": probs}
 
     def on_test_epoch_end(self):
-        self.log_dict(self.test_metrics.compute(), prog_bar=True)
-        self.test_metrics.reset()
+        try:
+            self.log_dict(self.test_metrics.compute(), prog_bar=True)
+        except ValueError:
+            logger.warning("[OOM] Entire test epoch was skipped — no samples to compute metrics.")
+        finally:
+            self.test_metrics.reset()
 
     # ---- optimizer --------------------------------------------------------
 
@@ -324,11 +392,14 @@ class MetricsCallback(Callback):
         preds = np.array(self.val_preds)
         targets = np.array(self.val_targets)
 
-        # Classification report
+        # Classification report — pass labels explicitly so it always covers
+        # all 3 classes even when a small batch (e.g. sanity check) is missing one
+        target_names = ["Normal", "Pneumonia", "Tuberculosis"]
         report = classification_report(
             targets,
             preds,
-            target_names=["Normal", "Pneumonia", "Tuberculosis"],
+            labels=list(range(len(target_names))),
+            target_names=target_names,
             output_dict=True,
             zero_division=0,
         )
@@ -340,8 +411,9 @@ class MetricsCallback(Callback):
                     if isinstance(value, (int, float)):
                         pl_module.log(f"val_{cls_name}_{metric_name}", float(value))
 
-        # Confusion matrix
-        cm = confusion_matrix(targets, preds)
+        # Confusion matrix — pass labels so the matrix is always (num_classes x
+        # num_classes) even when a single class dominates a small batch.
+        cm = confusion_matrix(targets, preds, labels=list(range(len(target_names))))
         logger.info(f"\nConfusion Matrix (epoch {trainer.current_epoch}):\n{cm}")
 
         # Save predictions if requested

@@ -3,10 +3,8 @@ dataset.py - Handles all data-related operations, including loading, augmentatio
 """
 
 import logging
-from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Optional, Tuple, Dict
-
+from typing import Callable, Optional, Tuple
 import albumentations as A
 import cv2
 import numpy as np
@@ -23,7 +21,7 @@ CLASS_MAP = {"normal": 0, "pneumonia": 1, "tuberculosis": 2}
 # ---------------------------------------------------------------------------
 # 1. Albumentations Transforms (Optimized & Medical-Safe)
 # ---------------------------------------------------------------------------
-def get_train_transforms(image_size: int = 224) -> A.Compose:
+def get_train_transforms(image_size: int = 384) -> A.Compose:
     """Robust medical-safe augmentation pipeline."""
     return A.Compose([
         A.RandomResizedCrop(
@@ -32,14 +30,18 @@ def get_train_transforms(image_size: int = 224) -> A.Compose:
             ratio=(1.0, 1.0),
             p=1.0),
         A.HorizontalFlip(p=0.5),
-        A.Affine(translate_percent=0.05, scale=(0.9, 1.1), rotate=(-7, 7), p=0.3),
+        A.RandomBrightnessContrast(brightness_limit=0.4, contrast_limit=0.4, p=0.8),
+        A.HueSaturationValue(hue_shift_limit=0, sat_shift_limit=20, val_shift_limit=20, p=0.5),
+        #A.Affine(translate_percent=0.05, scale=(0.9, 1.1), rotate=(-7, 7), p=0.3),
         A.RandomGamma(gamma_limit=(90, 110), p=0.3),
-        A.GaussNoise(p=0.2),
+        A.GaussianBlur(blur_limit=(3, 7), p=0.3),
+        #A.GaussNoise(p=0.2),
+        A.CoarseDropout(max_holes=8, max_height=40, max_width=40, fill_value=0, p=0.5),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
 
-def get_val_transforms(image_size: int = 224) -> A.Compose:
+def get_val_transforms(image_size: int = 384) -> A.Compose:
     return A.Compose([
         A.Resize(height=image_size, width=image_size, interpolation=cv2.INTER_AREA),
         A.Normalize(
@@ -60,11 +62,10 @@ class ChestXrayDataset(Dataset):
         self._cache_size = cache_size
         self.fallback_size = fallback_size
         self.labels = [CLASS_MAP[row['class'].lower()] for _, row in self.df.iterrows()]
-        
-        if cache_size > 0:
-            self._load_image = lru_cache(maxsize=cache_size)(self._load_image_impl)
-        else:
-            self._load_image = self._load_image_impl
+        # H-2 fix: use a plain dict instead of lru_cache on a bound method.
+        # lru_cache wrapping self._load_image_impl creates a strong-reference cycle
+        # (cache -> bound-method -> self -> cache) that delays GC and bloats memory.
+        self._image_cache: dict = {}
             
     def _load_image_impl(self, image_path: str) -> np.ndarray:
         try:
@@ -74,6 +75,17 @@ class ChestXrayDataset(Dataset):
             logger.error(f"Error loading {image_path}: {e}")
             image = np.zeros((self.fallback_size, self.fallback_size), dtype=np.uint8)
         return np.stack([image, image, image], axis=-1)
+
+    def _load_image(self, image_path: str) -> np.ndarray:
+        """Load image with FIFO dict cache that avoids reference cycles."""
+        if self._cache_size <= 0:
+            return self._load_image_impl(image_path)
+        if image_path not in self._image_cache:
+            if len(self._image_cache) >= self._cache_size:
+                # Evict the oldest inserted entry (Python 3.7+ dict preserves insertion order)
+                self._image_cache.pop(next(iter(self._image_cache)))
+            self._image_cache[image_path] = self._load_image_impl(image_path)
+        return self._image_cache[image_path]
         
     def __len__(self) -> int:
         return len(self.df)
@@ -98,7 +110,7 @@ class ChestXrayDataModule(pl.LightningDataModule):
         manifest_path: str, 
         batch_size: int = 32, 
         num_workers: int = 4,
-        image_size: int = 224, 
+        image_size: int = 384, 
         cache_size: int = 1000, 
         use_weighted_sampler: bool = True,
     ):
@@ -139,7 +151,7 @@ class ChestXrayDataModule(pl.LightningDataModule):
         if not self.use_weighted_sampler: return None
         weights = self.get_class_weights()
         sample_weights = torch.DoubleTensor([weights[l].item() for l in self.train_dataset.labels])
-        return WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+        return WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=False)
 
     def train_dataloader(self):
         sampler = self.get_sampler()
@@ -147,7 +159,7 @@ class ChestXrayDataModule(pl.LightningDataModule):
             self.train_dataset, batch_size=self.batch_size, shuffle=(sampler is None),
             sampler=sampler, num_workers=self.num_workers, pin_memory=True, drop_last=bool(sampler)
         )
-        
+         
     def val_dataloader(self):
         return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True)
         

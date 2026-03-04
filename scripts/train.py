@@ -8,6 +8,7 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
+import torch
 import yaml
 
 # Add src to python path for local imports
@@ -37,6 +38,58 @@ from xclinvision.trainer import (
 
 
 SYSTEM_CONFIG = Path(__file__).parent.parent / "configs" / "system.yaml"
+
+# ---------------------------------------------------------------------------
+# Dataset summary
+# ---------------------------------------------------------------------------
+
+def log_dataset_summary(manifest_path: str) -> None:
+    """Print a verbose dataset summary (directories + per-split/class counts)."""
+    import pandas as pd
+
+    manifest = Path(manifest_path)
+    if not manifest.exists():
+        print(f"[warn] Manifest not found: {manifest} – skipping dataset summary.")
+        return
+
+    df = pd.read_csv(manifest)
+    required = {"split", "class", "filepath_processed"}
+    if required - set(df.columns):
+        print(f"[warn] Manifest missing columns {required - set(df.columns)} – skipping summary.")
+        return
+
+    splits = [s for s in ("train", "val", "test") if s in df["split"].unique()]
+    classes = sorted(df["class"].unique().tolist())
+
+    SEP  = "=" * 64
+    DASH = "-" * 64
+    print(SEP)
+    print("  XClinVision  –  Dataset Summary")
+    print(SEP)
+    print(f"  Manifest : {manifest.resolve()}")
+    print(DASH)
+
+    grand_total = 0
+    for split in splits:
+        split_df = df[df["split"] == split]
+        # Derive the split directory from the first filepath in this split
+        sample_path = Path(split_df["filepath_processed"].iloc[0])
+        # filepath_processed is typically  data/processed/<split>/<class>/img.jpg
+        # so the split dir is two levels up from the file
+        split_dir = sample_path.parent.parent.resolve()
+        print(f"  Split : {split.upper():<5}  |  {split_dir}")
+        split_total = 0
+        for cls in classes:
+            n = int((split_df["class"] == cls).sum())
+            split_total += n
+            print(f"    {cls:<18} : {n:>6} images")
+        grand_total += split_total
+        print(f"    {'SPLIT TOTAL':<18} : {split_total:>6} images")
+        print(DASH)
+
+    print(f"  {'GRAND TOTAL':<22} : {grand_total:>6} images")
+    print(SEP)
+    print()
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -124,7 +177,11 @@ def main():
         use_weighted_sampler=False,  # class_weights passed to loss instead
     )
     data_module.setup(stage="fit")
-    
+
+    # ---- verbose dataset summary ----------------------------------------
+    log_dataset_summary(args.manifest)
+    # ---------------------------------------------------------------------
+
     # Compute class weights from training data
     class_weights = data_module.get_class_weights().tolist()
     print(f"Computed class weights: {class_weights}")
@@ -226,7 +283,19 @@ def main():
         lgr.log_hyperparams(hparams)
 
     print(f"\n--- Starting XClinVision Train | Model: {args.model} | Epochs: {args.epochs} | Image size: {image_size} ---")
-    trainer.fit(pl_module, datamodule=data_module)
+    try:
+        trainer.fit(pl_module, datamodule=data_module)
+    except torch.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        print(
+            f"\n[OOM] Training '{args.model}' ran out of GPU memory.\n"
+            f"  Current batch_size : {args.batch_size}\n"
+            f"  Current img_size   : {image_size}\n"
+            f"  Suggestions:\n"
+            f"    --batch-size {max(1, args.batch_size // 2)}   (halve batch size)\n"
+            f"    export PYTORCH_ALLOC_CONF=expandable_segments:True\n"
+        )
+        sys.exit(1)
 
     # 6. Final Evaluation on test set
     # PL calls data_module.setup("test") internally before running test_dataloader()

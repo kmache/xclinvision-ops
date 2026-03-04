@@ -1,8 +1,8 @@
-name: resnet50
+name: efficientnet_b4
 type: cnn
 
 architecture:
-  backbone: resnet50
+  backbone: efficientnet_b4
   pretrained: true
   num_classes: 3
   dropout_rate: 0.3
@@ -13,7 +13,7 @@ architecture:
         output_size: [1, 1]
       - type: flatten
       - type: linear
-        in_features: 2048
+        in_features: 1792
         out_features: 512
       - type: relu
       - type: dropout
@@ -34,4 +34,4 @@ input:
 
 explainability:
   method: gradcam++
-  target_layer: layer4
+  target_layer: blocks.6

@@ -48,7 +48,11 @@ data:
   
   # Data Split
   split:
-    method: "patient_wise"
+    # C-5 note: organize_data.py now uses hash-bucket patient-wise splitting
+    # for the TB dataset and improved patient-ID extraction for the Chest X-ray
+    # dataset.  True patient-wise separation still requires explicit patient
+    # metadata (not embedded in these filenames) for perfect leakage prevention.
+    method: "patient_wise_best_effort"
     train_ratio: 0.7
     val_ratio: 0.15
     test_ratio: 0.15
@@ -56,6 +60,10 @@ data:
     random_seed: 42
 
 # Augmentation Configuration
+# H-5 NOTE: this section is REFERENCE DOCUMENTATION ONLY.
+# The actual training augmentations are hard-coded in src/xclinvision/dataset.py
+# (get_train_transforms / get_val_transforms) and are NOT loaded from this file.
+# Update dataset.py if you need to change the augmentation pipeline.
 augmentation:
   enabled: true
   train_transforms:

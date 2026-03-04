@@ -13,3 +13,4 @@ scipy
 mlflow
 open_clip_torch
 tensorboard
+langchain

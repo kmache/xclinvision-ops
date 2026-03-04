@@ -121,7 +121,8 @@ def clean_dark_overlays(image: np.ndarray, dark_thresh: int = 30, min_area_ratio
     return image
 
 
-def process_and_filter_xray(input_data: Union[str, Path, np.ndarray], target_size: int = 384, min_area_ratio: float = DEFAULT_MIN_AREA_RATIO) -> Tuple[Optional[np.ndarray], str]:
+def process_and_filter_xray(input_data: Union[str, Path, np.ndarray], target_size: int = 384,
+                             min_area_ratio: float = DEFAULT_MIN_AREA_RATIO) -> Tuple[Optional[np.ndarray], str]:
     """Smart cropping, artifact cleaning, CLAHE, and resizing to square."""
     if isinstance(input_data, (str, Path)):
         img = cv2.imread(str(input_data), cv2.IMREAD_GRAYSCALE)
@@ -437,6 +438,23 @@ def run_processing_pipeline(
     df = load_dataset_metadata(raw_dir)
     report.total_images = len(df)
 
+    # M-4 fix: merge source dataset tags if the metadata file written by
+    # organize_data.py is present.  This lets downstream analysis distinguish
+    # Normal images from 'chest_xray_pneumonia' vs 'tuberculosis_chest_xray'
+    # (two different hospital/scanner distributions that are both labelled
+    # "normal" but may introduce distribution-specific artefacts).\n    
+
+    source_meta_path = raw_dir / "source_metadata.csv"
+    if source_meta_path.exists():
+        try:
+            src_df = pd.read_csv(source_meta_path)
+            df = df.merge(src_df[["filename", "source_dataset"]], on="filename", how="left")
+            logger.info("Merged source_metadata.csv: %d rows matched", df["source_dataset"].notna().sum())
+        except Exception as exc:
+            logger.warning("Could not merge source_metadata.csv: %s", exc)
+    if "source_dataset" not in df.columns:
+        df["source_dataset"] = "unknown"
+
     if report.total_images == 0:
         logger.warning("No images found. Aborting.")
         return report
@@ -529,7 +547,8 @@ def run_processing_pipeline(
                 "filepath_original": filepath,
                 "filepath_processed": str(dest),
                 "split": row["split"],
-                "class": row["class"]
+                "class": row["class"],
+                "source_dataset": row.get("source_dataset", "unknown"),
             })
             report.processed += 1
             

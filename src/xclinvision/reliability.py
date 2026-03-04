@@ -93,14 +93,18 @@ class ReliabilityAnalyzer:
         train_mean = np.mean(train_embeddings, axis=0)
         train_cov = np.cov(train_embeddings.T)
         
-        # Add small regularization for numerical stability
-        train_cov += np.eye(train_cov.shape[0]) * 1e-6
+        # H-3 fix: 1e-6 is far too small for high-dimensional embeddings (e.g.
+        # 768-dim ViT/Swin features) where the covariance matrix is rank-deficient
+        # when n_samples < feature_dim.  Use 1e-2 to ensure stable inversion.
+        train_cov += np.eye(train_cov.shape[0]) * 1e-2
         
         # Compute inverse covariance
         try:
-            inv_cov = np.linalg.inv(train_cov)
-        except np.linalg.LinAlgError:
+            # Prefer pseudo-inverse: robust to rank-deficiency even after regularization
             inv_cov = np.linalg.pinv(train_cov)
+        except np.linalg.LinAlgError:
+            inv_cov = np.eye(train_cov.shape[0])
+            logger.warning("Covariance inversion failed; using identity matrix (OOD distances are unreliable).")
         
         def _mahalanobis(embeddings: np.ndarray) -> np.ndarray:
             diffs = embeddings - train_mean
