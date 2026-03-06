@@ -1,14 +1,18 @@
 """LLM-based Clinical Decision Support Agent with RAG."""
 
-from typing import Dict, List, Optional
+import json
+import logging
 import os
 from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 try:
-    from langchain import OpenAI, LLMChain, PromptTemplate
-    from langchain.embeddings import HuggingFaceEmbeddings
-    from langchain.vectorstores import Chroma
-    from langchain.chains import RetrievalQA
+    from langchain_openai import ChatOpenAI
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain_community.vectorstores import Qdrant
+    from qdrant_client import QdrantClient
     LANGCHAIN_AVAILABLE = True
 except ImportError:
     LANGCHAIN_AVAILABLE = False
@@ -22,6 +26,8 @@ class ClinicalContext:
     confidence: float
     uncertainty_level: str
     highlighted_regions: List[str]
+    # Optional — if supplied, used to label each probability; works for any number of classes
+    class_names: Optional[List[str]] = None
     patient_age: Optional[int] = None
     patient_sex: Optional[str] = None
 
@@ -40,43 +46,59 @@ class ClinicalDecisionSupportAgent:
         self.model = model
         self.temperature = temperature
         self.vector_db_path = vector_db_path
-        
+        self.llm = None
+        self.retriever = None
+        self.vector_store = None
+
         if not LANGCHAIN_AVAILABLE:
-            print("Warning: LangChain not available. Using mock responses.")
-            
+            logger.warning(
+                "LangChain / Qdrant packages not available. "
+                "Using rule-based fallback responses."
+            )
+            return
+
         self._init_llm()
         self._init_rag()
         
     def _init_llm(self):
         """Initialize LLM client."""
-        if LANGCHAIN_AVAILABLE:
-            if self.llm_provider == "openai":
-                from langchain.chat_models import ChatOpenAI
-                self.llm = ChatOpenAI(
-                    model_name=self.model,
-                    temperature=self.temperature,
+        if self.llm_provider == "openai":
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise EnvironmentError(
+                    "OPENAI_API_KEY environment variable is not set. "
+                    "Set it before instantiating ClinicalDecisionSupportAgent."
                 )
-            else:
-                raise ValueError(f"Unsupported LLM provider: {self.llm_provider}")
+            self.llm = ChatOpenAI(
+                model_name=self.model,
+                temperature=self.temperature,
+                api_key=api_key,
+            )
+            logger.info("LLM initialised: provider=%s model=%s", self.llm_provider, self.model)
+        else:
+            raise ValueError(f"Unsupported LLM provider: {self.llm_provider}")
                 
     def _init_rag(self):
-        """Initialize RAG components."""
-        if LANGCHAIN_AVAILABLE and self.vector_db_path:
-            embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2"
-            )
-            
-            self.vector_store = Chroma(
-                persist_directory=self.vector_db_path,
-                embedding_function=embeddings,
-            )
-            
-            self.retriever = self.vector_store.as_retriever(
-                search_kwargs={"k": 5}
-            )
-        else:
-            self.vector_store = None
-            self.retriever = None
+        """Initialize RAG components backed by Qdrant."""
+        if not self.vector_db_path:
+            logger.info("No vector_db_path provided — RAG disabled.")
+            return
+
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        # QdrantClient with a local path persists to disk.
+        # Pass url="http://localhost:6333" for a remote Qdrant server.
+        client = QdrantClient(path=self.vector_db_path)
+        self.vector_store = Qdrant(
+            client=client,
+            collection_name="clinical_guidelines",
+            embeddings=embeddings,
+        )
+        self.retriever = self.vector_store.as_retriever(
+            search_kwargs={"k": 5}
+        )
+        logger.info("Qdrant RAG initialised from '%s'.", self.vector_db_path)
             
     def generate_report(
         self,
@@ -102,17 +124,18 @@ Guidelines:
         retrieved_context = ""
         if self.retriever:
             query = f"{context.prediction} chest X-ray findings {', '.join(context.highlighted_regions)}"
-            docs = self.retriever.get_relevant_documents(query)
+            docs = self.retriever.invoke(query)
             retrieved_context = "\n\n".join([d.page_content for d in docs[:3]])
             
         # Generate response
-        if LANGCHAIN_AVAILABLE:
+        if LANGCHAIN_AVAILABLE and self.llm is not None:
             full_prompt = f"{system_prompt}\n\n{retrieved_context}\n\n{user_prompt}"
             
             try:
-                response = self.llm.predict(full_prompt)
+                response = self.llm.invoke(full_prompt).content
                 structured_output = self._parse_response(response)
             except Exception as e:
+                logger.exception("LLM call failed: %s", e)
                 structured_output = self._generate_fallback_response(context, str(e))
         else:
             structured_output = self._generate_fallback_response(context)
@@ -131,8 +154,11 @@ Guidelines:
 - Confidence: {context.confidence:.1%}
 - Uncertainty Level: {context.uncertainty_level}
 - Highlighted Regions: {', '.join(context.highlighted_regions) if context.highlighted_regions else 'None specifically'}
-- Class Probabilities: Normal={context.probabilities[0]:.1%}, Pneumonia={context.probabilities[1]:.1%}, TB={context.probabilities[2]:.1%}
 """
+        # Build class probabilities dynamically — works for any num_classes
+        names = context.class_names or [f"Class {i}" for i in range(len(context.probabilities))]
+        prob_str = ", ".join(f"{n}={p:.1%}" for n, p in zip(names, context.probabilities))
+        prompt += f"- Class Probabilities: {prob_str}\n"
         
         if context.patient_age:
             prompt += f"- Patient Age: {context.patient_age}\n"
@@ -157,7 +183,6 @@ Format the response as a JSON object with these keys."""
         
     def _parse_response(self, response: str) -> Dict:
         """Parse LLM response into structured format."""
-        import json
         
         try:
             # Try to extract JSON from response
@@ -167,7 +192,7 @@ Format the response as a JSON object with these keys."""
             if start != -1 and end != 0:
                 json_str = response[start:end]
                 return json.loads(json_str)
-        except:
+        except (json.JSONDecodeError, ValueError):
             pass
             
         # Fallback: return as text
@@ -204,28 +229,32 @@ Format the response as a JSON object with these keys."""
         
         recommendation = "Clinical correlation with patient history, symptoms, and physical examination is essential. "
         
-        if context.prediction in ["Pneumonia", "Tuberculosis"]:
+        if context.prediction in ["Pneumonia", "Cardiomegaly"]:
             recommendation += "Consider additional imaging (CT) and laboratory tests if clinically indicated."
         else:
             recommendation += "Follow standard clinical protocols for patient management."
             
-        return {
+        result: Dict = {
             "findings": findings,
             "impression": impression,
             "uncertainty": uncertainty_note,
             "recommendation": recommendation,
-            "error": error_msg,
         }
+        if error_msg is not None:
+            result["error"] = error_msg
+        return result
 
 
 def create_agent(
     llm_provider: str = "openai",
     model: str = "gpt-4",
+    temperature: float = 0.3,
     vector_db_path: Optional[str] = None,
 ) -> ClinicalDecisionSupportAgent:
     """Factory function to create a clinical decision support agent."""
     return ClinicalDecisionSupportAgent(
         llm_provider=llm_provider,
         model=model,
+        temperature=temperature,
         vector_db_path=vector_db_path,
     )

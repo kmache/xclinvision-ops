@@ -237,7 +237,7 @@ class FailureAnalyzer:
     """Analyze model failure modes."""
     
     def __init__(self, class_names: Optional[List[str]] = None):
-        self.class_names = class_names or ["Normal", "Pneumonia", "Tuberculosis"]
+        self.class_names = class_names or ["Normal", "Pneumonia", "Cardiomegaly"]
         
     def analyze_failures(
         self,

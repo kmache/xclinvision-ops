@@ -16,9 +16,7 @@ import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
-from sklearn.model_selection import train_test_split
-
+from typing import Optional, Tuple, Union
 import cv2
 import numpy as np
 import pandas as pd
@@ -282,133 +280,6 @@ def load_dataset_metadata(raw_dir: Union[Path, str]) -> pd.DataFrame:
         
     return df
 
-# This allows creating proper train/val/test splits when raw data is just class folders
-def create_stratified_split(
-    data_dir: str,
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15,
-    test_ratio: float = 0.15,
-    seed: int = 42
-) -> Tuple[List[str], List[str], List[str], List[str], List[str], List[str]]:
-    """
-    Create stratified train/val/test splits from a directory of images.
-    
-    This function is useful when the original dataset doesn't have proper splits
-    or when you want to create custom splits with specific ratios.
-    
-    Args:
-        data_dir: Root directory containing class subdirectories
-        train_ratio: Proportion of data for training
-        val_ratio: Proportion of data for validation
-        test_ratio: Proportion of data for testing
-        seed: Random seed for reproducibility
-        
-    Returns:
-        Tuple of (train_paths, val_paths, test_paths, 
-                 train_labels, val_labels, test_labels)
-    """
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-5, \
-        "Split ratios must sum to 1.0"
-    
-    data_dir = Path(data_dir)
-    all_images = []
-    all_labels = []
-    
-    # Collect all images and labels
-    for class_dir in sorted(data_dir.iterdir()):
-        if not class_dir.is_dir():
-            continue
-            
-        class_name = class_dir.name.lower()
-        
-        # Load all images in this class (supporting multiple extensions)
-        for ext in IMAGE_EXTS:
-            for img_path in class_dir.glob(f'*{ext}'):
-                all_images.append(str(img_path))
-                all_labels.append(class_name)
-    
-    if len(all_images) == 0:
-        raise ValueError(f"No images found in {data_dir}")
-    
-    # Encode labels for stratification
-    from sklearn.preprocessing import LabelEncoder
-    le = LabelEncoder()
-    label_indices = le.fit_transform(all_labels)
-    
-    # First split: train vs (val + test)
-    train_imgs, temp_imgs, train_lbls, temp_lbls = train_test_split(
-        all_images,
-        all_labels,
-        test_size=(val_ratio + test_ratio),
-        stratify=label_indices,
-        random_state=seed
-    )
-    
-    # Second split: val vs test
-    val_ratio_adjusted = val_ratio / (val_ratio + test_ratio)
-    
-    # Re-encode temp labels for second stratification
-    temp_indices = le.transform(temp_lbls)
-    val_imgs, test_imgs, val_lbls, test_lbls = train_test_split(
-        temp_imgs,
-        temp_lbls,
-        test_size=(1 - val_ratio_adjusted),
-        stratify=temp_indices,
-        random_state=seed
-    )
-    
-    logger.info(f"Created stratified split: {len(train_imgs)} train, {len(val_imgs)} val, {len(test_imgs)} test")
-    return train_imgs, val_imgs, test_imgs, train_lbls, val_lbls, test_lbls
-
-
-def save_split_metadata(
-    train_paths: List[str],
-    val_paths: List[str],
-    test_paths: List[str],
-    train_labels: List[str],
-    val_labels: List[str],
-    test_labels: List[str],
-    output_dir: str
-):
-    """
-    Save split information to CSV files for reproducibility.
-    
-    Args:
-        train_paths: Training image paths
-        val_paths: Validation image paths
-        test_paths: Test image paths
-        train_labels: Training labels
-        val_labels: Validation labels
-        test_labels: Test labels
-        output_dir: Directory to save metadata
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    all_data = []
-    # Save each split
-    for split_name, paths, labels in [
-        ('train', train_paths, train_labels),
-        ('val', val_paths, val_labels),
-        ('test', test_paths, test_labels)
-    ]:
-        df = pd.DataFrame({
-            'filepath_processed': paths, # Added for dataset.py compatibility
-            'class': labels,             # Added for dataset.py compatibility
-            'split': [split_name] * len(paths), # Added for dataset.py compatibility
-            'image_path': paths,         # Left for backward compatibility
-            'label': labels
-        })
-        df.to_csv(output_dir / f'{split_name}_split.csv', index=False)
-        all_data.append(df)
-        
-    # Attempt to unify for users loading straight into ChestXrayDataModule 
-    if all_data:
-        combined_df = pd.concat(all_data, ignore_index=True)
-        combined_df.to_csv(output_dir / 'manifest_splits.csv', index=False)
-        
-    logger.info(f"Split metadata saved to {output_dir}")
-
 
 @dataclass
 class PipelineReport:
@@ -436,13 +307,7 @@ def run_processing_pipeline(
 
     logger.info("Scanning raw dataset at %s …", raw_dir)
     df = load_dataset_metadata(raw_dir)
-    report.total_images = len(df)
-
-    # M-4 fix: merge source dataset tags if the metadata file written by
-    # organize_data.py is present.  This lets downstream analysis distinguish
-    # Normal images from 'chest_xray_pneumonia' vs 'tuberculosis_chest_xray'
-    # (two different hospital/scanner distributions that are both labelled
-    # "normal" but may introduce distribution-specific artefacts).\n    
+    report.total_images = len(df) 
 
     source_meta_path = raw_dir / "source_metadata.csv"
     if source_meta_path.exists():
@@ -477,13 +342,11 @@ def run_processing_pipeline(
             hashes.append(compute_image_hash(Path(fp)))
         df['hash'] = hashes
 
-        # Group by hash and categorize
         for img_hash, group_df in df.groupby('hash'):
             entries = group_df.to_dict('records')
             hash_to_entries[img_hash] = entries
             unique_classes = group_df['class'].unique()
 
-            # --- Cross-class conflict: same pixels, different labels ---
             if len(unique_classes) > 1:
                 cross_class_hashes.add(img_hash)
                 report.duplicates_cross_class += len(entries)
@@ -618,37 +481,10 @@ def main() -> None:
     parser.add_argument("--output-format", type=str, default="png", choices=["png", "jpg"])
     parser.add_argument("--duplicate-dir", type=str, default="data/duplicate", help="Output dir for cross-class duplicate images")
     parser.add_argument("--skip-duplicate-check", action="store_true", help="Skip duplicate detection across splits")
-    
-    parser.add_argument("--create-splits", action="store_true", 
-                       help="Create stratified train/val/test splits from flat class folders")
-    parser.add_argument("--train-ratio", type=float, default=0.7, help="Training set ratio")
-    parser.add_argument("--val-ratio", type=float, default=0.15, help="Validation set ratio")
-    parser.add_argument("--test-ratio", type=float, default=0.15, help="Test set ratio")
-    parser.add_argument("--split-seed", type=int, default=42, help="Random seed for split creation")
-    
+
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
-
-    if args.create_splits:
-        logging.info("Creating stratified splits from %s", args.raw_dir)
-        train_imgs, val_imgs, test_imgs, train_lbls, val_lbls, test_lbls = create_stratified_split(
-            args.raw_dir,
-            train_ratio=args.train_ratio,
-            val_ratio=args.val_ratio,
-            test_ratio=args.test_ratio,
-            seed=args.split_seed
-        )
-        
-        # Save metadata for reproducibility
-        save_split_metadata(
-            train_imgs, val_imgs, test_imgs,
-            train_lbls, val_lbls, test_lbls,
-            args.raw_dir
-        )
-        
-        logging.info("Stratified splits created. Run again without --create-splits to process.")
-        return
 
     run_processing_pipeline(
         raw_dir=args.raw_dir,

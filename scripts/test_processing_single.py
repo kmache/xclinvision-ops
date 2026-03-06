@@ -5,7 +5,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 import cv2
 from xclinvision.processing import process_and_filter_xray
 
-img_path = Path("/home/karim-mache/Documents/nouncode-ai/portfolio_projects/xclinvision-ops/data/raw/train/tuberculosis/tuberculosis-9349.jpg")
+img_path = Path("/home/karim-mache/Documents/nouncode-ai/portfolio_projects/xclinvision-ops/data/raw/train/cardiomegaly/cardiomegaly-9349.jpg")
 img, status = process_and_filter_xray(img_path)
 print(f"Status: {status}")
 if img is not None:

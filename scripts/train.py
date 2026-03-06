@@ -161,6 +161,7 @@ def main():
     # Resolve values: CLI flag > config > hardcoded default
     image_size = config.get("input", {}).get("size", [224, 224])
     image_size = image_size[0] if isinstance(image_size, list) else image_size
+    num_classes = config.get("model", {}).get("num_classes", 3)
     weight_decay = args.weight_decay if args.weight_decay is not None else opt_cfg.get("weight_decay", 1e-4)
     label_smoothing = args.label_smoothing if args.label_smoothing is not None else train_cfg.get("label_smoothing", 0.1)
 
@@ -174,7 +175,7 @@ def main():
         num_workers=args.num_workers,
         image_size=image_size,
         cache_size=args.cache_size,
-        use_weighted_sampler=False,  # class_weights passed to loss instead
+        use_weighted_sampler=False,  
     )
     data_module.setup(stage="fit")
 
@@ -182,14 +183,13 @@ def main():
     log_dataset_summary(args.manifest)
     # ---------------------------------------------------------------------
 
-    # Compute class weights from training data
     class_weights = data_module.get_class_weights().tolist()
     print(f"Computed class weights: {class_weights}")
 
     # 2. Build Base Model
     base_model = build_model(
         model_name=args.model,
-        num_classes=3,
+        num_classes=num_classes,
         pretrained=not args.no_pretrained,
         img_size=image_size,
     )
@@ -197,7 +197,7 @@ def main():
     # 3. Setup Lightning Module
     pl_module = XClinVisionModel(
         model=base_model,
-        num_classes=3,
+        num_classes=num_classes,
         learning_rate=args.lr,
         weight_decay=weight_decay,
         loss_type=args.loss,
@@ -215,21 +215,20 @@ def main():
         LearningRateMonitor(logging_interval="step"),
         RichProgressBar(),
         EarlyStopping(
-            monitor="val_auc",
-            mode="max",
-            patience=15,
+            monitor="val_loss",
+            mode="min",
+            patience=7,
             min_delta=0.001,
         ),
         ModelCheckpoint(
             dirpath=str(output_path),
-            filename=f"{args.model}-{{epoch:02d}}-{{val_auc:.4f}}",
-            monitor="val_auc",
-            mode="max",
-            save_top_k=3,
+            filename=f"{args.model}-{{epoch:02d}}-{{val_loss:.4f}}",
+            monitor="val_loss",
+            mode="min",
+            save_top_k=1,
         ),
     ]
 
-    # Add custom diagnostic callbacks
     callbacks.extend([
         MetricsCallback(
             save_predictions=True, 
@@ -243,7 +242,6 @@ def main():
         ),
     ])
     
-    # Using both TensorBoard and MLFlow loggers
     loggers = [
         TensorBoardLogger(save_dir=f"{args.output_dir}/logs", name=args.model),
         MLFlowLogger(experiment_name="xclinvision", run_name=f"{args.model}_{run_ts}"),
@@ -298,10 +296,8 @@ def main():
         sys.exit(1)
 
     # 6. Final Evaluation on test set
-    # PL calls data_module.setup("test") internally before running test_dataloader()
     print("\n--- Running Final Evaluation ---")
     trainer.test(pl_module, datamodule=data_module)
-
 
 if __name__ == "__main__":
     main()

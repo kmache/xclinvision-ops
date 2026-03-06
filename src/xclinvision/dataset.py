@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 logger = logging.getLogger(__name__)
 
-CLASS_MAP = {"normal": 0, "pneumonia": 1, "tuberculosis": 2}
+CLASS_MAP = {"normal": 0, "pneumonia": 1, "cardiomegaly": 2}
 
 # ---------------------------------------------------------------------------
 # 1. Albumentations Transforms (Optimized & Medical-Safe)
@@ -31,11 +31,11 @@ def get_train_transforms(image_size: int = 384) -> A.Compose:
             p=1.0),
         A.HorizontalFlip(p=0.5),
         A.RandomBrightnessContrast(brightness_limit=0.4, contrast_limit=0.4, p=0.8),
+        A.Affine(translate_percent=0.05, scale=(0.9, 1.1), rotate=(-7, 7), p=0.3),
         A.HueSaturationValue(hue_shift_limit=0, sat_shift_limit=20, val_shift_limit=20, p=0.5),
-        #A.Affine(translate_percent=0.05, scale=(0.9, 1.1), rotate=(-7, 7), p=0.3),
         A.RandomGamma(gamma_limit=(90, 110), p=0.3),
+        A.GaussNoise(p=0.2),
         A.GaussianBlur(blur_limit=(3, 7), p=0.3),
-        #A.GaussNoise(p=0.2),
         A.CoarseDropout(max_holes=8, max_height=40, max_width=40, fill_value=0, p=0.5),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
@@ -62,9 +62,6 @@ class ChestXrayDataset(Dataset):
         self._cache_size = cache_size
         self.fallback_size = fallback_size
         self.labels = [CLASS_MAP[row['class'].lower()] for _, row in self.df.iterrows()]
-        # H-2 fix: use a plain dict instead of lru_cache on a bound method.
-        # lru_cache wrapping self._load_image_impl creates a strong-reference cycle
-        # (cache -> bound-method -> self -> cache) that delays GC and bloats memory.
         self._image_cache: dict = {}
             
     def _load_image_impl(self, image_path: str) -> np.ndarray:
@@ -82,7 +79,6 @@ class ChestXrayDataset(Dataset):
             return self._load_image_impl(image_path)
         if image_path not in self._image_cache:
             if len(self._image_cache) >= self._cache_size:
-                # Evict the oldest inserted entry (Python 3.7+ dict preserves insertion order)
                 self._image_cache.pop(next(iter(self._image_cache)))
             self._image_cache[image_path] = self._load_image_impl(image_path)
         return self._image_cache[image_path]
@@ -133,7 +129,6 @@ class ChestXrayDataModule(pl.LightningDataModule):
         if {'split', 'class', 'filepath_processed'} - set(df.columns):
             raise ValueError("Manifest missing required columns")
 
-        # Respect PL's stage convention to avoid building unused datasets
         if stage in ("fit", None):
             self.train_dataset = ChestXrayDataset(df[df['split'] == 'train'], get_train_transforms(self.image_size), self.cache_size, fallback_size=self.image_size)
             self.val_dataset = ChestXrayDataset(df[df['split'] == 'val'], get_val_transforms(self.image_size), self.cache_size, fallback_size=self.image_size)
@@ -143,7 +138,7 @@ class ChestXrayDataModule(pl.LightningDataModule):
     def get_class_weights(self) -> torch.Tensor:
         counts = self.train_dataset.df['class'].value_counts().to_dict()
         total = sum(counts.values()) or 1
-        class_counts = [max(counts.get(k, 0), 1) for k in ["normal", "pneumonia", "tuberculosis"]]
+        class_counts = [max(counts.get(k, 0), 1) for k in ["normal", "pneumonia", "cardiomegaly"]]
         weights = torch.FloatTensor([total / (3 * max(class_counts[i], 1)) for i in range(3)])
         return weights / weights.sum() * len(weights)
 
@@ -192,10 +187,10 @@ class ChestXrayDataModule(pl.LightningDataModule):
                     'val': val_counts.get('pneumonia', 0),
                     'test': test_counts.get('pneumonia', 0)
                 },
-                'tuberculosis': {
-                    'train': train_counts.get('tuberculosis', 0),
-                    'val': val_counts.get('tuberculosis', 0),
-                    'test': test_counts.get('tuberculosis', 0)
+                'cardiomegaly': {
+                    'train': train_counts.get('cardiomegaly', 0),
+                    'val': val_counts.get('cardiomegaly', 0),
+                    'test': test_counts.get('cardiomegaly', 0)
                 }
             },
             'class_weights': self.get_class_weights().tolist()

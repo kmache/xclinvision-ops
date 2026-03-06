@@ -6,7 +6,10 @@ including progressive unfreezing, focal loss, and comprehensive metrics tracking
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 from typing import List, Optional
 
 import torch
@@ -25,7 +28,6 @@ from sklearn.metrics import classification_report, confusion_matrix
 from .modeling import freeze_backbone, unfreeze_layers, get_param_counts
 
 # Determine PL major version once at import time so _apply_unfreeze_schedule
-# can branch without repeated string parsing.
 _PL_MAJOR = int(pl.__version__.split(".")[0])
 
 
@@ -103,7 +105,7 @@ class XClinVisionModel(pl.LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.progressive_unfreezing = progressive_unfreezing
-        self.unfreeze_schedule = unfreeze_schedule or [0, 5, 10, 20]
+        self.unfreeze_schedule = unfreeze_schedule or [1, 5, 10, 20]
         self.current_phase = 0
         self.label_smoothing = label_smoothing
         self._oom_steps = 0  # L-2: track OOM-skipped batches per epoch
@@ -116,7 +118,7 @@ class XClinVisionModel(pl.LightningModule):
 
         # TorchMetrics — distributed-safe, auto-synced across devices
         metrics = MetricCollection({
-            "acc": Accuracy(task="multiclass", num_classes=num_classes),
+            "acc": Accuracy(task="multiclass", num_classes=num_classes, average="macro"),
             "f1_macro": F1Score(task="multiclass", num_classes=num_classes, average="macro"),
             "auc": AUROC(task="multiclass", num_classes=num_classes, average="macro"),
         })
@@ -147,7 +149,6 @@ class XClinVisionModel(pl.LightningModule):
         raise ValueError(f"Unknown loss type: {loss_type}")
 
     # ---- progressive unfreezing -------------------------------------------
-
     def _apply_unfreeze_schedule(self):
         """Apply progressive unfreezing based on current epoch."""
         if not self.progressive_unfreezing:
@@ -173,12 +174,8 @@ class XClinVisionModel(pl.LightningModule):
                 
             self.print(f"Epoch {self.current_epoch}: Phase {target_phase} - {msg}")
 
-            # Rebuild / extend the optimizer so newly unfrozen parameters
-            # are included in gradient updates.
             if self.trainer is not None:
                 if _PL_MAJOR >= 2:
-                    # PL 2.x: add each new param individually with the same
-                    # backbone/head discriminative LR used in configure_optimizers.
                     opt = self.optimizers()
                     if isinstance(opt, list):
                         opt = opt[0]
@@ -275,8 +272,6 @@ class XClinVisionModel(pl.LightningModule):
         self.log("val_loss", loss, on_epoch=True, prog_bar=True)
         self.val_metrics.update(logits, y)
 
-        # Return dict so callbacks (e.g. MetricsCallback) can collect outputs
-        # Detach val_loss so PL doesn't retain the full computation graph in memory
         return {"val_loss": loss.detach(), "preds": preds, "targets": y, "probs": probs}
 
     def on_validation_epoch_end(self):
@@ -315,19 +310,12 @@ class XClinVisionModel(pl.LightningModule):
         head_cutoff = int(len(named_params) * 0.9)
 
         for i, (name, param) in enumerate(named_params):
-            # Only register params that currently require gradients to avoid
-            # PyTorch UserWarning about requires_grad=False params in optimizer groups.
-            # Progressive unfreezing calls configure_optimizers again via
-            # trainer.strategy.setup_optimizers() so newly unfrozen params are picked up.
             if not param.requires_grad:
                 continue
             if i >= head_cutoff or any(k in name for k in ("head", "fc", "classifier")):
                 head_params.append(param)
             else:
                 backbone_params.append(param)
-
-        # Guard: AdamW raises ValueError on an empty param list.
-        # Build groups dynamically so neither an empty backbone nor empty head crashes.
         param_groups = []
         if backbone_params:
             param_groups.append({"params": backbone_params, "lr": self.learning_rate * 0.1, "name": "backbone"})
@@ -391,10 +379,7 @@ class MetricsCallback(Callback):
 
         preds = np.array(self.val_preds)
         targets = np.array(self.val_targets)
-
-        # Classification report — pass labels explicitly so it always covers
-        # all 3 classes even when a small batch (e.g. sanity check) is missing one
-        target_names = ["Normal", "Pneumonia", "Tuberculosis"]
+        target_names = ["Normal", "Pneumonia", "Cardiomegaly"]
         report = classification_report(
             targets,
             preds,
@@ -411,8 +396,6 @@ class MetricsCallback(Callback):
                     if isinstance(value, (int, float)):
                         pl_module.log(f"val_{cls_name}_{metric_name}", float(value))
 
-        # Confusion matrix — pass labels so the matrix is always (num_classes x
-        # num_classes) even when a single class dominates a small batch.
         cm = confusion_matrix(targets, preds, labels=list(range(len(target_names))))
         logger.info(f"\nConfusion Matrix (epoch {trainer.current_epoch}):\n{cm}")
 
@@ -442,6 +425,104 @@ class MetricsCallback(Callback):
         filepath = os.path.join(self.output_dir, f"val_predictions_{timestamp}.json")
         with open(filepath, "w") as f:
             json.dump(save_data, f, indent=2)
+
+
+class BestModelExportCallback(Callback):
+    """
+    Exports the best model weights as a portable ``xclinvision_{model_name}_{run_id}.pth``
+    file at the end of training.  The file contains only the model ``state_dict`` plus
+    lightweight metadata so it can be loaded for inference without PyTorch Lightning.
+
+    Loading example::
+
+        ckpt = torch.load("models/xclinvision_resnet50_v0c4f.pth", map_location="cpu")
+        model = build_model(ckpt["model_name"], num_classes=ckpt["num_classes"], pretrained=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
+    """
+
+    CLASS_MAP = {"normal": 0, "pneumonia": 1, "cardiomegaly": 2}
+
+    def __init__(
+        self,
+        model_name: str,
+        export_dir: str,
+        num_classes: int = 3,
+        run_id: Optional[str] = None,
+    ):
+        super().__init__()
+        self.model_name = model_name
+        self.export_dir = export_dir
+        self.num_classes = num_classes
+        # Deterministic short ID: "v" + first 4 hex chars of sha256(model_name)
+        if run_id is None:
+            digest = hashlib.sha256(model_name.encode()).hexdigest()[:4]
+            self.run_id = f"v{digest}"
+        else:
+            self.run_id = run_id
+
+    def on_train_end(self, trainer, pl_module) -> None:  # type: ignore[override]
+        """Load the best checkpoint and export a clean .pth weights file."""
+        # Locate the ModelCheckpoint callback
+        ckpt_callback = next(
+            (cb for cb in trainer.callbacks if hasattr(cb, "best_model_path")),
+            None,
+        )
+        if ckpt_callback is None:
+            logger.warning("BestModelExportCallback: no ModelCheckpoint found — skipping .pth export.")
+            return
+
+        best_path = ckpt_callback.best_model_path
+        if not best_path or not os.path.exists(best_path):
+            logger.warning(
+                f"BestModelExportCallback: best_model_path '{best_path}' not found — skipping .pth export."
+            )
+            return
+
+        try:
+            raw = torch.load(best_path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            logger.error(f"BestModelExportCallback: failed to load checkpoint '{best_path}': {exc}")
+            return
+
+        # Strip the "model." prefix that PL adds to every key in state_dict
+        raw_sd = raw.get("state_dict", {})
+        model_sd = {
+            k[len("model."):]: v
+            for k, v in raw_sd.items()
+            if k.startswith("model.")
+        }
+        if not model_sd:
+            logger.warning("BestModelExportCallback: no 'model.*' keys found in checkpoint — skipping .pth export.")
+            return
+
+        # Pull best metric / epoch from the checkpoint path name if possible
+        best_val_auc = getattr(ckpt_callback, "best_model_score", None)
+        best_val_auc = float(best_val_auc) if best_val_auc is not None else None
+
+        payload = {
+            "model_state_dict": model_sd,
+            "model_name": self.model_name,
+            "num_classes": self.num_classes,
+            "run_id": self.run_id,
+            "class_map": self.CLASS_MAP,
+            "best_val_auc": best_val_auc,
+            "source_ckpt": best_path,
+        }
+
+        os.makedirs(self.export_dir, exist_ok=True)
+        out_name = f"xclinvision_{self.model_name}_{self.run_id}.pth"
+        out_path = os.path.join(self.export_dir, out_name)
+        torch.save(payload, out_path)
+
+        # Write a companion metadata JSON for quick inspection without loading tensors
+        meta = {k: v for k, v in payload.items() if k != "model_state_dict"}
+        meta_path = os.path.join(self.export_dir, f"xclinvision_{self.model_name}_{self.run_id}_meta.json")
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+        logger.info(f"[BestModelExport] Saved → {out_path}  (val_auc={best_val_auc})")
+        print(f"\n  Best model exported → {out_path}")
 
 
 class XAIValidationCallback(Callback):
@@ -475,8 +556,6 @@ class XAIValidationCallback(Callback):
             output_path = f"{self.output_dir}/epoch_{epoch:03d}"
             xai = ValidationXAI(pl_module.model, self.architecture, output_path, img_size=self.image_size)
 
-            # val_dataloaders is a list in PL ≥ 1.6; use the first dataloader.
-            # In PL 2.x the attribute may be None if the datamodule hasn't been
             # set up yet — fall back to the datamodule if available.
             val_dataloaders = getattr(trainer, "val_dataloaders", None)
             if val_dataloaders is None and trainer.datamodule is not None:

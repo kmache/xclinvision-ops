@@ -14,3 +14,10 @@ mlflow
 open_clip_torch
 tensorboard
 langchain
+langchain-openai
+langchain-community
+unstructured[pdf]
+poppler-utils
+tesseract
+qdrant-client
+tiktoken

@@ -50,6 +50,13 @@ data/quarantine/
 data/duplicate/ 
 data/processed/
 data/vector_db/
+data/NIH_ChestX-ray14/test/
+data/NIH_ChestX-ray14/train/
+data/NIH_ChestX-ray14/val/
+data/NIH-ChestX-ray3/val/
+data/NIH-ChestX-ray3/train/
+data/NIH-ChestX-ray3/test/
+NIH_ChestX-ray14/
 # Keep the directory structure on Git
 !data/raw/.gitkeep
 !data/processed/.gitkeep 

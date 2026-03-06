@@ -27,7 +27,7 @@ data:
     - name: "tb_chest_xray"
       source: "kaggle"
       kaggle_id: ""  # Add specific dataset ID
-      classes: ["Normal", "Tuberculosis"]
+      classes: ["Normal", "Cardiomegaly"]
   
   # Preprocessing
   target_size: [384, 384]  # Height, Width
@@ -48,10 +48,6 @@ data:
   
   # Data Split
   split:
-    # C-5 note: organize_data.py now uses hash-bucket patient-wise splitting
-    # for the TB dataset and improved patient-ID extraction for the Chest X-ray
-    # dataset.  True patient-wise separation still requires explicit patient
-    # metadata (not embedded in these filenames) for perfect leakage prevention.
     method: "patient_wise_best_effort"
     train_ratio: 0.7
     val_ratio: 0.15
@@ -60,10 +56,6 @@ data:
     random_seed: 42
 
 # Augmentation Configuration
-# H-5 NOTE: this section is REFERENCE DOCUMENTATION ONLY.
-# The actual training augmentations are hard-coded in src/xclinvision/dataset.py
-# (get_train_transforms / get_val_transforms) and are NOT loaded from this file.
-# Update dataset.py if you need to change the augmentation pipeline.
 augmentation:
   enabled: true
   train_transforms:
@@ -95,7 +87,7 @@ augmentation:
 model:
   name: "efficientnet_b2"
   num_classes: 3
-  class_names: ["Normal", "Pneumonia", "Tuberculosis"]
+  class_names: ["Normal", "Pneumonia", "Cardiomegaly"]
   pretrained: true
   dropout_rate: 0.3
   

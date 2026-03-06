@@ -1,10 +1,18 @@
 name: efficientnet_b2
 type: cnn
 
+# Override model.num_classes here to train with a different number of classes.
+# Update class_names to match. Examples:
+#   2 classes: ["Normal", "Pneumonia"]
+#   4 classes: ["Normal", "Pneumonia", "Cardiomegaly", "COVID-19"]
+model:
+  num_classes: 3
+  class_names: ["Normal", "Pneumonia", "Cardiomegaly"]
+
 architecture:
   backbone: efficientnet_b2
   pretrained: true
-  num_classes: 3
+  num_classes: 3  # keep in sync with model.num_classes above
   dropout_rate: 0.3
   head:
     type: sequential

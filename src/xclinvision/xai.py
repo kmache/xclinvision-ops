@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Constants & Radiological Mappings
 # ---------------------------------------------------------------------------
 
-DEFAULT_CLASS_NAMES: List[str] = ["Normal", "Pneumonia", "Tuberculosis"]
+DEFAULT_CLASS_NAMES: List[str] = ["Normal", "Pneumonia", "Cardiomegaly"]
 
 LUNG_REGIONS: Dict[str, Tuple[float, float, float, float]] = {
     # ---------------------------------------------------------------
@@ -267,7 +267,7 @@ def extract_findings(
     basal = (region_scores.get("left_lower", 0.0) + region_scores.get("right_lower", 0.0)) / 2.0
     
     if apical > basal * 1.5 and apical > high_threshold:
-        findings.append("Apical predominance (often associated with Tuberculosis)")
+        findings.append("Apical predominance (often associated with Cardiomegaly)")
     elif basal > apical * 1.5 and basal > high_threshold:
         findings.append("Basal predominance (often associated with Pneumonia)")
 
@@ -301,11 +301,13 @@ def clinical_plausibility_score(
         mid = (region_scores.get("left_middle", 0) + region_scores.get("right_middle", 0)) / 2
         if basal > 0.2 or mid > 0.2:
             score += 0.3
-    elif "tuberculosis" in class_name_lower or "tb" in class_name_lower:
-        apical = region_scores.get("apical", 0)
-        upper = (region_scores.get("left_upper", 0) + region_scores.get("right_upper", 0)) / 2
-        if apical > 0.2 or upper > 0.2:
+    elif "cardiomegaly" in class_name_lower:
+        # Cardiomegaly: attention should concentrate on the cardiac/central region
+        cardiac = region_scores.get("cardiac", 0)
+        if cardiac > 0.3:
             score += 0.3
+        elif cardiac > 0.15:
+            score += 0.15
 
     if activation_range > 0.1:
         score += 0.15

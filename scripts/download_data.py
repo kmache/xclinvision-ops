@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 EXPECTED_SPLITS = ["train", "val", "test"]
-EXPECTED_CLASSES = ["normal", "pneumonia", "tuberculosis"]
+EXPECTED_CLASSES = ["normal", "pneumonia", "cardiomegaly"]
 
 
 def download_dataset(
@@ -14,7 +14,7 @@ def download_dataset(
     force: bool = False,
 ):
     """
-    Downloads the Chest X-Ray Dataset (Normal / Pneumonia / Tuberculosis)
+    Downloads the Chest X-Ray Dataset (Normal / Pneumonia / Cardiomegaly)
     via KaggleHub and organises it into data/raw/{train,val,test}/{class}/.
 
     If force=True, the Kaggle cache for this dataset is wiped first so a

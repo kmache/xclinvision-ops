@@ -32,7 +32,7 @@ class MetricsComputer:
     """
 
     def __init__(self, class_names: Optional[List[str]] = None):
-        self.class_names = class_names or ["Normal", "Pneumonia", "Tuberculosis"]
+        self.class_names = class_names or ["Normal", "Pneumonia", "Cardiomegaly"]
 
     # ------------------------------------------------------------------
     # Full metric suite

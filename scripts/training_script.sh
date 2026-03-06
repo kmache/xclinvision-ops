@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run full training suite — calls each per-model script in sequence.
 # To train a single model, run its script directly:
-#   bash scripts/run_train/train_resnet50.sh
+#   bash scripts/run_training/train_resnet50.sh
 
 set -e
 
@@ -12,7 +12,7 @@ run() {
   echo "================================================================"
   echo "  Training: $1"
   echo "================================================================"
-  bash "$SCRIPT_DIR/run_train/$1"
+  bash "$SCRIPT_DIR/run_training/$1"
 }
 
 echo "Starting model training suite..."

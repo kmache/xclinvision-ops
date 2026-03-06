@@ -56,16 +56,18 @@ class BiomedCLIPClassifier(nn.Module):
             )
         
         logger.info("Loading Microsoft BiomedCLIP foundation model...")
-        model_name = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
+        hub_id = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
         
         try:
-            model, _, _ = open_clip.create_model_and_transforms(model_name)
+            if pretrained:
+                model, _, _ = open_clip.create_model_and_transforms(hub_id)
+            else:
+                model = open_clip.create_model('ViT-B-16', pretrained=False)
             self.vision_encoder = model.visual
         except Exception as e:
             logger.error(f"Failed to load BiomedCLIP: {e}")
             raise
         
-        # Dynamically determine the feature dimension
         dummy_input = torch.zeros(1, 3, 224, 224)
         with torch.no_grad():
             feat_dim = self.vision_encoder(dummy_input).shape[-1]
@@ -93,7 +95,6 @@ class BiomedCLIPClassifier(nn.Module):
                 last_block = self.vision_encoder.blocks[-1]
                 return getattr(last_block, 'attn', last_block)
             
-            # Fallback
             for name, module in reversed(list(self.vision_encoder.named_modules())):
                 if 'attn' in name.lower() and hasattr(module, 'qkv'):
                     return module
@@ -114,7 +115,6 @@ class BiomedCLIPClassifier(nn.Module):
                     nn.init.zeros_(param)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # BiomedCLIP's internal ViT strictly expects 224x224. Resize if incoming tensor is different.
         if x.shape[-1] != 224 or x.shape[-2] != 224:
             x = torch.nn.functional.interpolate(x, size=(224, 224), mode='bicubic', align_corners=False)
         features = self.vision_encoder(x)
@@ -129,7 +129,6 @@ class EnsembleClassifier(nn.Module):
     Ensemble of multiple models for robust predictions.
     Supports 'average' (logits) and 'vote' (probabilities) methods.
     """
-    
     def __init__(self, models: List[nn.Module], method: str = 'average', weights: Optional[List[float]] = None, img_size: int = 224):
         super().__init__()
         if not models:
@@ -156,7 +155,6 @@ class EnsembleClassifier(nn.Module):
     
     def _validate_models(self):
         first_model = self.models[0]
-        # Get device safely
         device = next(first_model.parameters()).device if list(first_model.parameters()) else torch.device('cpu')
         dummy_input = torch.randn(1, 3, self.img_size, self.img_size, device=device)
         
@@ -228,7 +226,6 @@ def build_model(
         model_kwargs["drop_path_rate"] = drop_path_rate
         logger.info(f"Using drop_path_rate={drop_path_rate} for {model_name}")
         
-    # Pass img_size to transformers to automatically interpolate positional embeddings
     if any(x in model_name for x in ['vit', 'swin', 'deit']):
         model_kwargs["img_size"] = img_size
     
@@ -355,10 +352,8 @@ def unfreeze_layers(model: nn.Module, num_layers: int = 0) -> None:
     if num_layers < 0:
         raise ValueError(f"num_layers must be >= 0, got {num_layers}")
     
-    # 1. Freeze everything, then unfreeze head
     freeze_backbone(model, unfreeze_head=True)
     
-    # 2. Find the primary sequence of blocks in the model
     target_seq = None
     if hasattr(model, 'blocks') and isinstance(model.blocks, nn.Sequential):
         target_seq = model.blocks
@@ -367,11 +362,10 @@ def unfreeze_layers(model: nn.Module, num_layers: int = 0) -> None:
     elif hasattr(model, 'layers') and isinstance(model.layers, nn.Sequential):
         target_seq = model.layers
     else:
-        target_seq = model # Fallback to top-level model
+        target_seq = model 
         
     children = list(target_seq.children())
     
-    # 3. Unfreeze the last N blocks from the sequence
     children_to_unfreeze = children[-num_layers:] if num_layers < len(children) else children
     for child in children_to_unfreeze:
         for param in child.parameters():
@@ -452,7 +446,7 @@ if __name__ == "__main__":
     TEST_MODELS = [
         "densenet", "resnet50", "efficientnet_b0", "efficientnet_b2",
         "convnext_tiny", "vit_small", "swin_t",
-        # "biomedclip",  # Uncomment if open_clip installed
+        "biomedclip",  # Uncomment if open_clip installed
     ]
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'

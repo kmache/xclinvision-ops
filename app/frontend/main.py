@@ -8,10 +8,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 import streamlit as st
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw
 import numpy as np
 import io
 import json
+import cv2
 
 # Page config
 st.set_page_config(
@@ -23,12 +24,50 @@ st.set_page_config(
 
 # Constants
 API_BASE_URL = os.getenv("API_URL", "http://localhost:8000")
-CLASS_NAMES = ["Normal", "Pneumonia", "Tuberculosis"]
+CLASS_NAMES = ["Normal", "Pneumonia", "Cardiomegaly"]
 CLASS_COLORS = {
     "Normal": "#28a745",
     "Pneumonia": "#dc3545",
-    "Tuberculosis": "#fd7e14",
+    "Cardiomegaly": "#fd7e14",
 }
+
+
+def draw_bounding_box(
+    image: Image.Image,
+    heatmap: np.ndarray,
+    threshold: float = 0.4,
+    color: str = "#FF0000",
+    line_width: int = 3,
+) -> Image.Image:
+    """Draw a bounding box around the most activated heatmap region.
+
+    Parameters
+    ----------
+    image     : original PIL image
+    heatmap   : 2-D float array (values in [0, 1]) at any resolution
+    threshold : pixels above this activation level are included in the box
+    color     : hex or name colour for the rectangle
+    line_width: thickness of the drawn rectangle border
+    """
+    img = image.convert("RGB").copy()
+    w, h = img.size
+
+    # Resize heatmap to match image dimensions
+    heat_resized = cv2.resize(heatmap, (w, h), interpolation=cv2.INTER_LINEAR)
+    heat_norm = heat_resized / (heat_resized.max() + 1e-8)  # normalise 0-1
+
+    mask = heat_norm >= threshold
+    if not mask.any():
+        return img  # nothing above threshold – return image unchanged
+
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    y_min, y_max = int(rows.min()), int(rows.max())
+    x_min, x_max = int(cols.min()), int(cols.max())
+
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([x_min, y_min, x_max, y_max], outline=color, width=line_width)
+    return img
 
 
 def init_session_state():
@@ -77,7 +116,20 @@ def render_sidebar():
             value=0.5,
             step=0.1,
         )
-        
+
+        # Bounding box
+        st.markdown("**Bounding Box**")
+        show_bbox = st.toggle("Show bounding box", value=True)
+        bbox_threshold = st.slider(
+            "Activation threshold",
+            min_value=0.1,
+            max_value=0.9,
+            value=0.4,
+            step=0.05,
+            help="Pixels above this Grad-CAM activation level define the box.",
+        )
+        bbox_color = st.color_picker("Box colour", value="#FF0000")
+
         st.markdown("---")
         
         # Disclaimer
@@ -86,10 +138,10 @@ def render_sidebar():
             "It does not provide medical diagnoses and must always be used under clinician supervision."
         )
         
-        return model_name, threshold, opacity
+        return model_name, threshold, opacity, show_bbox, bbox_threshold, bbox_color
 
 
-def page_inference_explanation():
+def page_inference_explanation(show_bbox: bool = True, bbox_threshold: float = 0.4, bbox_color: str = "#FF0000"):
     """Page 1: Inference & Explanation."""
     st.header("Inference & Explanation")
     
@@ -172,12 +224,37 @@ def page_inference_explanation():
         # Explanation section
         st.markdown("---")
         st.subheader("Explainability (Grad-CAM++)")
-        
+
+        # --- Mock heatmap (replace with real API response when available) ---
+        img_w, img_h = image.size
+        mock_heatmap = np.zeros((img_h, img_w), dtype=np.float32)
+        # Simulate a right-upper-lobe activation blob
+        cy, cx = int(img_h * 0.30), int(img_w * 0.65)
+        for y in range(img_h):
+            for x in range(img_w):
+                d = np.sqrt(((y - cy) / (img_h * 0.25)) ** 2 + ((x - cx) / (img_w * 0.25)) ** 2)
+                mock_heatmap[y, x] = np.exp(-d)
+        # Apply colormap for overlay display
+        heatmap_uint8 = (mock_heatmap * 255).astype(np.uint8)
+        heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+        heatmap_color_rgb = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+        img_np = np.array(image.convert("RGB").resize((img_w, img_h)))
+        overlay = (img_np * 0.55 + heatmap_color_rgb * 0.45).astype(np.uint8)
+        overlay_pil = Image.fromarray(overlay)
+
+        if show_bbox:
+            overlay_pil = draw_bounding_box(
+                overlay_pil, mock_heatmap,
+                threshold=bbox_threshold,
+                color=bbox_color,
+                line_width=3,
+            )
+        # --------------------------------------------------------------------
+
         col3, col4 = st.columns(2)
-        
+
         with col3:
-            # Display heatmap overlay (placeholder)
-            st.image(image, use_column_width=True, caption="Grad-CAM++ Heatmap Overlay")
+            st.image(overlay_pil, use_column_width=True, caption="Grad-CAM++ Heatmap Overlay" + (" + Bounding Box" if show_bbox else ""))
             
         with col4:
             st.markdown("#### Region Importance Scores")
@@ -381,17 +458,17 @@ def main():
     render_header()
     
     # Sidebar
-    model_name, threshold, opacity = render_sidebar()
-    
+    model_name, threshold, opacity, show_bbox, bbox_threshold, bbox_color = render_sidebar()
+
     # Navigation
     page = st.sidebar.radio(
         "Navigation",
         ["Inference & Explanation", "Historical Comparison", "Report Generation", "Audit & Transparency"],
     )
-    
+
     # Render selected page
     if page == "Inference & Explanation":
-        page_inference_explanation()
+        page_inference_explanation(show_bbox=show_bbox, bbox_threshold=bbox_threshold, bbox_color=bbox_color)
     elif page == "Historical Comparison":
         page_historical_comparison()
     elif page == "Report Generation":

@@ -364,7 +364,7 @@ async def generate_report(request: ReportRequest):
     from xclinvision.agent import ClinicalContext, create_agent
     
     context = ClinicalContext(
-        prediction=["Normal", "Pneumonia", "Tuberculosis"][request.prediction],
+        prediction=["Normal", "Pneumonia", "Cardiomegaly"][request.prediction],
         probabilities=[0.0, 0.0, 0.0],  # Placeholder
         confidence=request.confidence,
         uncertainty_level=request.uncertainty_level,
