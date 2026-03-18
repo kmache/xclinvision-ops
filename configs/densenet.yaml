@@ -4,7 +4,7 @@ type: cnn
 architecture:
   backbone: densenet
   pretrained: true
-  num_classes: 3  # auto-derived from system.yaml class_names at runtime
+  # num_classes: NOT set here — derived at runtime from system.yaml model.class_names
   dropout_rate: 0.3
   head:
     type: sequential
@@ -20,7 +20,7 @@ architecture:
         p: 0.3
       - type: linear
         in_features: 512
-        out_features: 3  # must match num_classes
+        # out_features: NOT set here — determined at build time from system.yaml model.class_names
 
 transfer_learning:
   freeze_backbone: false

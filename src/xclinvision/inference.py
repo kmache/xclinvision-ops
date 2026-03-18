@@ -92,6 +92,18 @@ class InferencePipeline:
         self.dataset_std = dataset_std if dataset_std is not None else [0.229, 0.224, 0.225]
 
     # -----------------------------------------------------------------------
+    # Temperature scaling helper (DRY — used by predict, predict_batch, compute_uncertainty)
+    # -----------------------------------------------------------------------
+    def _apply_temperature(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply temperature scaling to raw logits (in-place safe)."""
+        if self.temperature_scaler is None:
+            return logits
+        if hasattr(self.temperature_scaler, "T") and isinstance(self.temperature_scaler.T, torch.Tensor):
+            return logits / self.temperature_scaler.T
+        scaled = self.temperature_scaler.scale(logits.cpu().numpy())
+        return torch.from_numpy(scaled).to(self.device)
+
+    # -----------------------------------------------------------------------
     # Pre-processing
     # -----------------------------------------------------------------------s
     def preprocess(
@@ -199,14 +211,7 @@ class InferencePipeline:
         x, vis_image = self.preprocess(image)
 
         with torch.no_grad():
-            logits = self.model(x)
-
-            if self.temperature_scaler is not None:
-                if hasattr(self.temperature_scaler, "T") and isinstance(self.temperature_scaler.T, torch.Tensor):
-                    logits = logits / self.temperature_scaler.T
-                else:
-                    scaled = self.temperature_scaler.scale(logits.cpu().numpy())
-                    logits = torch.from_numpy(scaled).to(self.device)
+            logits = self._apply_temperature(self.model(x))
 
             probs = F.softmax(logits, dim=1)
             pred_class = int(torch.argmax(probs, dim=1).item())
@@ -272,14 +277,7 @@ class InferencePipeline:
 
             self.model.eval()
             with torch.no_grad():
-                logits = self.model(x_batch)
-                if self.temperature_scaler is not None:
-                    # Keep computation on device if T is available
-                    if hasattr(self.temperature_scaler, "T") and isinstance(self.temperature_scaler.T, torch.Tensor):
-                        logits = logits / self.temperature_scaler.T
-                    else:
-                        scaled = self.temperature_scaler.scale(logits.cpu().numpy())
-                        logits = torch.from_numpy(scaled).to(self.device)
+                logits = self._apply_temperature(self.model(x_batch))
                 probs_batch = F.softmax(logits, dim=1).cpu().numpy()
             
             batched_mc_preds = None
@@ -288,13 +286,7 @@ class InferencePipeline:
                 mc_preds_list = []
                 with torch.no_grad():
                     for _ in range(self.mc_samples):
-                        mc_logits = self.model(x_batch)
-                        if self.temperature_scaler is not None:
-                            if hasattr(self.temperature_scaler, "T") and isinstance(self.temperature_scaler.T, torch.Tensor):
-                                mc_logits = mc_logits / self.temperature_scaler.T
-                            else:
-                                scaled = self.temperature_scaler.scale(mc_logits.cpu().numpy())
-                                mc_logits = torch.from_numpy(scaled).to(self.device)
+                        mc_logits = self._apply_temperature(self.model(x_batch))
                         mc_preds_list.append(F.softmax(mc_logits, dim=1).cpu().numpy())
                 self.model.eval()
                 batched_mc_preds = np.array(mc_preds_list) # Shape: (mc_samples, batch_size, num_classes)
@@ -366,13 +358,7 @@ class InferencePipeline:
         mc_preds: List[np.ndarray] = []
         with torch.no_grad():
             for _ in range(self.mc_samples):
-                logits = self.model(x)
-                if self.temperature_scaler is not None:
-                    if hasattr(self.temperature_scaler, "T") and isinstance(self.temperature_scaler.T, torch.Tensor):
-                        logits = logits / self.temperature_scaler.T
-                    else:
-                        scaled = self.temperature_scaler.scale(logits.cpu().numpy())
-                        logits = torch.from_numpy(scaled).to(self.device)
+                logits = self._apply_temperature(self.model(x))
                 mc_preds.append(F.softmax(logits, dim=1).cpu().numpy())
 
         self.model.eval()  # restore deterministic mode

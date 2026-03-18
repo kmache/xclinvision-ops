@@ -40,6 +40,7 @@ from xclinvision.evaluator import (
     TemperatureScaler,
 )
 from xclinvision.modeling import build_model, get_model_normalization
+from xclinvision.processing import get_processed_dir_for_size
 from xclinvision.reliability import FailureAnalyzer
 from xclinvision.trainer import XClinVisionModel
 from xclinvision.config import get_class_names, get_num_classes
@@ -55,16 +56,8 @@ logger = logging.getLogger("xclinvision.evaluate")
 # ---------------------------------------------------------------------------
 # Dynamic processed data resolution
 # ---------------------------------------------------------------------------
-
-def get_processed_dir_for_size(base_processed_dir: str, image_size: int) -> Path:
-    """
-    Dynamically construct processed data directory based on image size.
-    Example: base='data/processed', size=384 -> 'data/processed_384'
-    """
-    base = Path(base_processed_dir)
-    if image_size == 1024: # Backward compat
-        return base
-    return base.parent / f"{base.name}_{image_size}"
+# get_processed_dir_for_size is imported from xclinvision.processing
+# (single source of truth shared with scripts/train.py).
 
 
 def resolve_manifest_path(
@@ -75,7 +68,7 @@ def resolve_manifest_path(
     """Resolve manifest path: explicit arg takes precedence, else derive from image_size."""
     if manifest_arg:
         return manifest_arg
-    return str(get_processed_dir_for_size(processed_dir, image_size) / "manifest.csv")
+    return str(get_processed_dir_for_size(processed_dir, image_size, get_class_names()) / "manifest.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -162,10 +155,18 @@ def collect_predictions(
         x = x.to(device)
         logits = model(x)
         if tta:
-            # Fix #23: multi-augmentation TTA — horizontal flip + slight brightness
+            # Fix #4: multi-augmentation TTA — horizontal flip + slight brightness
             # boost averaged with the original logits for better robustness.
+            # Brightness is applied in the *pre-normalized* pixel space to avoid
+            # corrupting the normalized tensor distribution:
+            #   x_bright = Normalize((x * std + mean) * 1.05)
+            # Algebraically: x_bright = x * 1.05 + mean * 0.05 / std
+            mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
+            std  = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
+            x_bright = x * 1.05 + mean * 0.05 / std
+
             logits_flip   = model(torch.flip(x, dims=[-1]))   # horizontal flip
-            logits_bright = model(x * 1.05)                   # +5% brightness
+            logits_bright = model(x_bright)
             logits = (logits + logits_flip + logits_bright) / 3.0
         all_targets.append(y.cpu().numpy())
         all_logits.append(logits.cpu().numpy())

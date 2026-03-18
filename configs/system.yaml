@@ -9,12 +9,37 @@ paths:
   processed_data_dir: "./data/processed"
   quarantine_dir: "./data/quarantine"
 
+# Augmentation
+augmentation:
+  horizontal_flip: true   # set false for laterality-sensitive classes (e.g. pneumothorax, effusion)
+
 # Model Configuration
 # class_names is the single source of truth for disease classes.
 # To change the set of diseases, update class_names below and ensure your
 # data directories / manifest match.  num_classes is derived automatically.
 model:
   class_names: ["Normal", "Pneumonia", "Cardiomegaly"]
+
+# Clinical plausibility rules (optional, disease-agnostic).
+# Each entry maps a class name (case-insensitive) to the expected XAI
+# activation pattern so that clinical_plausibility_score() can evaluate
+# whether the Grad-CAM focus is anatomically plausible.
+#
+# Supported rule types:
+#   normal_class: true         – expect LOW overall activation
+#   expected_regions: [list]   – expect HIGH activation in these LUNG_REGIONS keys
+#   expected_region_key: "key" – expect HIGH activation in a single region key
+#
+# If a class has no rule, a generic activation-spread heuristic is used.
+# To add a new disease, add an entry here — no code changes required.
+clinical_rules:
+  Normal:
+    normal_class: true
+  Pneumonia:
+    expected_regions: ["left_upper", "left_middle", "left_lower",
+                       "right_upper", "right_middle", "right_lower"]
+  Cardiomegaly:
+    expected_region_key: "cardiac"
 
 # Training defaults (can be overridden by CLI flags)
 training:

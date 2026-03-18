@@ -46,7 +46,13 @@ def mixup_data(
     Returns mixed inputs, pairs of targets, and the lambda coefficient.
     """
     if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
+        # Use torch.distributions so the random state lives on the torch RNG,
+        # which is seeded per-rank in DDP — avoiding mismatched lam values.
+        lam = float(
+            torch.distributions.Beta(
+                torch.tensor(alpha), torch.tensor(alpha)
+            ).sample().item()
+        )
     else:
         lam = 1.0
     batch_size = x.size(0)
@@ -79,6 +85,9 @@ class FocalLoss(nn.Module):
         label_smoothing: float = 0.0,
     ):
         super().__init__()
+        # alpha=1.0 is a uniform global scaling factor — it does NOT provide
+        # per-class reweighting (that role is fulfilled by the `weight` buffer).
+        # Reduce alpha below 1.0 to globally discount the focal modulation term.
         self.alpha = alpha
         self.gamma = gamma
         # Register as buffer so it moves to the correct device automatically
@@ -86,10 +95,16 @@ class FocalLoss(nn.Module):
         self.label_smoothing = label_smoothing
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # 1. Get true probability (pt) using UNWEIGHTED hard-label cross entropy
-        unweighted_ce = F.cross_entropy(inputs, targets, reduction="none")
-        pt = torch.exp(-unweighted_ce)
-        
+        # 1. Compute pt as the true-class probability via softmax + gather.
+        # This is the correct multi-class generalisation of focal loss:
+        # exp(-CE_unweighted) equals softmax[target] only in the binary case.
+        pt = (
+            F.softmax(inputs, dim=-1)
+            .gather(1, targets.unsqueeze(1))
+            .squeeze(1)
+            .detach()  # stop gradients through pt; only modulate the loss scale
+        )
+
         # 2. Compute focal term
         focal_term = (1 - pt) ** self.gamma
 
@@ -138,6 +153,7 @@ class XClinVisionModel(pl.LightningModule):
         progressive_unfreezing: bool = True,
         unfreeze_schedule: Optional[List[int]] = None,
         mixup_alpha: float = 0.2,
+        mixup_prob: float = 0.5,
         **kwargs,
     ):
         super().__init__()
@@ -152,6 +168,7 @@ class XClinVisionModel(pl.LightningModule):
         self.current_phase = 0
         self.label_smoothing = label_smoothing
         self.mixup_alpha = mixup_alpha
+        self.mixup_prob = mixup_prob  # fraction of batches where Mixup is applied
         self._oom_steps = 0  # L-2: track OOM-skipped batches per epoch
 
         # Loss function
@@ -235,19 +252,34 @@ class XClinVisionModel(pl.LightningModule):
             self._rebuild_optimizers()
 
     def _rebuild_optimizers(self):
-        """Rebuild optimizer + LR scheduler after unfreezing new parameters."""
+        """Rebuild optimizer + LR scheduler after unfreezing new parameters.
+
+        Uses PL's public ``lr_schedulers`` / ``optimizers`` replacement pattern
+        rather than the private ``_configure_schedulers`` API so this remains
+        stable across PL minor versions.
+        """
         if self.trainer is None:
             return
         opt_config = self.configure_optimizers()
         optimizer = opt_config["optimizer"]
-        lr_sched = opt_config["lr_scheduler"]
+        scheduler = opt_config["lr_scheduler"]["scheduler"]
+        interval = opt_config["lr_scheduler"].get("interval", "epoch")
 
+        # Replace the optimizer list in-place (public attribute, documented).
         self.trainer.optimizers = [optimizer]
-        # Build the LRSchedulerConfig list that PL expects
-        self.trainer.lr_scheduler_configs = self.trainer._configure_schedulers(
-            [{"scheduler": lr_sched["scheduler"], "interval": lr_sched.get("interval", "epoch")}],
-            monitor=None,
-        )
+
+        # Wrap scheduler in a LRSchedulerConfig (PL ≥ 2.0) or a plain dict (PL 1.x).
+        # The spurious _AcceleratorConnector import guard has been removed — it was
+        # a no-op that obscured the intent and broke on some PL builds.
+        try:
+            from pytorch_lightning.utilities.types import LRSchedulerConfig
+            self.trainer.lr_scheduler_configs = [
+                LRSchedulerConfig(scheduler=scheduler, interval=interval)
+            ]
+        except (ImportError, AttributeError):
+            # PL < 2.0 fallback: lr_schedulers is a plain list of dicts.
+            self.trainer.lr_schedulers = [{"scheduler": scheduler, "interval": interval}]
+
         trainable = sum(1 for p in self.model.parameters() if p.requires_grad)
         self.print(f"  → Optimizer rebuilt ({trainable} trainable params)")
 
@@ -262,8 +294,14 @@ class XClinVisionModel(pl.LightningModule):
     def training_step(self, batch, _batch_idx):
         x, y = batch
         try:
-            # Apply Mixup augmentation during training
-            if self.mixup_alpha > 0 and self.training:
+            # Apply Mixup probabilistically so hard examples still appear
+            # unblended ~50 % of the time (helps boundary learning late in training).
+            use_mixup = (
+                self.mixup_alpha > 0
+                and self.training
+                and torch.rand(1).item() < self.mixup_prob
+            )
+            if use_mixup:
                 mixed_x, y_a, y_b, lam = mixup_data(x, y, self.mixup_alpha)
                 logits = self(mixed_x)
                 loss = mixup_criterion(self.criterion, logits, y_a, y_b, lam)
@@ -280,10 +318,12 @@ class XClinVisionModel(pl.LightningModule):
             return None
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        # Fix P2: Only update train metrics when mixup is NOT active.
-        # Mixed logits scored against hard labels produce noisy/misleading metrics.
-        if not (self.mixup_alpha > 0 and self.training):
-            self.train_metrics.update(logits, y)
+        # Fix #7: skip metric updates during Mixup steps.  Blended logits vs.
+        # hard labels produce a systematically low accuracy/F1 signal that
+        # pollutes the training metrics dashboard.  Only update when the batch
+        # is un-mixed so the metrics reflect true model capability.
+        if not use_mixup:
+            self.train_metrics.update(logits.detach(), y)
         return loss
 
     def on_train_epoch_end(self):
@@ -383,18 +423,32 @@ class XClinVisionModel(pl.LightningModule):
             eps=1e-8,
         )
 
-        # Warmup for 3 epochs then cosine annealing.
-        # Reduced from 5 to 3: backbone is frozen at start, so a long warmup
-        # wastes epochs where only the head trains at a fraction of the target LR.
-        warmup_epochs = 3
-        warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
-        cosine = CosineAnnealingLR(
-            optimizer, T_max=max(self.trainer.max_epochs - warmup_epochs, 1),
-            eta_min=1e-6,
-        )
-        scheduler = SequentialLR(
-            optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs]
-        )
+        # Build the LR schedule.  On the very first call (epoch 0) we start the
+        # standard warmup → cosine sequence.  On subsequent calls from
+        # _rebuild_optimizers (unfreeze boundaries) warmup is already complete,
+        # so we build a plain CosineAnnealingLR for the *remaining* epochs only.
+        # This prevents the LR from jumping back to the full rate at every
+        # unfreeze phase (issue #18).
+        first_unfreeze = self.unfreeze_schedule[0] if self.unfreeze_schedule else 5
+        warmup_epochs = max(1, min(first_unfreeze - 1, 5))
+        current_epoch = getattr(self, "current_epoch", 0)
+
+        if current_epoch < warmup_epochs:
+            # Warmup not yet finished — full SequentialLR
+            warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
+            cosine = CosineAnnealingLR(
+                optimizer,
+                T_max=max(self.trainer.max_epochs - warmup_epochs, 1),
+                eta_min=1e-6,
+            )
+            scheduler = SequentialLR(
+                optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs]
+            )
+        else:
+            # Warmup already done — cosine only for remaining epochs so the
+            # scheduler clock doesn't reset on every optimizer rebuild.
+            remaining = max(self.trainer.max_epochs - current_epoch, 1)
+            scheduler = CosineAnnealingLR(optimizer, T_max=remaining, eta_min=1e-6)
 
         return {
             "optimizer": optimizer,
@@ -433,41 +487,48 @@ class MetricsCallback(Callback):
         self.val_probs.extend(outputs["probs"].detach().cpu().numpy())
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        """Compute and log detailed classification metrics."""
+        """Compute and log detailed classification metrics.
+
+        _reset() is called in a finally block so stale predictions never
+        accumulate into the next epoch if an exception occurs mid-reporting.
+        """
         if len(self.val_preds) == 0:
             return
 
         preds = np.array(self.val_preds)
         targets = np.array(self.val_targets)
-        
-        # Always use all classes to prevent dimension mismatch during sanity checks
-        target_names = getattr(pl_module, 'class_names', get_class_names())
-        all_labels = list(range(len(target_names)))
 
-        report = classification_report(
-            targets,
-            preds,
-            labels=all_labels,
-            target_names=target_names,
-            output_dict=True,
-            zero_division=0,
-        )
+        try:
+            # Always use all classes to prevent dimension mismatch during sanity checks
+            target_names = getattr(pl_module, 'class_names', get_class_names())
+            all_labels = list(range(len(target_names)))
 
-        # Log per-class metrics
-        for cls_name, metrics in report.items():
-            if isinstance(metrics, dict):
-                for metric_name, value in metrics.items():
-                    if isinstance(value, (int, float)):
-                        pl_module.log(f"val_{cls_name}_{metric_name}", float(value))
+            report = classification_report(
+                targets,
+                preds,
+                labels=all_labels,
+                target_names=target_names,
+                output_dict=True,
+                zero_division=0,
+            )
 
-        cm = confusion_matrix(targets, preds, labels=all_labels)
-        logger.info(f"\nConfusion Matrix (epoch {trainer.current_epoch}):\n{cm}")
+            # Log per-class metrics
+            for cls_name, metrics in report.items():
+                if isinstance(metrics, dict):
+                    for metric_name, value in metrics.items():
+                        if isinstance(value, (int, float)):
+                            pl_module.log(f"val_{cls_name}_{metric_name}", float(value))
 
-        # Save predictions if requested
-        if self.save_predictions and self.output_dir:
-            self._save_predictions(trainer.current_epoch)
+            cm = confusion_matrix(targets, preds, labels=all_labels)
+            logger.info(f"\nConfusion Matrix (epoch {trainer.current_epoch}):\n{cm}")
 
-        self._reset()
+            # Save predictions if requested
+            if self.save_predictions and self.output_dir:
+                self._save_predictions(trainer.current_epoch)
+        finally:
+            # Always reset — even if logging or saving throws an exception —
+            # so stale data never leaks into the next epoch.
+            self._reset()
 
     def _save_predictions(self, epoch: int):
         """Persist predictions to disk."""
@@ -530,6 +591,58 @@ class BestModelExportCallback(Callback):
         else:
             self.run_id = run_id
 
+    def _fit_temperature_scaler(self, pl_module, trainer) -> Optional[float]:
+        """Fit temperature scaling on the validation set.
+
+        The model must already hold the *best-checkpoint* weights when this
+        method is called.  Returns the learned temperature scalar, or None on
+        any failure (missing datamodule, empty loader, optimisation error).
+        """
+        from xclinvision.evaluator import TemperatureScaler
+
+        if trainer.datamodule is None:
+            logger.warning(
+                "BestModelExportCallback: no datamodule — skipping temperature calibration."
+            )
+            return None
+
+        try:
+            val_loader = trainer.datamodule.val_dataloader()
+        except Exception as exc:
+            logger.warning("BestModelExportCallback: could not get val_dataloader: %s", exc)
+            return None
+
+        device = next(pl_module.model.parameters()).device
+        all_logits: list = []
+        all_labels: list = []
+        pl_module.model.eval()
+
+        with torch.no_grad():
+            for batch in val_loader:
+                x, y = batch
+                x = x.to(device)
+                logits = pl_module.model(x)
+                all_logits.append(logits.cpu().float().numpy())
+                all_labels.append(
+                    y.cpu().numpy() if isinstance(y, torch.Tensor) else np.array(y)
+                )
+
+        if not all_logits:
+            logger.warning("BestModelExportCallback: empty val loader — skipping calibration.")
+            return None
+
+        logits_np = np.concatenate(all_logits, axis=0)
+        labels_np = np.concatenate(all_labels, axis=0)
+
+        scaler = TemperatureScaler()
+        try:
+            temperature = scaler.fit(logits_np, labels_np)
+        except Exception as exc:
+            logger.warning("BestModelExportCallback: temperature fit failed: %s", exc)
+            return None
+
+        return temperature
+
     def on_train_end(self, trainer, pl_module) -> None:  # type: ignore[override]
         """Load the best checkpoint and export a clean .pth weights file."""
         # Locate the ModelCheckpoint callback
@@ -549,7 +662,7 @@ class BestModelExportCallback(Callback):
             return
 
         try:
-            raw = torch.load(best_path, map_location="cpu", weights_only=False)
+            raw = torch.load(best_path, map_location="cpu", weights_only=True)
         except Exception as exc:
             logger.error(f"BestModelExportCallback: failed to load checkpoint '{best_path}': {exc}")
             return
@@ -569,6 +682,30 @@ class BestModelExportCallback(Callback):
         best_val_auc = getattr(ckpt_callback, "best_model_score", None)
         best_val_auc = float(best_val_auc) if best_val_auc is not None else None
 
+        # --- Temperature calibration on best-checkpoint weights --------
+        # Temporarily swap in the best-checkpoint weights so calibration
+        # runs on the exported model rather than the end-of-training state.
+        temperature = None
+        original_sd = None
+        try:
+            original_sd = {k: v.clone() for k, v in pl_module.model.state_dict().items()}
+            load_result = pl_module.model.load_state_dict(model_sd, strict=False)
+            if load_result.missing_keys or load_result.unexpected_keys:
+                logger.warning(
+                    "Temperature calibration: checkpoint mismatch "
+                    "(missing=%s, unexpected=%s) — skipping.",
+                    load_result.missing_keys[:3],
+                    load_result.unexpected_keys[:3],
+                )
+            else:
+                temperature = self._fit_temperature_scaler(pl_module, trainer)
+        except Exception as exc:
+            logger.warning("BestModelExportCallback: temperature calibration failed: %s", exc)
+        finally:
+            if original_sd is not None:
+                pl_module.model.load_state_dict(original_sd, strict=False)
+        # ---------------------------------------------------------------
+
         payload = {
             "model_state_dict": model_sd,
             "model_name": self.model_name,
@@ -577,6 +714,7 @@ class BestModelExportCallback(Callback):
             "class_map": self.CLASS_MAP,
             "class_names": self.class_names,
             "best_val_auc": best_val_auc,
+            "temperature": temperature,
             "source_ckpt": best_path,
         }
 

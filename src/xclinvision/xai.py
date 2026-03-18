@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from xclinvision.config import get_class_names
+from xclinvision.config import get_class_names, get_clinical_rules
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +247,11 @@ def extract_findings(
     high_threshold: float = 0.30,
     center_threshold: float = 0.35,
 ) -> List[str]:
+    """Extract human-readable findings from region activation scores.
+
+    Fully disease-agnostic: all logic is based on region activation patterns
+    and laterality, not on specific disease names.
+    """
     findings: List[str] = []
     if not region_scores:
         return findings
@@ -278,11 +283,11 @@ def extract_findings(
 
     apical = region_scores.get("apical", 0.0)
     basal = (region_scores.get("left_lower", 0.0) + region_scores.get("right_lower", 0.0)) / 2.0
-    
+
     if apical > basal * 1.5 and apical > high_threshold:
-        findings.append("Apical predominance (often associated with Cardiomegaly)")
+        findings.append("Apical predominance")
     elif basal > apical * 1.5 and basal > high_threshold:
-        findings.append("Basal predominance (often associated with Pneumonia)")
+        findings.append("Basal predominance")
 
     if confidence < 0.5:
         findings.append(f"Low confidence ({confidence:.0%}) for {class_name} — review recommended")
@@ -294,6 +299,13 @@ def clinical_plausibility_score(
     region_scores: Dict[str, float],
     class_name: str,
 ) -> float:
+    """Score how anatomically plausible the Grad-CAM activation is.
+
+    Disease-specific logic is driven by ``clinical_rules`` in
+    ``configs/system.yaml``.  If no rule exists for a class, a generic
+    activation-spread heuristic is used — so the function works for
+    **any** disease set without code changes.
+    """
     if not region_scores:
         return 0.0
 
@@ -302,23 +314,33 @@ def clinical_plausibility_score(
     activation_range = max(region_scores.values()) - min(region_scores.values())
 
     score = 0.5
-    class_name_lower = class_name.lower()
+    rules = get_clinical_rules()
+    rule = rules.get(class_name.lower(), {})
 
-    if "normal" in class_name_lower:
+    if rule.get("normal_class"):
+        # Normal / healthy class: low activation = plausible
         if mean_lung < 0.15:
             score += 0.3
         elif mean_lung < 0.25:
             score += 0.1
-    elif "pneumonia" in class_name_lower:
-        lung_max = max([v for k, v in region_scores.items() if "left_" in k or "right_" in k] or [0.0])
-        if lung_max > 0.2:
+    elif rule.get("expected_regions"):
+        # Disease localised to specific lung regions
+        region_keys = rule["expected_regions"]
+        region_max = max(
+            (region_scores.get(k, 0.0) for k in region_keys), default=0.0
+        )
+        if region_max > 0.2:
             score += 0.3
-    elif "cardiomegaly" in class_name_lower:
-        # Cardiomegaly: attention should concentrate on the cardiac/central region
-        cardiac = region_scores.get("cardiac", 0)
-        if cardiac > 0.3:
+    elif rule.get("expected_region_key"):
+        # Disease localised to a single anatomical region (e.g. cardiac)
+        key_val = region_scores.get(rule["expected_region_key"], 0.0)
+        if key_val > 0.3:
             score += 0.3
-        elif cardiac > 0.15:
+        elif key_val > 0.15:
+            score += 0.15
+    else:
+        # Generic fallback: reward any focused activation
+        if mean_lung > 0.15:
             score += 0.15
 
     if activation_range > 0.1:

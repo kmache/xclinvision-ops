@@ -5,6 +5,8 @@ import json
 import uuid
 import base64
 import time
+import threading
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 
@@ -46,10 +48,25 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 # Fix #16: hard cap for the in-memory image store to prevent unbounded RAM growth.
 _IMAGE_STORE_MAX = 200
 
+
+@asynccontextmanager
+async def _lifespan(app: "FastAPI"):
+    """Application lifespan — replaces the deprecated @app.on_event('startup').
+
+    ``log_dataset_info`` is defined later in the module; Python resolves the
+    name at call time (server start-up), not at definition time, so the
+    forward reference is safe.
+    """
+    await log_dataset_info()
+    yield
+    # Shutdown: nothing to clean up currently.
+
+
 app = FastAPI(
     title="XClinVision API",
     description="Explainable Medical Imaging AI Platform API",
     version="0.1.0",
+    lifespan=_lifespan,
 )
 _raw_origins = os.getenv("XCLINVISION_CORS_ORIGINS", "http://localhost:8501")
 ALLOWED_ORIGINS: list = [o.strip() for o in _raw_origins.split(",") if o.strip()]
@@ -164,18 +181,24 @@ def get_pipeline():
 # rather than on every report/analysis request.
 # ---------------------------------------------------------------------------
 _agent_instance = None
+_agent_lock = threading.Lock()
 
 
 def _get_agent():
-    """Return a module-level cached ClinicalAgent, creating it on first call."""
+    """Return a module-level cached ClinicalAgent, creating it on first call.
+
+    Thread-safe: uses a module-level lock to prevent double-initialisation
+    when concurrent requests both find ``_agent_instance is None``.
+    """
     global _agent_instance
-    if _agent_instance is None:
-        try:
-            from xclinvision.agent import create_agent
-            _agent_instance = create_agent()
-        except Exception as exc:
-            logger.warning("Failed to initialise LLM agent: %s", exc)
-            raise HTTPException(503, detail=f"LLM agent unavailable: {exc}")
+    with _agent_lock:
+        if _agent_instance is None:
+            try:
+                from xclinvision.agent import create_agent
+                _agent_instance = create_agent()
+            except Exception as exc:
+                logger.warning("Failed to initialise LLM agent: %s", exc)
+                raise HTTPException(503, detail=f"LLM agent unavailable: {exc}")
     return _agent_instance
 
 # ---------------------------------------------------------------------------
@@ -214,8 +237,8 @@ def _dataset_stats(data_dir: Path) -> dict:
 # Application startup: log dataset summary
 # ---------------------------------------------------------------------------
 
-@app.on_event("startup")
 async def log_dataset_info() -> None:
+    """(Called from the lifespan context manager on server start-up.)"""
     """Log dataset directories and image counts on server startup."""
     raw_data_dir = os.getenv("XCLINVISION_DATA_DIR", "data/processed")
     data_dir = Path(raw_data_dir)
@@ -323,7 +346,26 @@ async def predict(
             413,
             f"File too large. Maximum upload size is {MAX_UPLOAD_MB} MB.",
         )
-    image_hash = hashlib.md5(contents).hexdigest()
+    image_hash = hashlib.sha256(contents).hexdigest()
+
+    # Validate actual file content via magic bytes, independent of the
+    # Content-Type header (which can be spoofed by the client).
+    # JPEG: FF D8 FF   PNG: 89 50 4E 47   BMP: 42 4D
+    # DICOM: 128-byte preamble + 'DICM' at offset 128
+    _MAGIC = (
+        (b"\xff\xd8\xff",),                    # JPEG
+        (b"\x89PNG",),                         # PNG
+        (b"BM",),                              # BMP
+        (b"II", b"MM"),                        # TIFF (little/big-endian)
+    )
+    _is_dicom = len(contents) > 132 and contents[128:132] == b"DICM"
+    _magic_ok = _is_dicom or any(
+        contents[:4].startswith(m)
+        for group in _MAGIC
+        for m in group
+    )
+    if not _magic_ok:
+        raise HTTPException(400, "File content does not match a supported image format (JPEG, PNG, BMP, TIFF, DICOM).")
 
     try:
         image = Image.open(io.BytesIO(contents)).convert("RGB")
@@ -389,7 +431,13 @@ async def explain(
     if not file.content_type.startswith("image/"):
         raise HTTPException(400, "Invalid file type")
 
-    contents = await file.read()
+    # Fix #2: enforce the same upload size limit as /predict.
+    contents = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            413,
+            f"File too large. Maximum upload size is {MAX_UPLOAD_MB} MB.",
+        )
     try:
         image = Image.open(io.BytesIO(contents)).convert("RGB")
     except Exception as e:
@@ -428,15 +476,16 @@ async def generate_report(request: ReportRequest):
 
     # Fix #21: validate prediction index before using it as a list index.
     class_names = get_class_names()
-    if request.prediction not in range(len(class_names)):
+    num_classes = len(class_names)
+    if request.prediction not in range(num_classes):
         raise HTTPException(
             422,
-            f"prediction must be 0–2, got {request.prediction}.",
+            f"prediction must be 0–{num_classes - 1}, got {request.prediction}.",
         )
 
     context = ClinicalContext(
         prediction=class_names[request.prediction],
-        probabilities=[0.0, 0.0, 0.0],  # Placeholder
+        probabilities=[0.0] * num_classes,  # Placeholder (dynamic length)
         confidence=request.confidence,
         uncertainty_level=request.uncertainty_level,
         highlighted_regions=request.highlighted_regions,
@@ -608,7 +657,7 @@ async def analyze_image(
             413,
             f"File too large. Maximum upload size is {MAX_UPLOAD_MB} MB.",
         )
-    image_hash = hashlib.md5(contents).hexdigest()
+    image_hash = hashlib.sha256(contents).hexdigest()
 
     try:
         from xclinvision.processing import read_image_grayscale
@@ -646,14 +695,18 @@ async def analyze_image(
     overlay_b64 = None
     explanation = result.get("explanation") or {}
     vis = explanation.get("visualization") or {}
-    raw_heatmap = vis.get("heatmap")  # numpy array if available
+    # Fix #1: use grayscale_cam (raw 2-D saliency map) instead of "heatmap"
+    # which is already colour-overlaid by create_overlay() inside xai.py.
+    # Passing the pre-blended image into _generate_heatmap_overlay produced a
+    # double-overlay artefact.
+    grayscale_cam = vis.get("grayscale_cam")
 
     # Also get vis_image from pipeline preprocess for overlay
     _, vis_image = pipeline.preprocess(image_np)
 
-    if raw_heatmap is not None:
-        heatmap_b64 = _img_to_base64(raw_heatmap)
-        overlay_img = _generate_heatmap_overlay(vis_image, raw_heatmap, opacity=0.45)
+    if grayscale_cam is not None:
+        heatmap_b64 = _img_to_base64(grayscale_cam)
+        overlay_img = _generate_heatmap_overlay(vis_image, grayscale_cam, opacity=0.45)
         overlay_b64 = _img_to_base64(overlay_img)
     else:
         # Generate a mock heatmap for demo purposes when no real XAI (vectorized)
@@ -780,7 +833,8 @@ async def get_dashboard_explanation(
 
     explanation = result.get("explanation") or {}
     vis = explanation.get("visualization") or {}
-    raw_heatmap = vis.get("heatmap")
+    # Fix #1: use grayscale_cam to avoid double-overlay artefact.
+    raw_heatmap = vis.get("grayscale_cam")
     _, vis_image = pipeline.preprocess(image_np)
 
     if raw_heatmap is not None:

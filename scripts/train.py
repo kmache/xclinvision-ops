@@ -28,46 +28,53 @@ from pytorch_lightning.callbacks import (
     LearningRateMonitor,
     RichProgressBar,
 )
-from pytorch_lightning.loggers import MLFlowLogger, TensorBoardLogger
+from pytorch_lightning.loggers import TensorBoardLogger
+try:
+    from pytorch_lightning.loggers import MLFlowLogger
+    _MLFLOW_AVAILABLE = True
+except ImportError:
+    _MLFLOW_AVAILABLE = False
+    MLFlowLogger = None  # type: ignore[assignment,misc]
 
 from xclinvision.dataset import ChestXrayDataModule
 from xclinvision.modeling import build_model, get_model_normalization
-from xclinvision.processing import run_processing_pipeline, PROCESSING_VERSION
+from xclinvision.processing import run_processing_pipeline, PROCESSING_VERSION, get_processed_dir_for_size
 from xclinvision.trainer import (
     XClinVisionModel,
     MetricsCallback,
     XAIValidationCallback,
     BestModelExportCallback,
 )
+from xclinvision.config import get_class_names
 
 SYSTEM_CONFIG = Path(__file__).parent.parent / "configs" / "system.yaml"
 
 # ---------------------------------------------------------------------------
 # Dynamic processed data caching
 # ---------------------------------------------------------------------------
+# get_processed_dir_for_size is imported from xclinvision.processing
+# (single source of truth shared with scripts/evaluate.py).
 
-def get_processed_dir_for_size(base_processed_dir: str, image_size: int) -> Path:
-    """
-    Dynamically construct processed data directory based on image size.
-    Example: base='data/processed', size=384 -> 'data/processed_384'
-    """
-    base = Path(base_processed_dir)
-    return base.parent / f"{base.name}_{image_size}_{PROCESSING_VERSION}"
 
 def ensure_processed_data_exists(
     image_size: int,
     raw_dir: str,
     processed_base_dir: str,
     quarantine_dir: str,
-    force_reprocess: bool = False
+    force_reprocess: bool = False,
+    class_names: list | None = None,
 ) -> Path:
     """
-    Check if processed data exists for the given image_size.
+    Check if processed data exists for the given image_size and class set.
     If not, automatically run the processing pipeline.
-    
+
+    The directory name encodes both the image size and a hash of the class names,
+    so changing system.yaml class_names automatically triggers a re-run without
+    needing --force-reprocess.
+
     Returns: Path to the processed directory for this image_size
     """
-    processed_dir = get_processed_dir_for_size(processed_base_dir, image_size)
+    processed_dir = get_processed_dir_for_size(processed_base_dir, image_size, class_names)
     manifest_path = processed_dir / "manifest.csv"
     
     if manifest_path.exists() and not force_reprocess:
@@ -217,6 +224,12 @@ def parse_args():
     parser.add_argument("--no-progressive-unfreeze", action="store_true", help="Disable progressive unfreezing")
     parser.add_argument("--deterministic", action="store_true", help="Enable CUDA deterministic mode")
     parser.add_argument("--force-reprocess", action="store_true", help="Force re-processing even if data exists")
+    parser.add_argument(
+        "--accumulate-grad-batches",
+        type=int,
+        default=2,
+        help="Gradient accumulation steps. Effective batch size = batch_size × this value. LR is scaled proportionally. Default: 2.",
+    )
     return parser.parse_args()
 
 
@@ -235,7 +248,10 @@ def main():
     else:
         raw_size = config.get("input", {}).get("size", [224, 224])
         image_size = raw_size[0] if isinstance(raw_size, list) else raw_size
-    class_names = config.get("model", {}).get("class_names", ["Normal", "Pneumonia", "Cardiomegaly"])
+    # Single source of truth: system.yaml → model.class_names via get_class_names().
+    # Do NOT fall back to a hardcoded list here; if the config is missing the
+    # pipeline should fail loudly rather than silently train on the wrong classes.
+    class_names = get_class_names()
     num_classes = len(class_names)
     weight_decay = args.weight_decay if args.weight_decay is not None else opt_cfg.get("weight_decay", 1e-4)
     label_smoothing = args.label_smoothing if args.label_smoothing is not None else train_cfg.get("label_smoothing", 0.1)
@@ -245,19 +261,25 @@ def main():
     processed_base_dir = paths_cfg.get("processed_data_dir", "data/processed")
     quarantine_dir = paths_cfg.get("quarantine_dir", "data/quarantine")
     
-    # Ensure processed data exists at this specific resolution
+    # Ensure processed data exists at this specific resolution and class set
     processed_dir = ensure_processed_data_exists(
         image_size=image_size,
         raw_dir=raw_dir,
         processed_base_dir=processed_base_dir,
         quarantine_dir=quarantine_dir,
-        force_reprocess=args.force_reprocess
+        force_reprocess=args.force_reprocess,
+        class_names=class_names,
     )
     
     manifest_path = str(processed_dir / "manifest.csv")
 
     # Set seed
     pl.seed_everything(args.seed, workers=True)
+    if args.deterministic:
+        # Enable op-level determinism; warn_only=True avoids hard errors for
+        # the handful of ops (e.g. upsample_bilinear2d) that have no
+        # deterministic kernel, while still flagging non-deterministic paths.
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
     # 2. Build Base Model
     base_model = build_model(
@@ -271,15 +293,19 @@ def main():
     norm_stats = get_model_normalization(base_model, args.model)
 
     # 1. Init DataModule
+    use_weighted_sampler = True  # set False to disable and use loss-level weighting instead
+    aug_cfg = config.get("augmentation", {})
+    horizontal_flip = aug_cfg.get("horizontal_flip", True)
     data_module = ChestXrayDataModule(
         manifest_path=manifest_path,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         image_size=image_size,
         cache_size=args.cache_size,
-        use_weighted_sampler=True,
+        use_weighted_sampler=use_weighted_sampler,
         mean=norm_stats["mean"],
         std=norm_stats["std"],
+        horizontal_flip=horizontal_flip,
     )
     data_module.setup(stage="fit")
 
@@ -290,18 +316,26 @@ def main():
 
     class_weights = data_module.get_class_weights().tolist()
     print(f"Computed class weights: {class_weights}")
-    # NOTE: WeightedRandomSampler already balances class representation per batch,
-    # so we do NOT pass class_weights to the loss function. Using both would
-    # double-correct for imbalance and destabilize training.
+    # When WeightedRandomSampler is active it already re-balances per-batch class
+    # representation, so passing class_weights to the loss as well would
+    # double-correct for imbalance and destabilise training.
+    # When the sampler is disabled, fall back to loss-level class weighting.
+    class_weights_for_loss = None if use_weighted_sampler else class_weights
+
+    # Scale LR before constructing the module so save_hyperparameters captures
+    # the effective learning rate (args.lr × accumulate_grad_batches), not the
+    # raw CLI value.
+    accumulate_grad_batches = args.accumulate_grad_batches
+    effective_lr = args.lr * accumulate_grad_batches
 
     pl_module = XClinVisionModel(
         model=base_model,
         num_classes=num_classes,
-        learning_rate=args.lr,
+        learning_rate=effective_lr,
         weight_decay=weight_decay,
         loss_type=args.loss,
         label_smoothing=label_smoothing,
-        class_weights=None,  # sampler handles imbalance; avoid double-correction
+        class_weights=class_weights_for_loss,
         progressive_unfreezing=not args.no_progressive_unfreeze,
     )
 
@@ -341,7 +375,8 @@ def main():
         ),
         BestModelExportCallback(
             model_name=args.model,
-            export_dir=str(Path(args.output_dir) / "best_models"),
+            # Anchor to project root so the path is stable regardless of CWD.
+            export_dir=str(Path(__file__).parent.parent / args.output_dir / "best_models"),
             num_classes=num_classes,
             class_names=class_names,
         ),
@@ -353,14 +388,16 @@ def main():
             name="tensorboard",
             version="",
         ),
-        MLFlowLogger(experiment_name="xclinvision", run_name=f"{args.model}_{run_ts}"),
     ]
+    if _MLFLOW_AVAILABLE:
+        loggers.append(
+            MLFlowLogger(experiment_name="xclinvision", run_name=f"{args.model}_{run_ts}")
+        )
+    else:
+        print("[Info] MLflow not installed — skipping MLflow logging. "
+              "Install with: pip install mlflow")
 
     # 5. Execute Training
-    accumulate_grad_batches = 2
-    # Scale LR to compensate for effective batch size increase from grad accumulation
-    pl_module.learning_rate *= accumulate_grad_batches
-
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator="auto",
@@ -413,6 +450,7 @@ def main():
         "num_workers": args.num_workers,
         "cache_size": args.cache_size,
         "deterministic": args.deterministic,
+        "accumulate_grad_batches": accumulate_grad_batches,
     }
     for lgr in trainer.loggers:
         lgr.log_hyperparams(hparams)

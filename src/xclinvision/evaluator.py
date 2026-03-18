@@ -125,10 +125,18 @@ class MetricsComputer:
             metrics["weighted_auc"] = float(
                 roc_auc_score(y_true, y_probs, multi_class="ovr", average="weighted")
             )
+            # Per-class OvR AUC — clinically more informative than aggregate only
+            per_class_auc = roc_auc_score(
+                y_true, y_probs, multi_class="ovr", average=None
+            )
+            for i, name in enumerate(self.class_names):
+                metrics[f"{name}_auc"] = float(per_class_auc[i])
         except ValueError as exc:
             logger.warning(f"AUC-ROC computation failed: {exc}")
             metrics["macro_auc"] = 0.0
             metrics["weighted_auc"] = 0.0
+            for name in self.class_names:
+                metrics[f"{name}_auc"] = 0.0
 
         return metrics
 

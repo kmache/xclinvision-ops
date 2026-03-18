@@ -57,11 +57,12 @@ def read_image_grayscale(source: Union[str, Path, bytes]) -> Optional[np.ndarray
         return None
 
 
-def _read_dicom_grayscale(path: Path) -> Optional[np.ndarray]:
-    """Decode a DICOM file to 8-bit grayscale via pydicom."""
-    import pydicom  # lazy import — only paid when DICOM files are present
+def _decode_dicom_dataset(ds) -> np.ndarray:
+    """Convert a loaded pydicom Dataset to an 8-bit grayscale numpy array.
 
-    ds = pydicom.dcmread(path)
+    Centralises the slope/intercept, VOI windowing, and MONOCHROME1 logic so
+    it is not duplicated between path-based and bytes-based DICOM readers.
+    """
     arr = ds.pixel_array.astype(np.float64)
 
     # Apply Rescale Slope / Intercept if present
@@ -75,25 +76,23 @@ def _read_dicom_grayscale(path: Path) -> Optional[np.ndarray]:
     if wc is not None and ww is not None:
         wc = float(wc[0]) if hasattr(wc, "__getitem__") else float(wc)
         ww = float(ww[0]) if hasattr(ww, "__getitem__") else float(ww)
-        lower = wc - ww / 2
-        upper = wc + ww / 2
-        arr = np.clip(arr, lower, upper)
+        arr = np.clip(arr, wc - ww / 2, wc + ww / 2)
 
-    # Normalise to 0-255
     mn, mx = arr.min(), arr.max()
-    if mx - mn > 0:
-        arr = (arr - mn) / (mx - mn) * 255.0
-    else:
-        arr = np.zeros_like(arr)
-
+    arr = (arr - mn) / (mx - mn) * 255.0 if mx - mn > 0 else np.zeros_like(arr)
     img = arr.astype(np.uint8)
 
-    # MONOCHROME1 = inverted (white=0), flip so anatomy is bright
-    pi = getattr(ds, "PhotometricInterpretation", "MONOCHROME2")
-    if pi == "MONOCHROME1":
+    # MONOCHROME1 = inverted (white=0); flip so anatomy is bright
+    if getattr(ds, "PhotometricInterpretation", "MONOCHROME2") == "MONOCHROME1":
         img = 255 - img
 
     return img
+
+
+def _read_dicom_grayscale(path: Path) -> Optional[np.ndarray]:
+    """Decode a DICOM file to 8-bit grayscale via pydicom."""
+    import pydicom  # lazy import — only paid when DICOM files are present
+    return _decode_dicom_dataset(pydicom.dcmread(path))
 
 
 def _read_bytes_grayscale(data: bytes) -> Optional[np.ndarray]:
@@ -102,29 +101,7 @@ def _read_bytes_grayscale(data: bytes) -> Optional[np.ndarray]:
     if len(data) > 132 and data[128:132] == b"DICM":
         import pydicom
         import io as _io
-        ds = pydicom.dcmread(_io.BytesIO(data))
-        arr = ds.pixel_array.astype(np.float64)
-        slope = float(getattr(ds, "RescaleSlope", 1))
-        intercept = float(getattr(ds, "RescaleIntercept", 0))
-        arr = arr * slope + intercept
-        wc = getattr(ds, "WindowCenter", None)
-        ww = getattr(ds, "WindowWidth", None)
-        if wc is not None and ww is not None:
-            wc = float(wc[0]) if hasattr(wc, "__getitem__") else float(wc)
-            ww = float(ww[0]) if hasattr(ww, "__getitem__") else float(ww)
-            lower = wc - ww / 2
-            upper = wc + ww / 2
-            arr = np.clip(arr, lower, upper)
-        mn, mx = arr.min(), arr.max()
-        if mx - mn > 0:
-            arr = (arr - mn) / (mx - mn) * 255.0
-        else:
-            arr = np.zeros_like(arr)
-        img = arr.astype(np.uint8)
-        pi = getattr(ds, "PhotometricInterpretation", "MONOCHROME2")
-        if pi == "MONOCHROME1":
-            img = 255 - img
-        return img
+        return _decode_dicom_dataset(pydicom.dcmread(_io.BytesIO(data)))
 
     # Standard image formats
     buf = np.frombuffer(data, dtype=np.uint8)
@@ -137,6 +114,42 @@ MAX_ASPECT_RATIO = 3.0
 
 # Bump this when processing logic changes to invalidate cached processed data.
 PROCESSING_VERSION = "v2"
+
+
+# ---------------------------------------------------------------------------
+# Shared processed-data directory resolution (used by train.py & evaluate.py)
+# ---------------------------------------------------------------------------
+
+def _class_names_hash(class_names: list) -> str:
+    """Return a short hash of the class list so a changed disease set busts the cache."""
+    key = ",".join(sorted(str(c).lower() for c in class_names))
+    return hashlib.sha1(key.encode()).hexdigest()[:6]
+
+
+def get_processed_dir_for_size(
+    base_processed_dir: str,
+    image_size: int,
+    class_names: list | None = None,
+) -> Path:
+    """Construct the processed-data directory for a given image size + class set.
+
+    The directory name encodes both the image size and a hash of the class list
+    so that changing ``system.yaml`` ``model.class_names`` automatically
+    invalidates the old cache.
+
+    This is the **single source of truth** — both ``scripts/train.py`` and
+    ``scripts/evaluate.py`` must import and call this function instead of
+    defining their own variants.
+
+    Examples
+    --------
+    >>> get_processed_dir_for_size("data/processed", 384, ["Normal", "Pneumonia"])
+    PosixPath('data/processed_384_v2_a3f9c1')
+    """
+    base = Path(base_processed_dir)
+    cls_hash = _class_names_hash(class_names) if class_names else "default"
+    return base.parent / f"{base.name}_{image_size}_{PROCESSING_VERSION}_{cls_hash}"
+
 
 def compute_image_hash(image_path: Path) -> str:
     """Compute SHA-256 hash of image file for duplicate detection."""

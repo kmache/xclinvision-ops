@@ -103,6 +103,7 @@ def _discover_classes(source_dir: Path) -> List[str]:
     return classes
 
 
+
 def _detect_layout(source_dir: Path, classes: List[str]) -> str:
     """Return 'pre-split' if every class folder contains train/val/test, else 'flat'."""
     for cls in classes:
@@ -371,7 +372,8 @@ if __name__ == "__main__":
 
     _validate_source(args.source)
 
-    if args.mode == "replace": _apply_replace_mode(args.dest)
+    if args.mode == "replace": 
+        _apply_replace_mode(args.dest)
 
     classes = _discover_classes(args.source)
     logger.info("Discovered %d classes: %s", len(classes), classes)
@@ -407,7 +409,32 @@ if __name__ == "__main__":
 
     # Transfer files
     succeeded, skipped = _transfer_files(splits, args.dest, args.copy)
-    if skipped: logger.warning("%d images skipped (transfer errors).", skipped)
+    if skipped: 
+        logger.warning("%d images skipped (transfer errors).", skipped)
     logger.info("Transfer complete: %d succeeded, %d skipped.", succeeded, skipped)
 
     _print_summary(splits, classes)
+
+    # Cross-check discovered class names against system.yaml so mismatches are
+    # caught here rather than silently failing during train.py manifest loading.
+    try:
+        import yaml as _yaml
+        _sys_cfg = PROJECT_ROOT / "configs" / "system.yaml"
+        if _sys_cfg.exists():
+            _cfg_classes = {
+                c.lower()
+                for c in (_yaml.safe_load(_sys_cfg.open()) or {})
+                .get("model", {})
+                .get("class_names", [])
+            }
+            _disc_classes = {c.lower() for c in classes}
+            if _cfg_classes and _cfg_classes != _disc_classes:
+                logger.warning(
+                    "Discovered classes %s differ from system.yaml class_names %s. "
+                    "Update configs/system.yaml before running train.py, otherwise "
+                    "ChestXrayDataset will raise a label-mapping error.",
+                    sorted(_disc_classes),
+                    sorted(_cfg_classes),
+                )
+    except Exception:
+        pass  # cross-check is best-effort; never block data organisation

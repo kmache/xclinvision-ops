@@ -48,7 +48,9 @@ def get_class_names() -> List[str]:
             logger.warning("Failed to read class_names from %s: %s", _SYSTEM_CONFIG, exc)
 
     logger.warning(
-        "class_names not found in %s — using fallback %s",
+        "class_names not found in %s — using fallback %s. "
+        "This should only happen in unit tests. In production, ensure "
+        "configs/system.yaml exists and contains model.class_names.",
         _SYSTEM_CONFIG,
         _FALLBACK_CLASS_NAMES,
     )
@@ -64,3 +66,47 @@ def get_class_map() -> Dict[str, int]:
 def get_num_classes() -> int:
     """Return the number of configured classes."""
     return len(get_class_names())
+
+
+# ---------------------------------------------------------------------------
+# Clinical rules
+# ---------------------------------------------------------------------------
+
+_cached_clinical_rules: Dict[str, Dict] | None = None
+
+
+def get_clinical_rules() -> Dict[str, Dict]:
+    """Return clinical plausibility rules from ``configs/system.yaml``.
+
+    Keys are **lowercased** class names.  Returns an empty dict when no
+    rules are defined — callers fall back to a generic heuristic.
+    """
+    global _cached_clinical_rules
+    if _cached_clinical_rules is not None:
+        return dict(_cached_clinical_rules)
+
+    if _SYSTEM_CONFIG.exists():
+        try:
+            with open(_SYSTEM_CONFIG, "r") as fh:
+                cfg = yaml.safe_load(fh) or {}
+            raw = cfg.get("clinical_rules")
+            if isinstance(raw, dict):
+                _cached_clinical_rules = {k.lower(): v for k, v in raw.items()}
+                return dict(_cached_clinical_rules)
+        except Exception as exc:
+            logger.warning("Failed to read clinical_rules from %s: %s", _SYSTEM_CONFIG, exc)
+
+    _cached_clinical_rules = {}
+    return {}
+
+
+def _reset_class_names_cache() -> None:
+    """Invalidate the module-level class-names cache.
+
+    Intended for **test teardown only**.  Call this when ``system.yaml`` is
+    swapped between test cases so that the next call to ``get_class_names()``
+    re-reads the config from disk.
+    """
+    global _cached_class_names, _cached_clinical_rules
+    _cached_class_names = None
+    _cached_clinical_rules = None

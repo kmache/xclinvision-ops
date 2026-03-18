@@ -25,13 +25,26 @@ logger = logging.getLogger(__name__)
 def get_train_transforms(
     image_size: int = 384,
     mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
-    std: Tuple[float, float, float] = (0.229, 0.224, 0.225)) -> A.Compose:
-    """Robust medical-safe augmentation pipeline."""
-    return A.Compose([
-        # Horizontal flip: single most impactful augmentation for chest X-ray
-        # classification.  Safe for classification tasks (not localization).
-        A.HorizontalFlip(p=0.5),
+    std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
+    horizontal_flip: bool = True,
+) -> A.Compose:
+    """Robust medical-safe augmentation pipeline.
 
+    Args:
+        horizontal_flip: Enable horizontal flipping. Safe for normal / pneumonia /
+            cardiomegaly classification. Disable (via
+            ``system.yaml augmentation.horizontal_flip: false``) for any
+            laterality-sensitive disease set such as pneumothorax or pleural effusion.
+    """
+    transforms_list = []
+
+    # Horizontal flip: single most impactful augmentation for chest X-ray
+    # classification. Controlled via config so laterality-sensitive disease
+    # sets can opt out without modifying this file.
+    if horizontal_flip:
+        transforms_list.append(A.HorizontalFlip(p=0.5))
+
+    transforms_list.extend([
         A.RandomResizedCrop(
             size=(image_size, image_size),
             scale=(0.85, 1.0),
@@ -83,6 +96,8 @@ def get_train_transforms(
 
         ToTensorV2()
     ])
+
+    return A.Compose(transforms_list)
 
 
 def get_val_transforms(
@@ -173,6 +188,7 @@ class ChestXrayDataModule(pl.LightningDataModule):
         use_weighted_sampler: bool = True,
         mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
         std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
+        horizontal_flip: bool = True,
     ):
         super().__init__()
         self.manifest_path = Path(manifest_path)
@@ -180,9 +196,14 @@ class ChestXrayDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.image_size = image_size
         self.cache_size = cache_size
+        # Per-worker cache: divide by worker count so total RAM stays bounded.
+        # Each DataLoader worker forks an independent copy of the cache dict;
+        # without this division: total usage = cache_size × num_workers.
+        self._cache_per_worker = max(0, cache_size // num_workers) if num_workers > 0 else cache_size
         self.use_weighted_sampler = use_weighted_sampler
         self.mean = mean
         self.std = std
+        self.horizontal_flip = horizontal_flip
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
@@ -196,23 +217,41 @@ class ChestXrayDataModule(pl.LightningDataModule):
         if {'split', 'class', 'filepath_processed'} - set(df.columns):
             raise ValueError("Manifest missing required columns")
 
-        if stage in ("fit", None):
-            self.train_dataset = ChestXrayDataset(df[df['split'] == 'train'], get_train_transforms(self.image_size, self.mean, self.std), self.cache_size, fallback_size=self.image_size)
-            # Fix #15: val/test are evaluated once per epoch — caching wastes RAM
+        # Guard against re-initialising datasets on duplicate setup() calls
+        # (PL can call setup() more than once, e.g. during sanity-check validation).
+        if stage in ("fit", None) and self.train_dataset is None:
+            self.train_dataset = ChestXrayDataset(df[df['split'] == 'train'], get_train_transforms(self.image_size, self.mean, self.std, self.horizontal_flip), self._cache_per_worker, fallback_size=self.image_size)
+            # val/test are evaluated once per epoch — caching wastes RAM
             # without any speed benefit (each image is visited exactly once).
             self.val_dataset = ChestXrayDataset(df[df['split'] == 'val'], get_val_transforms(self.image_size, self.mean, self.std), cache_size=0, fallback_size=self.image_size)
-        if stage in ("test", "predict", None):
+        if stage in ("test", "predict", None) and self.test_dataset is None:
             self.test_dataset = ChestXrayDataset(df[df['split'] == 'test'], get_val_transforms(self.image_size, self.mean, self.std), cache_size=0, fallback_size=self.image_size)
             self.predict_dataset = self.test_dataset
 
     def get_class_weights(self) -> torch.Tensor:
-        class_names = get_class_names()
-        n = len(class_names)
+        class_map = get_class_map() # e.g. {"normal": 0, "pneumonia": 1}
         counts = self.train_dataset.df['class'].str.lower().value_counts().to_dict()
+        
+        # Initialize weights tensor based on max label index
+        num_classes = max(class_map.values()) + 1
+        weights = torch.zeros(num_classes, dtype=torch.float32)
+        
         total = sum(counts.values()) or 1
-        class_counts = [max(counts.get(k.lower(), 0), 1) for k in class_names]
-        weights = torch.FloatTensor([total / (n * max(class_counts[i], 1)) for i in range(n)])
+        
+        for class_name, label_idx in class_map.items():
+            count = max(counts.get(class_name.lower(), 0), 1)
+            weights[label_idx] = total / (num_classes * count)
+            
         return weights / weights.sum() * len(weights)
+
+    # def get_class_weights(self) -> torch.Tensor:
+    #     class_names = get_class_names()
+    #     n = len(class_names)
+    #     counts = self.train_dataset.df['class'].str.lower().value_counts().to_dict()
+    #     total = sum(counts.values()) or 1
+    #     class_counts = [max(counts.get(k.lower(), 0), 1) for k in class_names]
+    #     weights = torch.FloatTensor([total / (n * max(class_counts[i], 1)) for i in range(n)])
+    #     return weights / weights.sum() * len(weights)
 
     def get_sampler(self) -> Optional[WeightedRandomSampler]:
         if not self.use_weighted_sampler: return None

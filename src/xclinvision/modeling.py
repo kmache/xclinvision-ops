@@ -40,8 +40,8 @@ TIMM_MODEL_MAP = {
 class BiomedCLIPClassifier(nn.Module):
     """
     Custom wrapper for Microsoft's BiomedCLIP.
-    Extracts the pre-trained Vision Transformer from the CLIP model 
-    and adds a linear classification head for our 3 classes.
+    Extracts the pre-trained Vision Transformer from the CLIP model
+    and adds a linear classification head with ``num_classes`` outputs.
     """
     
     def __init__(self, num_classes: int = 3, pretrained: bool = True, dropout: float = 0.2):
