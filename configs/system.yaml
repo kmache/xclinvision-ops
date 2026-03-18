@@ -1,198 +1,26 @@
 # XClinVision System Configuration
+# Only keys actually consumed by the codebase are kept here.
+# Per-model settings (architecture, input size, explainability) live in
+# configs/<model>.yaml and are deep-merged on top of this file at runtime.
 
-# Project Settings
-project_name: "xclinvision"
-version: "0.1.0"
-debug: false
-
-# Paths
+# Paths (used by scripts/train.py)
 paths:
-  data_dir: "./data"
   raw_data_dir: "./data/raw"
   processed_data_dir: "./data/processed"
   quarantine_dir: "./data/quarantine"
-  models_dir: "./models"
-  logs_dir: "./logs"
-  outputs_dir: "./outputs"
-  mlflow_dir: "./mlruns"
-
-# Data Configuration
-data:
-  # Dataset sources
-  datasets:
-    - name: "chest_xray_pneumonia"
-      source: "kaggle"
-      kaggle_id: "paultimothymooney/chest-xray-pneumonia"
-      classes: ["NORMAL", "PNEUMONIA"]
-    - name: "tb_chest_xray"
-      source: "kaggle"
-      kaggle_id: ""  # Add specific dataset ID
-      classes: ["Normal", "Cardiomegaly"]
-  
-  # Preprocessing
-  target_size: [384, 384]  # Height, Width
-  maintain_aspect_ratio: true
-  padding_mode: "constant"
-  normalize:
-    method: "imagenet"  # imagenet, dataset, or per_image
-    mean: [0.485, 0.456, 0.406]
-    std: [0.229, 0.224, 0.225]
-  
-  # Quality Control
-  quality_control:
-    enabled: true
-    min_resolution: [224, 224]
-    max_file_size_mb: 50
-    reject_blur: true
-    blur_threshold: 100
-  
-  # Data Split
-  split:
-    method: "patient_wise_best_effort"
-    train_ratio: 0.7
-    val_ratio: 0.15
-    test_ratio: 0.15
-    stratify: true
-    random_seed: 42
-
-# Augmentation Configuration
-augmentation:
-  enabled: true
-  train_transforms:
-    - name: "HorizontalFlip"
-      p: 0.5
-    - name: "Rotate"
-      limit: 10
-      p: 0.3
-    - name: "ShiftScaleRotate"
-      shift_limit: 0.05
-      scale_limit: 0.1
-      rotate_limit: 10
-      p: 0.3
-    - name: "GaussNoise"
-      var_limit: [0.001, 0.01]
-      p: 0.2
-    - name: "GaussianBlur"
-      blur_limit: [3, 5]
-      sigma_limit: [0.1, 1.0]
-      p: 0.2
-    - name: "CLAHE"
-      clip_limit: 2.0
-      tile_grid_size: [8, 8]
-      p: 0.3
-  
-  val_transforms: []  # Only normalization
 
 # Model Configuration
+# class_names is the single source of truth for disease classes.
+# To change the set of diseases, update class_names below and ensure your
+# data directories / manifest match.  num_classes is derived automatically.
 model:
-  name: "efficientnet_b2"
-  num_classes: 3
   class_names: ["Normal", "Pneumonia", "Cardiomegaly"]
-  pretrained: true
-  dropout_rate: 0.3
-  
-  # Uncertainty Estimation
-  uncertainty:
-    method: "mc_dropout"
-    num_samples: 10
-    temperature_scaling: true
 
-# Training Configuration
+# Training defaults (can be overridden by CLI flags)
 training:
-  batch_size: 32
-  num_epochs: 100
-  num_workers: 4
-  accelerator: "gpu"
-  devices: 1
-  
-  # Optimizer
+  label_smoothing: 0.1
   optimizer:
-    name: "adamw"
-    lr: 1.0e-4
     weight_decay: 1.0e-4
-    betas: [0.9, 0.999]
-  
-  # Scheduler
-  scheduler:
-    name: "cosine_warmup"
-    warmup_epochs: 5
-    min_lr: 1.0e-6
-  
-  # Loss Function
-  loss:
-    name: "focal_loss"
-    alpha: 0.25
-    gamma: 2.0
-    class_weights: [1.0, 1.5, 1.5]  # Balance classes
-  
-  # Early Stopping
-  early_stopping:
-    monitor: "val_auc"
-    mode: "max"
-    patience: 10
-    min_delta: 0.001
-  
-  # Checkpointing
-  checkpoint:
-    monitor: "val_auc"
-    mode: "max"
-    save_top_k: 3
-    filename: "{epoch}-{val_auc:.3f}"
-
-# Evaluation Configuration
-evaluation:
-  metrics:
-    - "accuracy"
-    - "precision"
-    - "recall"
-    - "f1"
-    - "auc"
-    - "specificity"
-    - "sensitivity"
-  
-  calibration:
-    compute_ece: true
-    num_bins: 15
-  
-  thresholds:
-    optimize: true
-    metric: "f1"
-
-# Explainability Configuration
-explainability:
-  method: "gradcam++"
-  target_layer: "features"
-  heatmap_alpha: 0.5
-  colormap: "jet"
-  
-  # For transformers
-  attention:
-    method: "attention_rollout"
-    discard_ratio: 0.9
-
-# LLM Configuration
-llm:
-  provider: "openai"
-  model: "gpt-4"
-  temperature: 0.3
-  max_tokens: 500
-  
-  # RAG Configuration
-  rag:
-    vector_db: "chromadb"
-    embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
-    top_k: 5
-    sources:
-      - "merck_manual"
-      - "radiopaedia"
-      - "who_guidelines"
-
-# API Configuration
-api:
-  host: "0.0.0.0"
-  port: 8000
-  workers: 1
-  reload: false
   
   # Rate Limiting
   rate_limit:

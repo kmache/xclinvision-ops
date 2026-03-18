@@ -41,40 +41,37 @@ ENV/
 
 # Environment variables
 .env
-.env.* 
+.env.*
 
 # Data files
-data/raw/
-new_data/
-data/quarantine/
-data/duplicate/ 
+data/raw/*
+data/processed/*
+data/vector_db/*   
+data/NIH-ChestX-ray3
 data/processed/
-data/vector_db/
-data/NIH_ChestX-ray14/test/
-data/NIH_ChestX-ray14/train/
-data/NIH_ChestX-ray14/val/
-data/NIH-ChestX-ray3/val/
-data/NIH-ChestX-ray3/train/
-data/NIH-ChestX-ray3/test/
 NIH_ChestX-ray14/
-# Keep the directory structure on Git
+data/duplicate/
+data/quarantine/
+data/test_sample/
+new_data/
+
 !data/raw/.gitkeep
 !data/processed/.gitkeep 
 !data/vector_db/.gitkeep
-!data/processed/manifest.csv
 
-# Model artifacts 
-models/*
-!models/.gitkeep
+
+# Model artifacts
+models/
 *.pt
-*.pth 
+*.pth
 *.onnx
 *.h5
 *.pkl
 *.joblib
 
 # MLflow
-mlruns/
+mlruns/*
+!mlruns/.gitkeep
 mlartifacts/
 
 # Logs

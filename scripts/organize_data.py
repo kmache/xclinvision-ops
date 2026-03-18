@@ -76,8 +76,17 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 # ---------------------------------------------------------------------------
 
 def _patient_hash_bucket(patient_id: str) -> int:
-    """Deterministic 0-99 bucket for a patient ID (MD5-based)."""
-    return int(hashlib.md5(str(patient_id).encode()).hexdigest(), 16) % 100
+    """Deterministic 0-99 bucket for a patient ID (MD5-based).
+
+    Fix #27: normalise patient_id to a canonical integer string before hashing
+    so that equivalent IDs stored as different types (e.g. '1234', '1234.0')
+    always land in the same bucket.
+    """
+    try:
+        canonical = str(int(float(patient_id)))
+    except (ValueError, OverflowError):
+        canonical = str(patient_id)
+    return int(hashlib.md5(canonical.encode()).hexdigest(), 16) % 100
 
 
 def _assign_trainval_split(patient_id: str, val_ratio: float = 0.18) -> str:

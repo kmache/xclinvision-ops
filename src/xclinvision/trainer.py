@@ -18,18 +18,52 @@ logger = logging.getLogger(__name__)
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback
 import numpy as np
 from torchmetrics import MetricCollection, Accuracy, F1Score, AUROC
 from sklearn.metrics import classification_report, confusion_matrix
 
+from .config import get_class_map, get_class_names
 from .modeling import freeze_backbone, unfreeze_layers, get_param_counts
 
 # Determine PL major version once at import time so _apply_unfreeze_schedule
 _PL_MAJOR = int(pl.__version__.split(".")[0])
 
+
+# ---------------------------------------------------------------------------
+# Mixup / CutMix helpers
+# ---------------------------------------------------------------------------
+
+def mixup_data(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    alpha: float = 0.2,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Apply Mixup (Zhang et al., 2018) to a batch.
+
+    Returns mixed inputs, pairs of targets, and the lambda coefficient.
+    """
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    return mixed_x, y, y[index], lam
+
+
+def mixup_criterion(
+    criterion: nn.Module,
+    logits: torch.Tensor,
+    y_a: torch.Tensor,
+    y_b: torch.Tensor,
+    lam: float,
+) -> torch.Tensor:
+    """Compute loss for Mixup-augmented batch."""
+    return lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
 
 # ---------------------------------------------------------------------------
 # Loss
@@ -39,7 +73,7 @@ class FocalLoss(nn.Module):
 
     def __init__(
         self,
-        alpha: float = 0.25,
+        alpha: float = 1.0,
         gamma: float = 2.0,
         weight: Optional[torch.Tensor] = None,
         label_smoothing: float = 0.0,
@@ -52,6 +86,14 @@ class FocalLoss(nn.Module):
         self.label_smoothing = label_smoothing
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # 1. Get true probability (pt) using UNWEIGHTED hard-label cross entropy
+        unweighted_ce = F.cross_entropy(inputs, targets, reduction="none")
+        pt = torch.exp(-unweighted_ce)
+        
+        # 2. Compute focal term
+        focal_term = (1 - pt) ** self.gamma
+
+        # 3. Compute base cross entropy (with optional label smoothing)
         if self.label_smoothing > 0:
             n_classes = inputs.size(-1)
             targets_oh = F.one_hot(targets, n_classes).float()
@@ -63,10 +105,11 @@ class FocalLoss(nn.Module):
                 sample_weights = self.weight[targets]  # (B,)
                 ce_loss = ce_loss * sample_weights
         else:
+            # Apply standard weighted cross entropy
             ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction="none")
-
-        pt = torch.exp(-ce_loss)
-        return (self.alpha * (1 - pt) ** self.gamma * ce_loss).mean()
+            
+        # 4. Modulate and return
+        return (self.alpha * focal_term * ce_loss).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +126,6 @@ class XClinVisionModel(pl.LightningModule):
     - TorchMetrics for distributed-safe metrics tracking
     - Discriminative learning rates (backbone vs head)
     """
-
     def __init__(
         self,
         model: nn.Module,
@@ -95,6 +137,7 @@ class XClinVisionModel(pl.LightningModule):
         class_weights: Optional[List[float]] = None,
         progressive_unfreezing: bool = True,
         unfreeze_schedule: Optional[List[int]] = None,
+        mixup_alpha: float = 0.2,
         **kwargs,
     ):
         super().__init__()
@@ -108,6 +151,7 @@ class XClinVisionModel(pl.LightningModule):
         self.unfreeze_schedule = unfreeze_schedule or [1, 5, 10, 20]
         self.current_phase = 0
         self.label_smoothing = label_smoothing
+        self.mixup_alpha = mixup_alpha
         self._oom_steps = 0  # L-2: track OOM-skipped batches per epoch
 
         # Loss function
@@ -116,7 +160,6 @@ class XClinVisionModel(pl.LightningModule):
         )
         self.criterion = self._setup_loss(loss_type, weight_tensor, label_smoothing)
 
-        # TorchMetrics — distributed-safe, auto-synced across devices
         metrics = MetricCollection({
             "acc": Accuracy(task="multiclass", num_classes=num_classes, average="macro"),
             "f1_macro": F1Score(task="multiclass", num_classes=num_classes, average="macro"),
@@ -126,11 +169,18 @@ class XClinVisionModel(pl.LightningModule):
         self.val_metrics = metrics.clone(prefix="val_")
         self.test_metrics = metrics.clone(prefix="test_")
 
-        # Log model info (note: unfreezing has not run yet at init)
+        # Freeze the backbone right at init so configure_optimizers only sees the head.
+        # Start at phase 1 so _apply_unfreeze_schedule doesn't redundantly re-freeze
+        # the backbone on the very first epoch call (fix #13).
+        if self.progressive_unfreezing:
+            freeze_backbone(self.model, unfreeze_head=True)
+            self.current_phase = 1  # backbone already frozen — skip phase-1 re-freeze
+
+        # Log model info
         counts = get_param_counts(model)
         logger.info(
             f"Model loaded: {counts['total_m']:.2f}M params "
-            f"(trainable% will update after first unfreeze phase)"
+            f"({counts['trainable_m']:.2f}M trainable)"
         )
 
     # ---- loss setup -------------------------------------------------------
@@ -156,7 +206,12 @@ class XClinVisionModel(pl.LightningModule):
 
         target_phase = sum(1 for e in self.unfreeze_schedule if self.current_epoch >= e)
 
-        if target_phase != self.current_phase:
+        # Fix #13: only advance to higher phases \u2014 never go backwards.
+        # Using > instead of != means that if the backbone was already frozen at
+        # init (current_phase=1), the epoch-0 target_phase=0 does NOT trigger a
+        # spurious full-unfreeze, and the epoch-1 target_phase=1 is also skipped
+        # since the backbone is already in the correct state.
+        if target_phase > self.current_phase:
             self.current_phase = target_phase
             # Phase 1: head only  |  Phase 2: last 2 blocks  |
             # Phase 3: last 4 blocks  |  Phase 4+: full fine-tuning
@@ -174,45 +229,7 @@ class XClinVisionModel(pl.LightningModule):
                 
             self.print(f"Epoch {self.current_epoch}: Phase {target_phase} - {msg}")
 
-            if self.trainer is not None:
-                if _PL_MAJOR >= 2:
-                    opt = self.optimizers()
-                    if isinstance(opt, list):
-                        opt = opt[0]
-                    existing_ids = {id(p) for group in opt.param_groups for p in group["params"]}
-                    named_params = list(self.model.named_parameters())
-                    head_cutoff = int(len(named_params) * 0.9)
-                    new_backbone, new_head = [], []
-                    for i, (name, param) in enumerate(named_params):
-                        if not param.requires_grad or id(param) in existing_ids:
-                            continue
-                        is_head = i >= head_cutoff or any(
-                            k in name for k in ("head", "fc", "classifier")
-                        )
-                        (new_head if is_head else new_backbone).append(param)
-                    if new_backbone:
-                        opt.add_param_group({
-                            "params": new_backbone,
-                            "lr": self.learning_rate * 0.1,
-                            "name": "progressive_backbone",
-                        })
-                    if new_head:
-                        opt.add_param_group({
-                            "params": new_head,
-                            "lr": self.learning_rate,
-                            "name": "progressive_head",
-                        })
-                else:
-                    # PL 1.x: fully rebuild the optimizer from scratch via strategy.
-                    try:
-                        self.trainer.strategy.setup_optimizers(self.trainer)
-                    except Exception as exc:
-                        logger.warning(
-                            f"Could not rebuild optimizer after unfreeze (PL 1.x): {exc}"
-                        )
-
     # ---- forward / steps --------------------------------------------------
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
@@ -223,8 +240,14 @@ class XClinVisionModel(pl.LightningModule):
     def training_step(self, batch, _batch_idx):
         x, y = batch
         try:
-            logits = self(x)
-            loss = self.criterion(logits, y)
+            # Apply Mixup augmentation during training
+            if self.mixup_alpha > 0 and self.training:
+                mixed_x, y_a, y_b, lam = mixup_data(x, y, self.mixup_alpha)
+                logits = self(mixed_x)
+                loss = mixup_criterion(self.criterion, logits, y_a, y_b, lam)
+            else:
+                logits = self(x)
+                loss = self.criterion(logits, y)
         except torch.OutOfMemoryError:
             torch.cuda.empty_cache()
             self._oom_steps += 1
@@ -235,6 +258,9 @@ class XClinVisionModel(pl.LightningModule):
             return None
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        # Use the logits we already computed; avoids a costly second forward pass.
+        # When mixup is active, metrics reflect the mixed distribution — this is
+        # standard practice and matches what the loss actually optimises.
         self.train_metrics.update(logits, y)
         return loss
 
@@ -302,27 +328,30 @@ class XClinVisionModel(pl.LightningModule):
             self.test_metrics.reset()
 
     # ---- optimizer --------------------------------------------------------
-
     def configure_optimizers(self):
-        """Configure optimizer with discriminative learning rates."""
+        """Configure optimizer with discriminative learning rates and warmup."""
         backbone_params, head_params = [], []
-        named_params = list(self.model.named_parameters())
-        head_cutoff = int(len(named_params) * 0.9)
 
-        for i, (name, param) in enumerate(named_params):
+        for name, param in self.model.named_parameters():
+            # Fix #7: skip frozen parameters entirely — AdamW still allocates
+            # moment tensors for params with requires_grad=False, wasting GPU/CPU
+            # memory proportional to frozen backbone size.
             if not param.requires_grad:
                 continue
-            if i >= head_cutoff or any(k in name for k in ("head", "fc", "classifier")):
+            if any(k in name for k in ("head", "fc", "classifier", "last_linear")):
                 head_params.append(param)
             else:
                 backbone_params.append(param)
+        
         param_groups = []
         if backbone_params:
-            param_groups.append({"params": backbone_params, "lr": self.learning_rate * 0.1, "name": "backbone"})
+            # Fix #14: 5× discriminative ratio instead of 10× so the backbone
+            # retains enough learning signal when it unfreezes mid-training.
+            param_groups.append({"params": backbone_params, "lr": self.learning_rate * 0.2, "name": "backbone"})
         if head_params:
             param_groups.append({"params": head_params, "lr": self.learning_rate, "name": "head"})
 
-        # Fallback: if nothing is trainable yet (e.g. before first unfreeze), include all params
+        # Fallback: if somehow empty, include all params
         if not param_groups:
             param_groups = [{"params": list(self.model.parameters()), "lr": self.learning_rate}]
 
@@ -332,8 +361,16 @@ class XClinVisionModel(pl.LightningModule):
             eps=1e-8,
         )
 
-        scheduler = CosineAnnealingWarmRestarts(
-            optimizer, T_0=10, T_mult=2, eta_min=self.learning_rate * 1e-3
+        # Warmup for 5 epochs then cosine annealing.
+        # Fix #24: eta_min=1e-6 prevents the LR from reaching zero, which would
+        # kill fine-tuning if EarlyStopping fires before max_epochs.
+        warmup = LinearLR(optimizer, start_factor=0.01, total_iters=5)
+        cosine = CosineAnnealingLR(
+            optimizer, T_max=max(self.trainer.max_epochs - 5, 1),
+            eta_min=1e-6,
+        )
+        scheduler = SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[5]
         )
 
         return {
@@ -364,7 +401,7 @@ class MetricsCallback(Callback):
         self, trainer, pl_module, outputs, batch, batch_idx, **kwargs
     ):
         """Collect validation outputs. **kwargs handles PL 2.x dataloader_idx injections."""
-        if outputs is None or not isinstance(outputs, dict):
+        if outputs is None or not isinstance(outputs, dict) or "preds" not in outputs:
             return
         
         # Detach and move to CPU immediately to prevent memory leaks
@@ -379,11 +416,15 @@ class MetricsCallback(Callback):
 
         preds = np.array(self.val_preds)
         targets = np.array(self.val_targets)
-        target_names = ["Normal", "Pneumonia", "Cardiomegaly"]
+        
+        # Always use all classes to prevent dimension mismatch during sanity checks
+        target_names = getattr(pl_module, 'class_names', get_class_names())
+        all_labels = list(range(len(target_names)))
+
         report = classification_report(
             targets,
             preds,
-            labels=list(range(len(target_names))),
+            labels=all_labels,
             target_names=target_names,
             output_dict=True,
             zero_division=0,
@@ -396,7 +437,7 @@ class MetricsCallback(Callback):
                     if isinstance(value, (int, float)):
                         pl_module.log(f"val_{cls_name}_{metric_name}", float(value))
 
-        cm = confusion_matrix(targets, preds, labels=list(range(len(target_names))))
+        cm = confusion_matrix(targets, preds, labels=all_labels)
         logger.info(f"\nConfusion Matrix (epoch {trainer.current_epoch}):\n{cm}")
 
         # Save predictions if requested
@@ -441,19 +482,20 @@ class BestModelExportCallback(Callback):
         model.eval()
     """
 
-    CLASS_MAP = {"normal": 0, "pneumonia": 1, "cardiomegaly": 2}
-
     def __init__(
         self,
         model_name: str,
         export_dir: str,
-        num_classes: int = 3,
+        num_classes: int | None = None,
+        class_names: list[str] | None = None,
         run_id: Optional[str] = None,
     ):
         super().__init__()
         self.model_name = model_name
         self.export_dir = export_dir
-        self.num_classes = num_classes
+        self.class_names = class_names or get_class_names()
+        self.CLASS_MAP = get_class_map()
+        self.num_classes = num_classes if num_classes is not None else len(self.class_names)
         # Deterministic short ID: "v" + first 4 hex chars of sha256(model_name)
         if run_id is None:
             digest = hashlib.sha256(model_name.encode()).hexdigest()[:4]
@@ -506,6 +548,7 @@ class BestModelExportCallback(Callback):
             "num_classes": self.num_classes,
             "run_id": self.run_id,
             "class_map": self.CLASS_MAP,
+            "class_names": self.class_names,
             "best_val_auc": best_val_auc,
             "source_ckpt": best_path,
         }

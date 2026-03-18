@@ -18,11 +18,13 @@ python3 scripts/train.py \
   --config  configs/resnet50.yaml \
   --model   resnet50 \
   --epochs  50 \
-  --batch-size 64 \
+  --batch-size 32 \
+  --image-size  512 \
   --lr      1e-4 \
   --loss    focal \
   --weight-decay 1e-4 \
-  --label-smoothing 0.1 \
+  --label-smoothing 0.15 \
   --output-dir models \
   --num-workers 4 \
-  --seed    42
+  --seed    42 \
+  "$@"

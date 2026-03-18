@@ -7,3 +7,6 @@ torchvision>=0.15.0
 numpy>=1.24.0
 pillow>=10.0.0
 python-dotenv>=1.0.0
+opencv-python-headless>=4.8.0
+sqlalchemy>=2.0.0
+pydicom

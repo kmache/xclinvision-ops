@@ -22,13 +22,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from xclinvision.config import get_class_names
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants & Radiological Mappings
 # ---------------------------------------------------------------------------
 
-DEFAULT_CLASS_NAMES: List[str] = ["Normal", "Pneumonia", "Cardiomegaly"]
+DEFAULT_CLASS_NAMES: List[str] = get_class_names()
 
 LUNG_REGIONS: Dict[str, Tuple[float, float, float, float]] = {
     # ---------------------------------------------------------------
@@ -130,6 +132,13 @@ class GradCAMPlusPlus:
         # Transformers (Swin, ViT) produce (num_patches, C) — reshape to (C, H, W)
         if acts.ndim == 2:
             num_patches, C = acts.shape
+
+            # Check if there is a CLS token (perfect square + 1)
+            if int((num_patches - 1) ** 0.5) ** 2 == (num_patches - 1):
+                acts = acts[1:, :] # Strip CLS token
+                grads = grads[1:, :]
+                num_patches -= 1
+
             # L-3 fix: handle non-square patch grids (e.g. Swin with non-power-of-2
             # image sizes) instead of blindly assuming a perfect square.
             H_sq = int(num_patches ** 0.5)
@@ -193,7 +202,10 @@ def create_overlay(
     colormap: int = cv2.COLORMAP_JET,
 ) -> np.ndarray:
     if image.dtype != np.uint8:
-        base = np.clip(image * 255, 0, 255).astype(np.uint8)
+        if image.max() <= 1.0:
+            base = np.clip(image * 255, 0, 255).astype(np.uint8)
+        else:
+            base = np.clip(image, 0, 255).astype(np.uint8)
     else:
         base = image.copy()
 
@@ -204,7 +216,8 @@ def create_overlay(
         heatmap = cv2.resize(heatmap, (base.shape[1], base.shape[0]))
 
     coloured = cv2.applyColorMap(np.uint8(255 * np.clip(heatmap, 0, 1)), colormap)
-    return cv2.addWeighted(base, 1.0 - alpha, coloured, alpha, 0)
+    blended = cv2.addWeighted(base, 1.0 - alpha, coloured, alpha, 0)
+    return cv2.cvtColor(blended, cv2.COLOR_BGR2RGB)
 
 
 def score_lung_regions(
@@ -297,9 +310,8 @@ def clinical_plausibility_score(
         elif mean_lung < 0.25:
             score += 0.1
     elif "pneumonia" in class_name_lower:
-        basal = (region_scores.get("left_lower", 0) + region_scores.get("right_lower", 0)) / 2
-        mid = (region_scores.get("left_middle", 0) + region_scores.get("right_middle", 0)) / 2
-        if basal > 0.2 or mid > 0.2:
+        lung_max = max([v for k, v in region_scores.items() if "left_" in k or "right_" in k] or [0.0])
+        if lung_max > 0.2:
             score += 0.3
     elif "cardiomegaly" in class_name_lower:
         # Cardiomegaly: attention should concentrate on the cardiac/central region
@@ -378,12 +390,16 @@ class ExplainabilityEngine:
         target_layer: Optional[nn.Module] = None,
         device: str = "cpu",
         img_size: int = 384,
+        dataset_mean: Optional[np.ndarray] = None,
+        dataset_std: Optional[np.ndarray] = None,
     ) -> None:
         self.model = model
         self.class_names = class_names
         self.architecture = architecture
         self.device = device
         self.img_size = img_size
+        self.dataset_mean = dataset_mean if dataset_mean is not None else IMAGENET_MEAN
+        self.dataset_std = dataset_std if dataset_std is not None else IMAGENET_STD
         self._target_layer = target_layer or self._resolve_target_layer()
 
         if self._target_layer is None:
@@ -413,7 +429,7 @@ class ExplainabilityEngine:
         if img.shape[:2] != (self.img_size, self.img_size):
             img = cv2.resize(img, (self.img_size, self.img_size))
 
-        normalised = (img - IMAGENET_MEAN) / IMAGENET_STD
+        normalised = (img - self.dataset_mean) / self.dataset_std
         tensor = torch.from_numpy(normalised).permute(2, 0, 1).unsqueeze(0).float()
         return tensor.to(self.device)
 
@@ -426,7 +442,33 @@ class ExplainabilityEngine:
     ) -> Dict[str, Any]:
         """Generate heatmap. Accepts preprocessed Tensor or raw Numpy array."""
         if self._target_layer is None:
-            raise RuntimeError("No target layer available.")
+            logger.error("No target layer found. Returning empty heatmap.")
+            h, w = self.img_size, self.img_size
+            if original_image is not None:
+                h, w = original_image.shape[:2]
+            elif isinstance(input_data, np.ndarray):
+                h, w = input_data.shape[:2]
+
+            empty_cam = np.zeros((h, w), dtype=np.float32)
+            
+            vis_image = original_image.copy() if original_image is not None else (input_data.copy() if isinstance(input_data, np.ndarray) else np.zeros((h, w, 3), dtype=np.uint8))
+            if vis_image.ndim == 2:
+                vis_image = np.stack([vis_image, vis_image, vis_image], axis=-1)
+            elif vis_image.ndim == 3 and vis_image.shape[2] == 1:
+                vis_image = np.concatenate([vis_image, vis_image, vis_image], axis=-1)
+
+            if vis_image.dtype == np.uint8:
+                vis_image = vis_image.astype(np.float32) / 255.0
+
+            overlay = create_overlay(vis_image, empty_cam, alpha=alpha)
+            return {
+                "heatmap": overlay,
+                "grayscale_cam": empty_cam,
+                "region_scores": score_lung_regions(empty_cam),
+                "quality": assess_cam_quality(empty_cam),
+                "target_class": target_class if target_class is not None else 0,
+                "method": "gradcam++ (fallback)",
+            }
 
         # Handle double forward-pass prevention
         if isinstance(input_data, torch.Tensor):
@@ -565,7 +607,6 @@ class ValidationXAI:
                     label = int(labels[i].item())
                     tensor_batch = images[i : i + 1].to(self.device)
 
-                    # Pass tensor directly to avoid double forward pass
                     result = self.engine.generate_heatmap(
                         input_data=tensor_batch,
                         original_image=img_np,
@@ -608,11 +649,6 @@ class ValidationXAI:
             "n_samples": processed,
             "clinical_plausibility": {
                 "score": mean_plaus,
-                # M-2 fix: threshold raised from 0.5 to 0.65.
-                # 0.5 was the uninformative base score — a model with completely
-                # uniform CAM activation would pass.  0.65 requires at least one
-                # clinically meaningful bonus (e.g. activation_range > 0.1 AND
-                # a class-appropriate spatial pattern).
                 "is_acceptable": mean_plaus >= 0.65,
             },
             "qc_failure_rate": qc_rate,

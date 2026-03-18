@@ -1,10 +1,15 @@
 """Reliability analysis and robustness testing."""
 
 from typing import Dict, List, Optional, Tuple, Union
+import logging
 import numpy as np
 import torch
 import cv2
+from scipy.linalg import sqrtm
 from xclinvision.dataset import get_val_transforms
+from xclinvision.modeling import get_model_normalization
+
+logger = logging.getLogger(__name__)
 
 
 class ReliabilityAnalyzer:
@@ -31,7 +36,17 @@ class ReliabilityAnalyzer:
         if hasattr(self.model, "default_cfg") and "input_size" in self.model.default_cfg:
             img_size = self.model.default_cfg["input_size"][-1]
             
-        transform = get_val_transforms(image_size=img_size)
+        # Determine normalization stats from the loaded model
+        model_name = getattr(self.model, 'name', 'unknown')
+        if hasattr(self.model, '__class__') and self.model.__class__.__name__ == 'BiomedCLIPClassifier':
+            model_name = 'biomedclip'
+            
+        norm_stats = get_model_normalization(self.model, model_name)
+        transform = get_val_transforms(
+            image_size=img_size, 
+            mean=norm_stats["mean"], 
+            std=norm_stats["std"]
+        )
         
         if isinstance(images, np.ndarray):
             # If it's a single image, wrap it in a list. If it's a batch, list(images) will work too.
@@ -134,10 +149,14 @@ class ReliabilityAnalyzer:
         mu_test = np.mean(test_embeddings, axis=0)
         sigma_test = np.cov(test_embeddings.T)
         
-        # Compute FID
+        # Compute FID using scipy
         diff = mu_train - mu_test
-        covmean = self._sqrtm(sigma_train @ sigma_test)
         
+        # sqrtm returns complex numbers due to numerical noise; take the real part
+        covmean = sqrtm(sigma_train.dot(sigma_test))
+        if np.iscomplexobj(covmean):
+            covmean = covmean.real
+            
         if np.isnan(covmean).any():
             fid = np.sum(diff ** 2)
         else:
@@ -155,12 +174,6 @@ class ReliabilityAnalyzer:
             "cosine_distance": float(cosine_dist),
             "mean_l2_distance": float(np.linalg.norm(diff)),
         }
-    
-    def _sqrtm(self, matrix: np.ndarray) -> np.ndarray:
-        """Compute matrix square root."""
-        eigenvalues, eigenvectors = np.linalg.eigh(matrix)
-        eigenvalues = np.maximum(eigenvalues, 0)
-        return eigenvectors @ np.diag(np.sqrt(eigenvalues)) @ eigenvectors.T
     
     def test_robustness(
         self,
@@ -213,22 +226,24 @@ class ReliabilityAnalyzer:
                 "Install it with: pip install opencv-python"
             ) from exc
         
-        perturbed = image.copy()
+        # Safely cast to float32 for math operations
+        img_float = image.astype(np.float32)
         
         if perturbation == "noise":
-            noise = np.random.normal(0, severity * 255, image.shape)
-            perturbed = np.clip(image + noise, 0, 255).astype(np.uint8)
+            noise = np.random.normal(0, severity * 255, img_float.shape)
+            perturbed = np.clip(img_float + noise, 0, 255).astype(np.uint8)
             
         elif perturbation == "blur":
             kernel_size = int(5 + severity * 10) // 2 * 2 + 1
+            # cv2 functions prefer uint8
             perturbed = cv2.GaussianBlur(image, (kernel_size, kernel_size), 0)
             
         elif perturbation == "brightness":
-            perturbed = np.clip(image * (1 + severity), 0, 255).astype(np.uint8)
+            perturbed = np.clip(img_float * (1 + severity), 0, 255).astype(np.uint8)
             
         elif perturbation == "contrast":
-            mean = np.mean(image)
-            perturbed = np.clip((image - mean) * (1 + severity) + mean, 0, 255).astype(np.uint8)
+            mean = np.mean(img_float)
+            perturbed = np.clip((img_float - mean) * (1 + severity) + mean, 0, 255).astype(np.uint8)
             
         return perturbed
 
@@ -237,7 +252,8 @@ class FailureAnalyzer:
     """Analyze model failure modes."""
     
     def __init__(self, class_names: Optional[List[str]] = None):
-        self.class_names = class_names or ["Normal", "Pneumonia", "Cardiomegaly"]
+        from xclinvision.config import get_class_names
+        self.class_names = class_names or get_class_names()
         
     def analyze_failures(
         self,

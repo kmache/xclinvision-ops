@@ -476,7 +476,7 @@ def main() -> None:
     parser.add_argument("--raw-dir", type=str, default="data/raw", help="Raw data root")
     parser.add_argument("--processed-dir", type=str, default="data/processed", help="Output dir for clean images")
     parser.add_argument("--quarantine-dir", type=str, default="data/quarantine", help="Output dir for bad images")
-    parser.add_argument("--target-size", type=int, default=384, help="Target H=W in pixels")
+    parser.add_argument("--target-size", type=int, default=1024, help="Target H=W in pixels")
     parser.add_argument("--min-area", type=float, default=DEFAULT_MIN_AREA_RATIO, help="Minimum acceptable X-ray area ratio")
     parser.add_argument("--output-format", type=str, default="png", choices=["png", "jpg"])
     parser.add_argument("--duplicate-dir", type=str, default="data/duplicate", help="Output dir for cross-class duplicate images")

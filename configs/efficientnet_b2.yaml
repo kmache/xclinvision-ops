@@ -1,18 +1,16 @@
 name: efficientnet_b2
 type: cnn
 
-# Override model.num_classes here to train with a different number of classes.
-# Update class_names to match. Examples:
-#   2 classes: ["Normal", "Pneumonia"]
-#   4 classes: ["Normal", "Pneumonia", "Cardiomegaly", "COVID-19"]
-model:
-  num_classes: 3
-  class_names: ["Normal", "Pneumonia", "Cardiomegaly"]
+# class_names and num_classes are defined in system.yaml (single source of truth).
+# Only uncomment the overrides below if this model needs different classes.
+# model:
+#   num_classes: 3
+#   class_names: ["Normal", "Pneumonia", "Cardiomegaly"]
 
 architecture:
   backbone: efficientnet_b2
   pretrained: true
-  num_classes: 3  # keep in sync with model.num_classes above
+  num_classes: 3  # auto-derived from system.yaml class_names at runtime
   dropout_rate: 0.3
   head:
     type: sequential
@@ -28,7 +26,7 @@ architecture:
         p: 0.3
       - type: linear
         in_features: 512
-        out_features: 3
+        out_features: 3  # must match num_classes
 
 transfer_learning:
   freeze_backbone: false

@@ -1,0 +1,8 @@
+[server]
+# Use poll-based file watching instead of inotify to avoid
+# "inotify instance limit reached" (EMFILE) errors on Linux systems
+# with a low fs.inotify.max_user_instances kernel limit.
+fileWatcherType = "poll"
+
+[browser]
+gatherUsageStats = false

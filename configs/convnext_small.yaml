@@ -4,7 +4,7 @@ type: cnn
 architecture:
   backbone: convnext_small
   pretrained: true
-  num_classes: 3
+  num_classes: 3  # auto-derived from system.yaml class_names at runtime
   dropout_rate: 0.3
   head:
     type: sequential
@@ -20,7 +20,7 @@ architecture:
         p: 0.3
       - type: linear
         in_features: 512
-        out_features: 3
+        out_features: 3  # must match num_classes
 
 transfer_learning:
   freeze_backbone: false

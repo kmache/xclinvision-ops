@@ -14,39 +14,82 @@ import torch
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
+from xclinvision.config import get_class_map, get_class_names
+
 logger = logging.getLogger(__name__)
 
-CLASS_MAP = {"normal": 0, "pneumonia": 1, "cardiomegaly": 2}
+CLASS_MAP = get_class_map()
 
 # ---------------------------------------------------------------------------
 # 1. Albumentations Transforms (Optimized & Medical-Safe)
 # ---------------------------------------------------------------------------
-def get_train_transforms(image_size: int = 384) -> A.Compose:
+def get_train_transforms(
+    image_size: int = 384,
+    mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+    std: Tuple[float, float, float] = (0.229, 0.224, 0.225)) -> A.Compose:
     """Robust medical-safe augmentation pipeline."""
     return A.Compose([
         A.RandomResizedCrop(
-            size=(image_size, image_size), 
-            scale=(0.85, 1.0),
-            ratio=(1.0, 1.0),
-            p=1.0),
-        A.HorizontalFlip(p=0.5),
-        A.RandomBrightnessContrast(brightness_limit=0.4, contrast_limit=0.4, p=0.8),
-        A.Affine(translate_percent=0.05, scale=(0.9, 1.1), rotate=(-7, 7), p=0.3),
-        A.HueSaturationValue(hue_shift_limit=0, sat_shift_limit=20, val_shift_limit=20, p=0.5),
-        A.RandomGamma(gamma_limit=(90, 110), p=0.3),
-        A.GaussNoise(p=0.2),
-        A.GaussianBlur(blur_limit=(3, 7), p=0.3),
-        A.CoarseDropout(max_holes=8, max_height=40, max_width=40, fill_value=0, p=0.5),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
+            size=(image_size, image_size),
+            scale=(0.80, 1.0),  # 20% zoom range gives meaningful scale invariance
+            ratio=(0.95, 1.05),  # allow very slight non-square crops (chest X-rays are near-square)
+            p=1
+        ),
+
+        A.Affine(
+            translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
+            scale=(0.92, 1.08),
+            rotate=(-6, 6),
+            border_mode=cv2.BORDER_CONSTANT,
+            fill=0,
+            p=0.5
+        ),
+
+        A.RandomBrightnessContrast(
+            brightness_limit=0.2,
+            contrast_limit=0.2,
+            p=0.5
+        ),
+
+        A.RandomGamma(
+            gamma_limit=(90, 110),
+            p=0.2
+        ),
+
+        A.GaussNoise(
+            std_range=(0.012, 0.025),   # normalized to [0,1]; ≈ 3.0/255, 6.5/255
+            p=0.2
+        ),
+
+        # NOTE: CLAHE is already applied during preprocessing (processing.py).
+        # Applying it again here would double-enhance contrast on training data
+        # while val/test only get the preprocessing CLAHE — causing a train/eval
+        # distribution mismatch. Removed to keep transforms distribution-safe.
+
+        # Fix #12: limit to 1 small hole — multiple large holes risk occluding
+        # critical anatomy (cardiac border, hilum) in chest X-rays.
+        A.CoarseDropout(
+            num_holes_range=(1, 1),
+            hole_height_range=(1, 12),
+            hole_width_range=(1, 12),
+            fill=0,
+            p=0.15
+        ),
+
+        A.Normalize(mean=mean, std=std),
+
+        ToTensorV2()
     ])
 
-def get_val_transforms(image_size: int = 384) -> A.Compose:
+
+def get_val_transforms(
+    image_size: int = 384,
+    mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+    std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
+) -> A.Compose:
     return A.Compose([
         A.Resize(height=image_size, width=image_size, interpolation=cv2.INTER_AREA),
-        A.Normalize(
-            mean=[0.485, 0.456, 0.406], 
-            std=[0.229, 0.224, 0.225]),
+        A.Normalize(mean=mean, std=std),
         ToTensorV2(),
     ])
 
@@ -59,9 +102,22 @@ class ChestXrayDataset(Dataset):
     def __init__(self, df: pd.DataFrame, transform: Optional[Callable] = None, cache_size: int = 0, fallback_size: int = 384):
         self.df = df.reset_index(drop=True)
         self.transform = transform
+        
+        # Note: In multiprocessing (num_workers > 0), this cache is duplicated across 
+        # all worker processes independently. Actual RAM usage = (cache_size * num_workers).
         self._cache_size = cache_size
         self.fallback_size = fallback_size
-        self.labels = [CLASS_MAP[row['class'].lower()] for _, row in self.df.iterrows()]
+        # Fix #2: validate labels eagerly so unmapped classes raise immediately
+        # rather than silently producing NaN values that corrupt the training loop.
+        mapped = self.df['class'].str.lower().map(CLASS_MAP)
+        invalid_mask = mapped.isna()
+        if invalid_mask.any():
+            bad_vals = self.df.loc[invalid_mask, 'class'].unique().tolist()
+            raise ValueError(
+                f"Unknown class labels found in manifest: {bad_vals}. "
+                f"Expected one of: {list(CLASS_MAP.keys())}"
+            )
+        self.labels = mapped.tolist()
         self._image_cache: dict = {}
             
     def _load_image_impl(self, image_path: str) -> np.ndarray:
@@ -71,7 +127,7 @@ class ChestXrayDataset(Dataset):
         except Exception as e:
             logger.error(f"Error loading {image_path}: {e}")
             image = np.zeros((self.fallback_size, self.fallback_size), dtype=np.uint8)
-        return np.stack([image, image, image], axis=-1)
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
 
     def _load_image(self, image_path: str) -> np.ndarray:
         """Load image with FIFO dict cache that avoids reference cycles."""
@@ -81,7 +137,7 @@ class ChestXrayDataset(Dataset):
             if len(self._image_cache) >= self._cache_size:
                 self._image_cache.pop(next(iter(self._image_cache)))
             self._image_cache[image_path] = self._load_image_impl(image_path)
-        return self._image_cache[image_path]
+        return self._image_cache[image_path].copy()
         
     def __len__(self) -> int:
         return len(self.df)
@@ -106,9 +162,11 @@ class ChestXrayDataModule(pl.LightningDataModule):
         manifest_path: str, 
         batch_size: int = 32, 
         num_workers: int = 4,
-        image_size: int = 384, 
+        image_size: int = 512, 
         cache_size: int = 1000, 
         use_weighted_sampler: bool = True,
+        mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+        std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
     ):
         super().__init__()
         self.manifest_path = Path(manifest_path)
@@ -117,9 +175,12 @@ class ChestXrayDataModule(pl.LightningDataModule):
         self.image_size = image_size
         self.cache_size = cache_size
         self.use_weighted_sampler = use_weighted_sampler
+        self.mean = mean
+        self.std = std
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
+        self.predict_dataset = None
         
     def setup(self, stage: Optional[str] = None):
         if not self.manifest_path.exists():
@@ -130,68 +191,73 @@ class ChestXrayDataModule(pl.LightningDataModule):
             raise ValueError("Manifest missing required columns")
 
         if stage in ("fit", None):
-            self.train_dataset = ChestXrayDataset(df[df['split'] == 'train'], get_train_transforms(self.image_size), self.cache_size, fallback_size=self.image_size)
-            self.val_dataset = ChestXrayDataset(df[df['split'] == 'val'], get_val_transforms(self.image_size), self.cache_size, fallback_size=self.image_size)
-        if stage in ("test", None):
-            self.test_dataset = ChestXrayDataset(df[df['split'] == 'test'], get_val_transforms(self.image_size), self.cache_size, fallback_size=self.image_size)
+            self.train_dataset = ChestXrayDataset(df[df['split'] == 'train'], get_train_transforms(self.image_size, self.mean, self.std), self.cache_size, fallback_size=self.image_size)
+            # Fix #15: val/test are evaluated once per epoch — caching wastes RAM
+            # without any speed benefit (each image is visited exactly once).
+            self.val_dataset = ChestXrayDataset(df[df['split'] == 'val'], get_val_transforms(self.image_size, self.mean, self.std), cache_size=0, fallback_size=self.image_size)
+        if stage in ("test", "predict", None):
+            self.test_dataset = ChestXrayDataset(df[df['split'] == 'test'], get_val_transforms(self.image_size, self.mean, self.std), cache_size=0, fallback_size=self.image_size)
+            self.predict_dataset = self.test_dataset
 
     def get_class_weights(self) -> torch.Tensor:
-        counts = self.train_dataset.df['class'].value_counts().to_dict()
+        class_names = get_class_names()
+        n = len(class_names)
+        counts = self.train_dataset.df['class'].str.lower().value_counts().to_dict()
         total = sum(counts.values()) or 1
-        class_counts = [max(counts.get(k, 0), 1) for k in ["normal", "pneumonia", "cardiomegaly"]]
-        weights = torch.FloatTensor([total / (3 * max(class_counts[i], 1)) for i in range(3)])
+        class_counts = [max(counts.get(k.lower(), 0), 1) for k in class_names]
+        weights = torch.FloatTensor([total / (n * max(class_counts[i], 1)) for i in range(n)])
         return weights / weights.sum() * len(weights)
 
     def get_sampler(self) -> Optional[WeightedRandomSampler]:
         if not self.use_weighted_sampler: return None
         weights = self.get_class_weights()
         sample_weights = torch.DoubleTensor([weights[l].item() for l in self.train_dataset.labels])
-        return WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=False)
+        return WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
 
     def train_dataloader(self):
         sampler = self.get_sampler()
+        pw = self.num_workers > 0
         return DataLoader(
             self.train_dataset, batch_size=self.batch_size, shuffle=(sampler is None),
-            sampler=sampler, num_workers=self.num_workers, pin_memory=True, drop_last=bool(sampler)
+            sampler=sampler, num_workers=self.num_workers, pin_memory=True,
+            drop_last=True, persistent_workers=pw,
         )
          
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True)
+        pw = self.num_workers > 0
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True, persistent_workers=pw)
         
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True)
+        pw = self.num_workers > 0
+        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True, persistent_workers=pw)
+
+    def predict_dataloader(self):
+        pw = self.num_workers > 0
+        return DataLoader(self.predict_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True, persistent_workers=pw)
 
     def get_statistics(self) -> dict:
         """Compute and return dataset statistics for reporting."""
         if self.train_dataset is None or self.val_dataset is None or self.test_dataset is None:
             self.setup()
             
-        train_counts = self.train_dataset.df['class'].value_counts().to_dict()
-        val_counts = self.val_dataset.df['class'].value_counts().to_dict()
-        test_counts = self.test_dataset.df['class'].value_counts().to_dict()
+        train_counts = self.train_dataset.df['class'].str.lower().value_counts().to_dict()
+        val_counts = self.val_dataset.df['class'].str.lower().value_counts().to_dict()
+        test_counts = self.test_dataset.df['class'].str.lower().value_counts().to_dict()
         
         total_train = sum(train_counts.values())
         
+        class_names = get_class_names()
         stats = {
             'train_samples': total_train,
             'val_samples': sum(val_counts.values()),
             'test_samples': sum(test_counts.values()),
             'class_distribution': {
-                'normal': {
-                    'train': train_counts.get('normal', 0),
-                    'val': val_counts.get('normal', 0),
-                    'test': test_counts.get('normal', 0)
-                },
-                'pneumonia': {
-                    'train': train_counts.get('pneumonia', 0),
-                    'val': val_counts.get('pneumonia', 0),
-                    'test': test_counts.get('pneumonia', 0)
-                },
-                'cardiomegaly': {
-                    'train': train_counts.get('cardiomegaly', 0),
-                    'val': val_counts.get('cardiomegaly', 0),
-                    'test': test_counts.get('cardiomegaly', 0)
+                name.lower(): {
+                    'train': train_counts.get(name.lower(), 0),
+                    'val': val_counts.get(name.lower(), 0),
+                    'test': test_counts.get(name.lower(), 0),
                 }
+                for name in class_names
             },
             'class_weights': self.get_class_weights().tolist()
         }

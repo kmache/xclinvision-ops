@@ -21,3 +21,5 @@ poppler-utils
 tesseract
 qdrant-client
 tiktoken
+streamlit>=1.53.0
+pydicom

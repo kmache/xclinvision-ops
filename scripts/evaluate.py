@@ -39,10 +39,10 @@ from xclinvision.evaluator import (
     MetricsComputer,
     TemperatureScaler,
 )
-from xclinvision.modeling import build_model
+from xclinvision.modeling import build_model, get_model_normalization
 from xclinvision.reliability import FailureAnalyzer
 from xclinvision.trainer import XClinVisionModel
-from xclinvision.xai import DEFAULT_CLASS_NAMES
+from xclinvision.config import get_class_names, get_num_classes
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,6 +50,32 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("xclinvision.evaluate")
+
+
+# ---------------------------------------------------------------------------
+# Dynamic processed data resolution
+# ---------------------------------------------------------------------------
+
+def get_processed_dir_for_size(base_processed_dir: str, image_size: int) -> Path:
+    """
+    Dynamically construct processed data directory based on image size.
+    Example: base='data/processed', size=384 -> 'data/processed_384'
+    """
+    base = Path(base_processed_dir)
+    if image_size == 1024: # Backward compat
+        return base
+    return base.parent / f"{base.name}_{image_size}"
+
+
+def resolve_manifest_path(
+    manifest_arg: str | None, 
+    image_size: int, 
+    processed_dir: str
+) -> str:
+    """Resolve manifest path: explicit arg takes precedence, else derive from image_size."""
+    if manifest_arg:
+        return manifest_arg
+    return str(get_processed_dir_for_size(processed_dir, image_size) / "manifest.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -69,15 +95,19 @@ def parse_args() -> argparse.Namespace:
         help="Architecture name (must match the checkpoint). Default: efficientnet_b2."
     )
     parser.add_argument(
-        "--manifest", type=str, default="data/processed/manifest.csv",
-        help="Path to the processed dataset manifest CSV. Default: data/processed/manifest.csv."
+        "--manifest", type=str, default=None,
+        help="Path to the processed dataset manifest CSV. Default: auto-resolved from --processed-dir and --image-size."
+    )
+    parser.add_argument(
+        "--processed-dir", type=str, default="data/processed",
+        help="Base processed data directory."
     )
     parser.add_argument(
         "--output-dir", type=str, default="outputs/evaluation",
         help="Directory to write evaluation artefacts. Default: outputs/evaluation."
     )
     parser.add_argument(
-        "--image-size", type=int, default=224,
+        "--image-size", type=int, default=384,
         help="Image resolution (must match training). Default: 224."
     )
     parser.add_argument(
@@ -96,6 +126,10 @@ def parse_args() -> argparse.Namespace:
         "--split", type=str, default="test", choices=["test", "val"],
         help="Dataset split to evaluate on. Default: test."
     )
+    parser.add_argument(
+        "--tta", action="store_true",
+        help="Enable test-time augmentation (horizontal flip + multi-scale averaging)."
+    )
     return parser.parse_args()
 
 
@@ -109,8 +143,12 @@ def collect_predictions(
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     desc: str = "Inference",
+    tta: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run model over all batches and collect arrays.
+
+    When *tta* is True, predictions are averaged over the original image
+    and a horizontally-flipped copy for improved robustness.
 
     Returns:
         y_true   (N,)   – ground-truth integer labels
@@ -123,6 +161,12 @@ def collect_predictions(
     for x, y in tqdm(loader, desc=desc, leave=False):
         x = x.to(device)
         logits = model(x)
+        if tta:
+            # Fix #23: multi-augmentation TTA — horizontal flip + slight brightness
+            # boost averaged with the original logits for better robustness.
+            logits_flip   = model(torch.flip(x, dims=[-1]))   # horizontal flip
+            logits_bright = model(x * 1.05)                   # +5% brightness
+            logits = (logits + logits_flip + logits_bright) / 3.0
         all_targets.append(y.cpu().numpy())
         all_logits.append(logits.cpu().numpy())
 
@@ -147,6 +191,20 @@ def main() -> None:
     torch.manual_seed(42)
     np.random.seed(42)
 
+    # Resolve manifest path dynamically
+    manifest_path = resolve_manifest_path(
+        args.manifest, 
+        args.image_size, 
+        args.processed_dir
+    )
+    
+    manifest_file = Path(manifest_path)
+    if not manifest_file.exists():
+        raise FileNotFoundError(
+            f"Manifest not found at {manifest_file.resolve()}. "
+            f"Ensure data was processed for image_size={args.image_size}."
+        )
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -154,16 +212,42 @@ def main() -> None:
     logger.info(f"Device: {device}")
     logger.info(f"Model:  {args.model_name}")
     logger.info(f"Split:  {args.split}")
+    logger.info(f"Manifest: {manifest_file.resolve()}")
 
     # ------------------------------------------------------------------
-    # 1. Data
+    # 1. Model
+    # ------------------------------------------------------------------
+    logger.info(f"Loading checkpoint: {args.checkpoint_path}")
+    base_model = build_model(
+        model_name=args.model_name,
+        num_classes=get_num_classes(),
+        pretrained=False,
+        img_size=args.image_size,
+    )
+
+    norm_stats = get_model_normalization(base_model, args.model_name)
+
+    pl_module = XClinVisionModel.load_from_checkpoint(
+        args.checkpoint_path,
+        model=base_model,
+        map_location="cpu",
+    )
+    model = pl_module.model
+    model.to(device)
+    model.eval()
+    logger.info("Checkpoint loaded.")
+
+    # ------------------------------------------------------------------
+    # 2. Data
     # ------------------------------------------------------------------
     logger.info("Initialising DataModule …")
     data_module = ChestXrayDataModule(
-        manifest_path=args.manifest,
+        manifest_path=manifest_path,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         image_size=args.image_size,
+        mean=norm_stats["mean"],
+        std=norm_stats["std"],
     )
 
     if args.split == "test":
@@ -177,32 +261,11 @@ def main() -> None:
     logger.info(f"Evaluation dataset: {n_eval} samples")
 
     # ------------------------------------------------------------------
-    # 2. Model
-    # ------------------------------------------------------------------
-    logger.info(f"Loading checkpoint: {args.checkpoint_path}")
-    base_model = build_model(
-        model_name=args.model_name,
-        num_classes=3,
-        pretrained=False,
-        img_size=args.image_size,
-    )
-
-    pl_module = XClinVisionModel.load_from_checkpoint(
-        args.checkpoint_path,
-        model=base_model,
-        map_location="cpu",
-    )
-    model = pl_module.model
-    model.to(device)
-    model.eval()
-    logger.info("Checkpoint loaded.")
-
-    # ------------------------------------------------------------------
     # 3. Test-set predictions
     # ------------------------------------------------------------------
     logger.info("Running inference …")
     y_true, logits_eval, y_probs = collect_predictions(
-        model, eval_loader, device, desc=f"Eval ({args.split})"
+        model, eval_loader, device, desc=f"Eval ({args.split})", tta=args.tta,
     )
     y_pred = np.argmax(y_probs, axis=1)
 
@@ -213,6 +276,12 @@ def main() -> None:
     learned_temperature: float = 1.0
 
     if args.calibrate:
+        if args.split == "val":
+            logger.warning(
+                "⚠️ DATA LEAKAGE WARNING: You are fitting Temperature Scaling on the "
+                "Validation set, and evaluating on the Validation set. Your ECE and "
+                "calibration curve will be artificially over-optimistic!"
+            )
         logger.info("Collecting validation logits for temperature scaling …")
         if args.split == "test":
             data_module.setup(stage="fit")
@@ -238,14 +307,15 @@ def main() -> None:
     # 5. Metrics
     # ------------------------------------------------------------------
     logger.info("Computing metrics …")
-    metrics_computer = MetricsComputer(class_names=DEFAULT_CLASS_NAMES)
+    class_names = get_class_names()
+    metrics_computer = MetricsComputer(class_names=class_names)
 
     metrics = metrics_computer.compute_all_metrics(y_true, y_pred, y_probs)
     cm      = metrics_computer.compute_confusion_matrix(y_true, y_pred)
 
     metrics["confusion_matrix"] = {
         "matrix": cm.tolist(),
-        "labels": DEFAULT_CLASS_NAMES,
+        "labels": class_names,
     }
 
     # Print summary table
@@ -276,7 +346,7 @@ def main() -> None:
     # 7. Failure analysis
     # ------------------------------------------------------------------
     logger.info("Analysing failures …")
-    failure_analyzer = FailureAnalyzer(class_names=DEFAULT_CLASS_NAMES)
+    failure_analyzer = FailureAnalyzer(class_names=class_names)
     failures = failure_analyzer.analyze_failures(y_true, y_pred, y_probs)
     metrics["failure_analysis"] = failures
 
@@ -294,16 +364,22 @@ def main() -> None:
     # 8. Per-sample CSV
     # ------------------------------------------------------------------
     logger.info("Writing per-sample predictions …")
+    
+    # Extract file paths from the dataset for proper traceability
+    dataset_ref = data_module.test_dataset if args.split == "test" else data_module.val_dataset
+    filepaths = dataset_ref.df["filepath_processed"].tolist()
+    
     prob_cols = {
         f"prob_{name}": y_probs[:, i]
-        for i, name in enumerate(DEFAULT_CLASS_NAMES)
+        for i, name in enumerate(class_names)
     }
     df_preds = pd.DataFrame(
         {
+            "filepath":         filepaths,
             "true_label":       y_true,
-            "true_class":       [DEFAULT_CLASS_NAMES[lbl] for lbl in y_true],
+            "true_class":       [class_names[lbl] for lbl in y_true],
             "predicted_label":  y_pred,
-            "predicted_class":  [DEFAULT_CLASS_NAMES[p] for p in y_pred],
+            "predicted_class":  [class_names[p] for p in y_pred],
             "confidence":       np.max(y_probs, axis=1),
             "correct":          (y_true == y_pred),
             **prob_cols,

@@ -5,7 +5,7 @@ type: foundation_model
 architecture:
   backbone: microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224
   pretrained: true
-  num_classes: 3
+  num_classes: 3  # auto-derived from system.yaml class_names at runtime
   dropout_rate: 0.2
   head:
     type: sequential
@@ -22,7 +22,7 @@ architecture:
         p: 0.2
       - type: linear
         in_features: 256
-        out_features: 3
+        out_features: 3  # must match num_classes
 
 transfer_learning:
   freeze_vision_encoder: false

@@ -1,6 +1,10 @@
-streamlit>=1.53.0
+streamlit>=1.28.0
+plotly>=5.15.0
 pillow>=10.0.0
 requests>=2.31.0
 numpy>=1.24.0
+pandas>=2.0.0
 python-dotenv>=1.0.0
 opencv-python-headless>=4.8.0
+pydicom>=2.4.0
+python-dateutil>=2.8.0

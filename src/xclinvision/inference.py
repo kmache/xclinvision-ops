@@ -11,7 +11,9 @@ import torch.nn.functional as F
 from PIL import Image
 
 from xclinvision.evaluator import TemperatureScaler
-from xclinvision.xai import DEFAULT_CLASS_NAMES, generate_explanation
+from xclinvision.processing import process_and_filter_xray
+from xclinvision.config import get_class_names
+from xclinvision.xai import generate_explanation
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,8 @@ class InferencePipeline:
         mc_samples: int = 10,
         image_size: int = 384,
         class_names: Optional[List[str]] = None,
+        dataset_mean: Optional[List[float]] = None,
+        dataset_std: Optional[List[float]] = None,
     ):
         """
         Args:
@@ -73,6 +77,8 @@ class InferencePipeline:
             mc_samples: Number of stochastic forward passes for MC-Dropout.
             image_size: Input resolution matching the training pipeline.
             class_names: Human-readable class labels (label-index order).
+            dataset_mean: Optional mean values for input normalization.
+            dataset_std: Optional std values for input normalization.
         """
         self.device = _resolve_device(device)
         self.model = model.to(self.device)
@@ -81,7 +87,9 @@ class InferencePipeline:
         self.temperature_scaler = temperature_scaler
         self.mc_samples = mc_samples
         self.image_size = image_size
-        self.class_names = class_names or DEFAULT_CLASS_NAMES
+        self.class_names = class_names or get_class_names()
+        self.dataset_mean = dataset_mean if dataset_mean is not None else [0.485, 0.456, 0.406]
+        self.dataset_std = dataset_std if dataset_std is not None else [0.229, 0.224, 0.225]
 
     # -----------------------------------------------------------------------
     # Pre-processing
@@ -92,6 +100,13 @@ class InferencePipeline:
     ) -> Tuple[torch.Tensor, np.ndarray]:
         """Preprocess a single image into a normalised tensor + raw RGB array.
 
+        Replicates the exact training preprocessing chain:
+          1. Load image as grayscale.
+          2. process_and_filter_xray(): auto-crop, dark-overlay cleaning, CLAHE,
+             letterbox-pad to (image_size × image_size) — identical to training.
+          3. Convert to 3-channel RGB.
+          4. ImageNet normalisation + convert to tensor.
+
         Args:
             image: A file-path string, PIL Image, or NumPy array (any channel
                 count).
@@ -99,31 +114,44 @@ class InferencePipeline:
         Returns:
             Tuple of (tensor [1,C,H,W], vis_image [H,W,3 uint8]).
         """
+        # --- Load and convert to grayscale (matches training pipeline) -----
         if isinstance(image, str):
-            path = image
-            raw = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-            if raw is None:
-                raise FileNotFoundError(f"Cannot read image from path: {path}")
-            img = np.stack([raw, raw, raw], axis=-1)
+            gray = cv2.imread(image, cv2.IMREAD_GRAYSCALE)
+            if gray is None:
+                raise FileNotFoundError(f"Cannot read image from path: {image}")
         elif isinstance(image, Image.Image):
-            img = np.array(image.convert("RGB"))
+            arr = np.array(image.convert("L"))
+            gray = arr
         else:
-            img = np.asarray(image)
+            arr = np.asarray(image)
+            if arr.ndim == 3:
+                gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY if arr.shape[-1] == 3 else cv2.COLOR_RGBA2GRAY)
+            else:
+                gray = arr
 
-        # Normalise channel count to 3
-        if img.ndim == 2:
-            img = np.stack([img, img, img], axis=-1)
-        elif img.shape[-1] == 1:
-            img = np.repeat(img, 3, axis=-1)
-        elif img.shape[-1] == 4:
-            img = img[..., :3]
+        # --- Apply full preprocessing pipeline (CLAHE, crop, letterbox) ---
+        # Fix #1: training images are preprocessed via process_and_filter_xray().
+        # Skipping this step during inference creates a train/inference distribution
+        # mismatch that degrades real-world accuracy.
+        processed, status = process_and_filter_xray(gray, target_size=self.image_size)
+        if processed is None:
+            # Fallback: plain resize if preprocessing rejects the image (e.g.
+            # blank or corrupt). Log the reason so it is visible in server logs.
+            logger.warning(
+                "process_and_filter_xray rejected image (%s); "
+                "falling back to plain resize. Predictions may be less reliable.",
+                status,
+            )
+            processed = cv2.resize(gray, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
 
-        vis_image = cv2.resize(img, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
+        # Convert to 3-channel RGB (models expect 3 channels)
+        img = cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB)
+        vis_image = img.copy()
 
-        # ImageNet normalisation (matches training pipeline)
-        norm = vis_image.astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        # --- Normalise and convert to tensor --------------------------------
+        norm = img.astype(np.float32) / 255.0
+        mean = np.array(self.dataset_mean, dtype=np.float32)
+        std  = np.array(self.dataset_std, dtype=np.float32)
         norm = (norm - mean) / std
 
         tensor = torch.from_numpy(norm.transpose(2, 0, 1)).unsqueeze(0).float()
@@ -174,8 +202,11 @@ class InferencePipeline:
             logits = self.model(x)
 
             if self.temperature_scaler is not None:
-                scaled = self.temperature_scaler.scale(logits.cpu().numpy())
-                logits = torch.from_numpy(scaled).to(self.device)
+                if hasattr(self.temperature_scaler, "T") and isinstance(self.temperature_scaler.T, torch.Tensor):
+                    logits = logits / self.temperature_scaler.T
+                else:
+                    scaled = self.temperature_scaler.scale(logits.cpu().numpy())
+                    logits = torch.from_numpy(scaled).to(self.device)
 
             probs = F.softmax(logits, dim=1)
             pred_class = int(torch.argmax(probs, dim=1).item())
@@ -243,9 +274,30 @@ class InferencePipeline:
             with torch.no_grad():
                 logits = self.model(x_batch)
                 if self.temperature_scaler is not None:
-                    scaled = self.temperature_scaler.scale(logits.cpu().numpy())
-                    logits = torch.from_numpy(scaled).to(self.device)
+                    # Keep computation on device if T is available
+                    if hasattr(self.temperature_scaler, "T") and isinstance(self.temperature_scaler.T, torch.Tensor):
+                        logits = logits / self.temperature_scaler.T
+                    else:
+                        scaled = self.temperature_scaler.scale(logits.cpu().numpy())
+                        logits = torch.from_numpy(scaled).to(self.device)
                 probs_batch = F.softmax(logits, dim=1).cpu().numpy()
+            
+            batched_mc_preds = None
+            if return_uncertainty:
+                self.enable_mc_dropout()
+                mc_preds_list = []
+                with torch.no_grad():
+                    for _ in range(self.mc_samples):
+                        mc_logits = self.model(x_batch)
+                        if self.temperature_scaler is not None:
+                            if hasattr(self.temperature_scaler, "T") and isinstance(self.temperature_scaler.T, torch.Tensor):
+                                mc_logits = mc_logits / self.temperature_scaler.T
+                            else:
+                                scaled = self.temperature_scaler.scale(mc_logits.cpu().numpy())
+                                mc_logits = torch.from_numpy(scaled).to(self.device)
+                        mc_preds_list.append(F.softmax(mc_logits, dim=1).cpu().numpy())
+                self.model.eval()
+                batched_mc_preds = np.array(mc_preds_list) # Shape: (mc_samples, batch_size, num_classes)
 
             for i, (vis_image, prob) in enumerate(zip(vis_images, probs_batch)):
                 pred_class = int(np.argmax(prob))
@@ -259,10 +311,18 @@ class InferencePipeline:
                     "class_names": self.class_names,
                 }
                 if return_uncertainty:
-                    x_single = x_batch[i : i + 1]
-                    unc = self.compute_uncertainty(x_single)
-                    result["uncertainty"] = unc
-                    result["uncertainty_level"] = self._get_uncertainty_level(unc)
+                    item_preds = batched_mc_preds[:, i, :] # Shape: (mc_samples, num_classes)
+                    mean_pred = item_preds.mean(axis=0)
+                    
+                    epistemic = float(item_preds.var(axis=0).mean())
+                    predictive_entropy = float(-np.sum(mean_pred * np.log(mean_pred + 1e-10)))
+                    
+                    result["uncertainty"] = {
+                        "epistemic": epistemic,
+                        "predictive_entropy": predictive_entropy,
+                        "mc_samples": self.mc_samples,
+                    }
+                    result["uncertainty_level"] = self._get_uncertainty_level(result["uncertainty"])
                 if return_explanation:
                     result["explanation"] = generate_explanation(
                         model=self.model,
@@ -308,8 +368,11 @@ class InferencePipeline:
             for _ in range(self.mc_samples):
                 logits = self.model(x)
                 if self.temperature_scaler is not None:
-                    scaled = self.temperature_scaler.scale(logits.cpu().numpy())
-                    logits = torch.from_numpy(scaled).to(self.device)
+                    if hasattr(self.temperature_scaler, "T") and isinstance(self.temperature_scaler.T, torch.Tensor):
+                        logits = logits / self.temperature_scaler.T
+                    else:
+                        scaled = self.temperature_scaler.scale(logits.cpu().numpy())
+                        logits = torch.from_numpy(scaled).to(self.device)
                 mc_preds.append(F.softmax(logits, dim=1).cpu().numpy())
 
         self.model.eval()  # restore deterministic mode

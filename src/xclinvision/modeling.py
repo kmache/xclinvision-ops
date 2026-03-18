@@ -294,6 +294,22 @@ def get_param_counts(model: nn.Module) -> Dict[str, Union[int, float]]:
     }
 
 
+def get_model_normalization(model: nn.Module, model_name: str) -> Dict[str, tuple]:
+    """Retrieve the correct normalization mean/std for the architecture."""
+    if model_name.lower() == "biomedclip":
+        return {
+            "mean": (0.48145466, 0.4578275, 0.40821073),
+            "std":  (0.26862954, 0.26130258, 0.27577711)
+        }
+    if hasattr(model, 'default_cfg'):
+        return {
+            "mean": model.default_cfg.get('mean', (0.485, 0.456, 0.406)),
+            "std":  model.default_cfg.get('std', (0.229, 0.224, 0.225))
+        }
+    # Fallback standard ImageNet
+    return {"mean": (0.485, 0.456, 0.406), "std": (0.229, 0.224, 0.225)}
+
+
 def freeze_backbone(model: nn.Module, unfreeze_head: bool = True) -> None:
     """Freeze all layers except the classification head."""
     for param in model.parameters():
@@ -361,14 +377,25 @@ def unfreeze_layers(model: nn.Module, num_layers: int = 0) -> None:
         target_seq = model.features
     elif hasattr(model, 'layers') and isinstance(model.layers, nn.Sequential):
         target_seq = model.layers
+    # Fix #22: timm ConvNext exposes feature blocks as model.stages (nn.Sequential).
+    # Without this branch, the fallback (target_seq = model) iterates all top-level
+    # children including the head, effectively unfreezing the whole model at once.
+    elif hasattr(model, 'stages') and isinstance(model.stages, nn.Sequential):
+        target_seq = model.stages
     else:
         target_seq = model 
         
-    children = list(target_seq.children())
+    valid_blocks = []
+    for child in target_seq.children():
+        # Only consider blocks that actually have learnable parameters
+        if list(child.parameters()) and \
+           not isinstance(child, (nn.Linear, nn.AdaptiveAvgPool2d, nn.Flatten, nn.Dropout)):
+            valid_blocks.append(child)
     
-    children_to_unfreeze = children[-num_layers:] if num_layers < len(children) else children
-    for child in children_to_unfreeze:
-        for param in child.parameters():
+    blocks_to_unfreeze = valid_blocks[-num_layers:] if num_layers < len(valid_blocks) else valid_blocks
+    
+    for block in blocks_to_unfreeze:
+        for param in block.parameters():
             param.requires_grad = True
     
     counts = get_param_counts(model)

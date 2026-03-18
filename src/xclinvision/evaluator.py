@@ -32,7 +32,8 @@ class MetricsComputer:
     """
 
     def __init__(self, class_names: Optional[List[str]] = None):
-        self.class_names = class_names or ["Normal", "Pneumonia", "Cardiomegaly"]
+        from xclinvision.config import get_class_names
+        self.class_names = class_names or get_class_names()
 
     # ------------------------------------------------------------------
     # Full metric suite
@@ -118,12 +119,11 @@ class MetricsComputer:
                     f"y_true contains labels outside [0, {n_classes}): "
                     f"min={int(np.min(y_true))}, max={int(np.max(y_true))}"
                 )
-            y_true_oh = np.eye(n_classes)[y_true]
             metrics["macro_auc"] = float(
-                roc_auc_score(y_true_oh, y_probs, multi_class="ovr", average="macro")
+                roc_auc_score(y_true, y_probs, multi_class="ovr", average="macro")
             )
             metrics["weighted_auc"] = float(
-                roc_auc_score(y_true_oh, y_probs, multi_class="ovr", average="weighted")
+                roc_auc_score(y_true, y_probs, multi_class="ovr", average="weighted")
             )
         except ValueError as exc:
             logger.warning(f"AUC-ROC computation failed: {exc}")
@@ -336,18 +336,20 @@ class TemperatureScaler:
 
         logits_t = torch.FloatTensor(logits)
         labels_t = torch.LongTensor(y_true)
-        temperature = torch.nn.Parameter(torch.ones(1) * 1.5)
+        # Initialize log(T=1.5) ≈ 0.405
+        log_temperature = torch.nn.Parameter(torch.ones(1) * 0.405)
 
         def eval_fn():
             optimizer.zero_grad()
-            loss = torch.nn.CrossEntropyLoss()(logits_t / temperature, labels_t)
+            # torch.exp guarantees strictly positive temperature
+            loss = torch.nn.CrossEntropyLoss()(logits_t / torch.exp(log_temperature), labels_t)
             loss.backward()
             return loss
 
-        optimizer = LBFGS([temperature], lr=0.01, max_iter=50)
+        optimizer = LBFGS([log_temperature], lr=0.01, max_iter=50)
         optimizer.step(eval_fn)
 
-        self.temperature = max(float(temperature.item()), 0.01)
+        self.temperature = max(float(torch.exp(log_temperature).item()), 0.01)
         self._is_fitted = True
         logger.info(
             f"Temperature scaling converged: T = {self.temperature:.4f}, "
@@ -369,7 +371,7 @@ class TemperatureScaler:
                 "TemperatureScaler.scale() called before fit() – "
                 "returning unscaled logits (T=1.0)."
             )
-        return logits / self.temperature
+        return logits / max(self.temperature, 1e-4)
 
     def predict_proba(self, logits: np.ndarray) -> np.ndarray:
         """Return calibrated softmax probabilities.

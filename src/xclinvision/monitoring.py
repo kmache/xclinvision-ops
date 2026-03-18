@@ -64,7 +64,7 @@ class ModelRegistry:
             from mlflow.tracking import MlflowClient
             client = MlflowClient()
             try:
-                # MLflow >= 2.0: use lowercase alias (e.g. "production")
+                # MLflow >= 2.0:
                 alias = stage.lower()
                 client.set_registered_model_alias(name, alias, str(version))
             except AttributeError:
@@ -92,8 +92,6 @@ class PredictionLogger:
         timestamp: Optional[str] = None,
     ):
         """Log a single prediction."""
-        # Use a single now() call to avoid a midnight race condition between
-        # the timestamp string and the daily log filename.
         now = datetime.now()
         if timestamp is None:
             timestamp = now.isoformat()
