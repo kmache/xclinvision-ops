@@ -229,7 +229,8 @@ Format the response as a JSON object with these keys."""
         
         recommendation = "Clinical correlation with patient history, symptoms, and physical examination is essential. "
         
-        if context.prediction in ["Pneumonia", "Cardiomegaly"]:
+        # Config-driven: any non-Normal prediction gets additional imaging advice.
+        if context.prediction.lower() != "normal":
             recommendation += "Consider additional imaging (CT) and laboratory tests if clinically indicated."
         else:
             recommendation += "Follow standard clinical protocols for patient management."

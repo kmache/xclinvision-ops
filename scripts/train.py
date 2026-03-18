@@ -32,7 +32,7 @@ from pytorch_lightning.loggers import MLFlowLogger, TensorBoardLogger
 
 from xclinvision.dataset import ChestXrayDataModule
 from xclinvision.modeling import build_model, get_model_normalization
-from xclinvision.processing import run_processing_pipeline
+from xclinvision.processing import run_processing_pipeline, PROCESSING_VERSION
 from xclinvision.trainer import (
     XClinVisionModel,
     MetricsCallback,
@@ -52,7 +52,7 @@ def get_processed_dir_for_size(base_processed_dir: str, image_size: int) -> Path
     Example: base='data/processed', size=384 -> 'data/processed_384'
     """
     base = Path(base_processed_dir)
-    return base.parent / f"{base.name}_{image_size}"
+    return base.parent / f"{base.name}_{image_size}_{PROCESSING_VERSION}"
 
 def ensure_processed_data_exists(
     image_size: int,
@@ -357,6 +357,10 @@ def main():
     ]
 
     # 5. Execute Training
+    accumulate_grad_batches = 2
+    # Scale LR to compensate for effective batch size increase from grad accumulation
+    pl_module.learning_rate *= accumulate_grad_batches
+
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator="auto",
@@ -365,7 +369,7 @@ def main():
         callbacks=callbacks,
         logger=loggers,
         gradient_clip_val=1.0,
-        accumulate_grad_batches=2,
+        accumulate_grad_batches=accumulate_grad_batches,
         deterministic=args.deterministic,
     )
     

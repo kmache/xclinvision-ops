@@ -45,8 +45,10 @@ dashboard:
     text_color: "#262730"
 
 # Database Configuration
+# IMPORTANT: Set the DATABASE_URL environment variable instead of
+# hardcoding credentials.  The placeholder below is for documentation only.
 database:
-  url: "postgresql://user:password@localhost:5432/xclinvision"
+  url: "${DATABASE_URL:-postgresql://localhost:5432/xclinvision}"
   pool_size: 5
   max_overflow: 10
   

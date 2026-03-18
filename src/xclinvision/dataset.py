@@ -15,10 +15,9 @@ from albumentations.pytorch import ToTensorV2
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from xclinvision.config import get_class_map, get_class_names
+from xclinvision.processing import read_image_grayscale
 
 logger = logging.getLogger(__name__)
-
-CLASS_MAP = get_class_map()
 
 # ---------------------------------------------------------------------------
 # 1. Albumentations Transforms (Optimized & Medical-Safe)
@@ -29,16 +28,23 @@ def get_train_transforms(
     std: Tuple[float, float, float] = (0.229, 0.224, 0.225)) -> A.Compose:
     """Robust medical-safe augmentation pipeline."""
     return A.Compose([
+        # Horizontal flip: single most impactful augmentation for chest X-ray
+        # classification.  Safe for classification tasks (not localization).
+        A.HorizontalFlip(p=0.5),
+
         A.RandomResizedCrop(
             size=(image_size, image_size),
-            scale=(0.80, 1.0),  # 20% zoom range gives meaningful scale invariance
-            ratio=(0.95, 1.05),  # allow very slight non-square crops (chest X-rays are near-square)
+            scale=(0.85, 1.0),
+            ratio=(0.95, 1.05),
+            interpolation=cv2.INTER_AREA,  # match val transforms
             p=1
         ),
 
+        # Translation + rotation only — scale is handled by RandomResizedCrop;
+        # stacking both caused an effective 0.74–1.08× range that could crop
+        # out diagnostically relevant anatomy.
         A.Affine(
             translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
-            scale=(0.92, 1.08),
             rotate=(-6, 6),
             border_mode=cv2.BORDER_CONSTANT,
             fill=0,
@@ -62,18 +68,15 @@ def get_train_transforms(
         ),
 
         # NOTE: CLAHE is already applied during preprocessing (processing.py).
-        # Applying it again here would double-enhance contrast on training data
-        # while val/test only get the preprocessing CLAHE — causing a train/eval
-        # distribution mismatch. Removed to keep transforms distribution-safe.
+        # Removed here to keep transforms distribution-safe.
 
-        # Fix #12: limit to 1 small hole — multiple large holes risk occluding
-        # critical anatomy (cardiac border, hilum) in chest X-rays.
+        # Increased hole size for meaningful regularization at 384px.
         A.CoarseDropout(
-            num_holes_range=(1, 1),
-            hole_height_range=(1, 12),
-            hole_width_range=(1, 12),
+            num_holes_range=(1, 3),
+            hole_height_range=(16, 48),
+            hole_width_range=(16, 48),
             fill=0,
-            p=0.15
+            p=0.2
         ),
 
         A.Normalize(mean=mean, std=std),
@@ -107,22 +110,25 @@ class ChestXrayDataset(Dataset):
         # all worker processes independently. Actual RAM usage = (cache_size * num_workers).
         self._cache_size = cache_size
         self.fallback_size = fallback_size
+        # Fix D1: Resolve class map at init time (not module import time)
+        # so it always reflects the current system.yaml config.
+        class_map = get_class_map()
         # Fix #2: validate labels eagerly so unmapped classes raise immediately
         # rather than silently producing NaN values that corrupt the training loop.
-        mapped = self.df['class'].str.lower().map(CLASS_MAP)
+        mapped = self.df['class'].str.lower().map(class_map)
         invalid_mask = mapped.isna()
         if invalid_mask.any():
             bad_vals = self.df.loc[invalid_mask, 'class'].unique().tolist()
             raise ValueError(
                 f"Unknown class labels found in manifest: {bad_vals}. "
-                f"Expected one of: {list(CLASS_MAP.keys())}"
+                f"Expected one of: {list(class_map.keys())}"
             )
         self.labels = mapped.tolist()
         self._image_cache: dict = {}
             
     def _load_image_impl(self, image_path: str) -> np.ndarray:
         try:
-            image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+            image = read_image_grayscale(image_path)
             if image is None: raise ValueError("Image None")
         except Exception as e:
             logger.error(f"Error loading {image_path}: {e}")

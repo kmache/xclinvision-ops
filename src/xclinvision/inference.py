@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from xclinvision.evaluator import TemperatureScaler
-from xclinvision.processing import process_and_filter_xray
+from xclinvision.processing import process_and_filter_xray, read_image_grayscale
 from xclinvision.config import get_class_names
 from xclinvision.xai import generate_explanation
 
@@ -116,7 +116,7 @@ class InferencePipeline:
         """
         # --- Load and convert to grayscale (matches training pipeline) -----
         if isinstance(image, str):
-            gray = cv2.imread(image, cv2.IMREAD_GRAYSCALE)
+            gray = read_image_grayscale(image)
             if gray is None:
                 raise FileNotFoundError(f"Cannot read image from path: {image}")
         elif isinstance(image, Image.Image):

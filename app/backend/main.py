@@ -180,7 +180,7 @@ def _get_agent():
 
 # ---------------------------------------------------------------------------
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp", ".dcm"}
 
 
 def _count_images(directory: Path) -> int:
@@ -611,11 +611,15 @@ async def analyze_image(
     image_hash = hashlib.md5(contents).hexdigest()
 
     try:
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
+        from xclinvision.processing import read_image_grayscale
+        gray = read_image_grayscale(contents)
+        if gray is not None:
+            image_np = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+        else:
+            image = Image.open(io.BytesIO(contents)).convert("RGB")
+            image_np = np.array(image)
     except Exception as e:
         raise HTTPException(400, f"Could not process image: {e}")
-
-    image_np = np.array(image)
     analysis_id = f"XCL-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
 
     # --- Run inference -------------------------------------------------------

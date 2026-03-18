@@ -229,6 +229,28 @@ class XClinVisionModel(pl.LightningModule):
                 
             self.print(f"Epoch {self.current_epoch}: Phase {target_phase} - {msg}")
 
+            # Fix P0: Rebuild optimizer so newly-unfrozen params actually receive
+            # gradient updates.  Without this, params unfrozen after init are
+            # absent from all optimizer param-groups and never get updated.
+            self._rebuild_optimizers()
+
+    def _rebuild_optimizers(self):
+        """Rebuild optimizer + LR scheduler after unfreezing new parameters."""
+        if self.trainer is None:
+            return
+        opt_config = self.configure_optimizers()
+        optimizer = opt_config["optimizer"]
+        lr_sched = opt_config["lr_scheduler"]
+
+        self.trainer.optimizers = [optimizer]
+        # Build the LRSchedulerConfig list that PL expects
+        self.trainer.lr_scheduler_configs = self.trainer._configure_schedulers(
+            [{"scheduler": lr_sched["scheduler"], "interval": lr_sched.get("interval", "epoch")}],
+            monitor=None,
+        )
+        trainable = sum(1 for p in self.model.parameters() if p.requires_grad)
+        self.print(f"  → Optimizer rebuilt ({trainable} trainable params)")
+
     # ---- forward / steps --------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
@@ -258,10 +280,10 @@ class XClinVisionModel(pl.LightningModule):
             return None
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        # Use the logits we already computed; avoids a costly second forward pass.
-        # When mixup is active, metrics reflect the mixed distribution — this is
-        # standard practice and matches what the loss actually optimises.
-        self.train_metrics.update(logits, y)
+        # Fix P2: Only update train metrics when mixup is NOT active.
+        # Mixed logits scored against hard labels produce noisy/misleading metrics.
+        if not (self.mixup_alpha > 0 and self.training):
+            self.train_metrics.update(logits, y)
         return loss
 
     def on_train_epoch_end(self):
@@ -361,16 +383,17 @@ class XClinVisionModel(pl.LightningModule):
             eps=1e-8,
         )
 
-        # Warmup for 5 epochs then cosine annealing.
-        # Fix #24: eta_min=1e-6 prevents the LR from reaching zero, which would
-        # kill fine-tuning if EarlyStopping fires before max_epochs.
-        warmup = LinearLR(optimizer, start_factor=0.01, total_iters=5)
+        # Warmup for 3 epochs then cosine annealing.
+        # Reduced from 5 to 3: backbone is frozen at start, so a long warmup
+        # wastes epochs where only the head trains at a fraction of the target LR.
+        warmup_epochs = 3
+        warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
         cosine = CosineAnnealingLR(
-            optimizer, T_max=max(self.trainer.max_epochs - 5, 1),
+            optimizer, T_max=max(self.trainer.max_epochs - warmup_epochs, 1),
             eta_min=1e-6,
         )
         scheduler = SequentialLR(
-            optimizer, schedulers=[warmup, cosine], milestones=[5]
+            optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs]
         )
 
         return {
@@ -496,9 +519,13 @@ class BestModelExportCallback(Callback):
         self.class_names = class_names or get_class_names()
         self.CLASS_MAP = get_class_map()
         self.num_classes = num_classes if num_classes is not None else len(self.class_names)
-        # Deterministic short ID: "v" + first 4 hex chars of sha256(model_name)
+        # Unique short ID per run: "v" + first 4 hex of sha256(model_name + timestamp).
+        # Using a timestamp ensures different training runs of the same architecture
+        # produce distinct filenames and don't overwrite each other.
         if run_id is None:
-            digest = hashlib.sha256(model_name.encode()).hexdigest()[:4]
+            from datetime import datetime as _dt
+            seed = f"{model_name}_{_dt.now().isoformat()}"
+            digest = hashlib.sha256(seed.encode()).hexdigest()[:4]
             self.run_id = f"v{digest}"
         else:
             self.run_id = run_id

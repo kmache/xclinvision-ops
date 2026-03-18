@@ -25,14 +25,122 @@ from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".dcm"}
+
+
+# ---------------------------------------------------------------------------
+# DICOM / standard image reader
+# ---------------------------------------------------------------------------
+
+def read_image_grayscale(source: Union[str, Path, bytes]) -> Optional[np.ndarray]:
+    """Read an image as 8-bit grayscale, with transparent DICOM support.
+
+    Parameters
+    ----------
+    source : str | Path | bytes
+        File path (any format incl. DICOM) or raw file bytes.
+
+    Returns
+    -------
+    np.ndarray (H, W, dtype=uint8) or None on failure.
+    """
+    try:
+        if isinstance(source, bytes):
+            return _read_bytes_grayscale(source)
+        path = Path(source)
+        if path.suffix.lower() == ".dcm":
+            return _read_dicom_grayscale(path)
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        return img  # None if cv2 can't decode
+    except Exception as exc:
+        logger.error("read_image_grayscale failed for %s: %s", source if not isinstance(source, bytes) else "<bytes>", exc)
+        return None
+
+
+def _read_dicom_grayscale(path: Path) -> Optional[np.ndarray]:
+    """Decode a DICOM file to 8-bit grayscale via pydicom."""
+    import pydicom  # lazy import — only paid when DICOM files are present
+
+    ds = pydicom.dcmread(path)
+    arr = ds.pixel_array.astype(np.float64)
+
+    # Apply Rescale Slope / Intercept if present
+    slope = float(getattr(ds, "RescaleSlope", 1))
+    intercept = float(getattr(ds, "RescaleIntercept", 0))
+    arr = arr * slope + intercept
+
+    # Apply VOI windowing if present, otherwise min-max normalise
+    wc = getattr(ds, "WindowCenter", None)
+    ww = getattr(ds, "WindowWidth", None)
+    if wc is not None and ww is not None:
+        wc = float(wc[0]) if hasattr(wc, "__getitem__") else float(wc)
+        ww = float(ww[0]) if hasattr(ww, "__getitem__") else float(ww)
+        lower = wc - ww / 2
+        upper = wc + ww / 2
+        arr = np.clip(arr, lower, upper)
+
+    # Normalise to 0-255
+    mn, mx = arr.min(), arr.max()
+    if mx - mn > 0:
+        arr = (arr - mn) / (mx - mn) * 255.0
+    else:
+        arr = np.zeros_like(arr)
+
+    img = arr.astype(np.uint8)
+
+    # MONOCHROME1 = inverted (white=0), flip so anatomy is bright
+    pi = getattr(ds, "PhotometricInterpretation", "MONOCHROME2")
+    if pi == "MONOCHROME1":
+        img = 255 - img
+
+    return img
+
+
+def _read_bytes_grayscale(data: bytes) -> Optional[np.ndarray]:
+    """Decode raw bytes to grayscale — tries DICOM first, then cv2."""
+    # DICOM preamble: 128 bytes + 'DICM' magic at offset 128
+    if len(data) > 132 and data[128:132] == b"DICM":
+        import pydicom
+        import io as _io
+        ds = pydicom.dcmread(_io.BytesIO(data))
+        arr = ds.pixel_array.astype(np.float64)
+        slope = float(getattr(ds, "RescaleSlope", 1))
+        intercept = float(getattr(ds, "RescaleIntercept", 0))
+        arr = arr * slope + intercept
+        wc = getattr(ds, "WindowCenter", None)
+        ww = getattr(ds, "WindowWidth", None)
+        if wc is not None and ww is not None:
+            wc = float(wc[0]) if hasattr(wc, "__getitem__") else float(wc)
+            ww = float(ww[0]) if hasattr(ww, "__getitem__") else float(ww)
+            lower = wc - ww / 2
+            upper = wc + ww / 2
+            arr = np.clip(arr, lower, upper)
+        mn, mx = arr.min(), arr.max()
+        if mx - mn > 0:
+            arr = (arr - mn) / (mx - mn) * 255.0
+        else:
+            arr = np.zeros_like(arr)
+        img = arr.astype(np.uint8)
+        pi = getattr(ds, "PhotometricInterpretation", "MONOCHROME2")
+        if pi == "MONOCHROME1":
+            img = 255 - img
+        return img
+
+    # Standard image formats
+    buf = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
+    return img
+
 DEFAULT_MIN_AREA_RATIO = 0.15
 MIN_ASPECT_RATIO = 0.35
 MAX_ASPECT_RATIO = 3.0
 
+# Bump this when processing logic changes to invalidate cached processed data.
+PROCESSING_VERSION = "v2"
+
 def compute_image_hash(image_path: Path) -> str:
-    """Compute MD5 hash of image file for duplicate detection."""
-    hasher = hashlib.md5()
+    """Compute SHA-256 hash of image file for duplicate detection."""
+    hasher = hashlib.sha256()
     try:
         with open(image_path, 'rb') as f:
             for chunk in iter(lambda: f.read(8192), b""):
@@ -82,7 +190,12 @@ def is_side_by_side_double(img: np.ndarray, min_aspect: float = 1.5) -> bool:
     return False
 
 
-def clean_dark_overlays(image: np.ndarray, dark_thresh: int = 30, min_area_ratio: float = 0.005, border_margin_ratio: float = 0.15) -> np.ndarray:
+def clean_dark_overlays(
+        image: np.ndarray, 
+        dark_thresh: int = 30, 
+        min_area_ratio: float = 0.005, 
+        border_margin_ratio: float = 0.15
+        ) -> np.ndarray:
     """Detects and removes dark rectangular clinical markers/annotations near borders."""
     if len(image.shape) == 3:
         image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -119,11 +232,14 @@ def clean_dark_overlays(image: np.ndarray, dark_thresh: int = 30, min_area_ratio
     return image
 
 
-def process_and_filter_xray(input_data: Union[str, Path, np.ndarray], target_size: int = 384,
-                             min_area_ratio: float = DEFAULT_MIN_AREA_RATIO) -> Tuple[Optional[np.ndarray], str]:
+def process_and_filter_xray(
+        input_data: Union[str, Path, np.ndarray], 
+        target_size: int = 384,
+        min_area_ratio: float = DEFAULT_MIN_AREA_RATIO
+        ) -> Tuple[Optional[np.ndarray], str]:
     """Smart cropping, artifact cleaning, CLAHE, and resizing to square."""
     if isinstance(input_data, (str, Path)):
-        img = cv2.imread(str(input_data), cv2.IMREAD_GRAYSCALE)
+        img = read_image_grayscale(input_data)
     else:
         img = input_data if len(input_data.shape) == 2 else cv2.cvtColor(input_data, cv2.COLOR_BGR2GRAY)
             
@@ -289,6 +405,7 @@ class PipelineReport:
     quarantined_flagged: int = 0
     duplicates_same_class: int = 0
     duplicates_cross_class: int = 0
+    duplicates_cross_split: int = 0
 
 def run_processing_pipeline(
     raw_dir: Union[str, Path],
@@ -390,6 +507,41 @@ def run_processing_pipeline(
         keeper_filepaths = set(df['filepath'].tolist())
 
     # -------------------------------------------------------------------
+    # PHASE 1b: Cross-split leakage guard
+    # If the same hash (same class) appears in multiple splits, keep only
+    # the training copy to prevent data leakage into val/test.
+    # -------------------------------------------------------------------
+    if detect_duplicates:
+        _split_priority = {"train": 0, "val": 1, "test": 2}
+        keeper_df = df[df['filepath'].isin(keeper_filepaths)].copy()
+        for img_hash, grp in keeper_df.groupby('hash'):
+            if grp['split'].nunique() > 1:
+                # Keep the copy from the lowest-priority split (prefer train)
+                grp_sorted = grp.sort_values(
+                    'split', key=lambda s: s.map(_split_priority)
+                )
+                keep_fp = grp_sorted.iloc[0]['filepath']
+                leak_fps = set(grp_sorted.iloc[1:]['filepath'])
+                report.duplicates_cross_split += len(leak_fps)
+                keeper_filepaths -= leak_fps
+                for _, row in grp_sorted.iloc[1:].iterrows():
+                    logger.warning(
+                        "Cross-split duplicate removed: %s (%s/%s) — kept in %s",
+                        row['filename'], row['split'], row['class'],
+                        grp_sorted.iloc[0]['split'],
+                    )
+                    dest = duplicate_dir / "cross_split" / row['split'] / row['class'] / row['filename']
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(row['filepath'], dest)
+                    duplicate_records.append({
+                        "filepath_original": row['filepath'],
+                        "filepath_duplicate": str(dest),
+                        "split": row['split'],
+                        "class": row['class'],
+                        "reason": f"Cross-split leak (kept in {grp_sorted.iloc[0]['split']})",
+                    })
+
+    # -------------------------------------------------------------------
     # PHASE 2: Process the unique / clean set
     # -------------------------------------------------------------------
     df_keepers = df[df['filepath'].isin(keeper_filepaths)].copy()
@@ -456,6 +608,7 @@ def run_processing_pipeline(
     print(f"  Total raw images:              {report.total_images}")
     print(f"  Cross-class conflicts moved:   {report.duplicates_cross_class}")
     print(f"  Same-class duplicates moved:   {report.duplicates_same_class}")
+    print(f"  Cross-split leaks removed:     {report.duplicates_cross_split}")
     print(f"  Unique images to process:      {unique_count}")
     print("-" * 60)
     print(f"  Processed (clean):             {report.processed}")

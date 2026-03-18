@@ -2,10 +2,21 @@ import kagglehub
 import shutil
 import os
 from pathlib import Path
+import yaml
 
 
 EXPECTED_SPLITS = ["train", "val", "test"]
-EXPECTED_CLASSES = ["normal", "pneumonia", "cardiomegaly"]
+
+# Read class names from system.yaml (single source of truth)
+_SYSTEM_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "system.yaml"
+try:
+    with open(_SYSTEM_CONFIG, "r") as _fh:
+        _cfg = yaml.safe_load(_fh) or {}
+    EXPECTED_CLASSES = [c.lower() for c in _cfg.get("model", {}).get("class_names", [])]
+except Exception:
+    EXPECTED_CLASSES = []
+if len(EXPECTED_CLASSES) < 2:
+    EXPECTED_CLASSES = ["normal", "pneumonia", "cardiomegaly"]
 
 
 def download_dataset(
