@@ -37,10 +37,7 @@ def get_train_transforms(
             laterality-sensitive disease set such as pneumothorax or pleural effusion.
     """
     transforms_list = []
-
-    # Horizontal flip: single most impactful augmentation for chest X-ray
-    # classification. Controlled via config so laterality-sensitive disease
-    # sets can opt out without modifying this file.
+    
     if horizontal_flip:
         transforms_list.append(A.HorizontalFlip(p=0.5))
 
@@ -49,13 +46,10 @@ def get_train_transforms(
             size=(image_size, image_size),
             scale=(0.85, 1.0),
             ratio=(0.95, 1.05),
-            interpolation=cv2.INTER_AREA,  # match val transforms
+            interpolation=cv2.INTER_AREA, 
             p=1
         ),
 
-        # Translation + rotation only — scale is handled by RandomResizedCrop;
-        # stacking both caused an effective 0.74–1.08× range that could crop
-        # out diagnostically relevant anatomy.
         A.Affine(
             translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
             rotate=(-6, 6),
@@ -76,14 +70,10 @@ def get_train_transforms(
         ),
 
         A.GaussNoise(
-            std_range=(0.012, 0.025),   # normalized to [0,1]; ≈ 3.0/255, 6.5/255
+            std_range=(0.012, 0.025), 
             p=0.2
         ),
 
-        # NOTE: CLAHE is already applied during preprocessing (processing.py).
-        # Removed here to keep transforms distribution-safe.
-
-        # Increased hole size for meaningful regularization at 384px.
         A.CoarseDropout(
             num_holes_range=(1, 3),
             hole_height_range=(16, 48),
@@ -121,15 +111,9 @@ class ChestXrayDataset(Dataset):
         self.df = df.reset_index(drop=True)
         self.transform = transform
         
-        # Note: In multiprocessing (num_workers > 0), this cache is duplicated across 
-        # all worker processes independently. Actual RAM usage = (cache_size * num_workers).
         self._cache_size = cache_size
         self.fallback_size = fallback_size
-        # Fix D1: Resolve class map at init time (not module import time)
-        # so it always reflects the current system.yaml config.
         class_map = get_class_map()
-        # Fix #2: validate labels eagerly so unmapped classes raise immediately
-        # rather than silently producing NaN values that corrupt the training loop.
         mapped = self.df['class'].str.lower().map(class_map)
         invalid_mask = mapped.isna()
         if invalid_mask.any():
@@ -196,9 +180,6 @@ class ChestXrayDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.image_size = image_size
         self.cache_size = cache_size
-        # Per-worker cache: divide by worker count so total RAM stays bounded.
-        # Each DataLoader worker forks an independent copy of the cache dict;
-        # without this division: total usage = cache_size × num_workers.
         self._cache_per_worker = max(0, cache_size // num_workers) if num_workers > 0 else cache_size
         self.use_weighted_sampler = use_weighted_sampler
         self.mean = mean
@@ -217,22 +198,17 @@ class ChestXrayDataModule(pl.LightningDataModule):
         if {'split', 'class', 'filepath_processed'} - set(df.columns):
             raise ValueError("Manifest missing required columns")
 
-        # Guard against re-initialising datasets on duplicate setup() calls
-        # (PL can call setup() more than once, e.g. during sanity-check validation).
         if stage in ("fit", None) and self.train_dataset is None:
             self.train_dataset = ChestXrayDataset(df[df['split'] == 'train'], get_train_transforms(self.image_size, self.mean, self.std, self.horizontal_flip), self._cache_per_worker, fallback_size=self.image_size)
-            # val/test are evaluated once per epoch — caching wastes RAM
-            # without any speed benefit (each image is visited exactly once).
             self.val_dataset = ChestXrayDataset(df[df['split'] == 'val'], get_val_transforms(self.image_size, self.mean, self.std), cache_size=0, fallback_size=self.image_size)
         if stage in ("test", "predict", None) and self.test_dataset is None:
             self.test_dataset = ChestXrayDataset(df[df['split'] == 'test'], get_val_transforms(self.image_size, self.mean, self.std), cache_size=0, fallback_size=self.image_size)
             self.predict_dataset = self.test_dataset
 
     def get_class_weights(self) -> torch.Tensor:
-        class_map = get_class_map() # e.g. {"normal": 0, "pneumonia": 1}
+        class_map = get_class_map()
         counts = self.train_dataset.df['class'].str.lower().value_counts().to_dict()
         
-        # Initialize weights tensor based on max label index
         num_classes = max(class_map.values()) + 1
         weights = torch.zeros(num_classes, dtype=torch.float32)
         
@@ -243,15 +219,6 @@ class ChestXrayDataModule(pl.LightningDataModule):
             weights[label_idx] = total / (num_classes * count)
             
         return weights / weights.sum() * len(weights)
-
-    # def get_class_weights(self) -> torch.Tensor:
-    #     class_names = get_class_names()
-    #     n = len(class_names)
-    #     counts = self.train_dataset.df['class'].str.lower().value_counts().to_dict()
-    #     total = sum(counts.values()) or 1
-    #     class_counts = [max(counts.get(k.lower(), 0), 1) for k in class_names]
-    #     weights = torch.FloatTensor([total / (n * max(class_counts[i], 1)) for i in range(n)])
-    #     return weights / weights.sum() * len(weights)
 
     def get_sampler(self) -> Optional[WeightedRandomSampler]:
         if not self.use_weighted_sampler: return None

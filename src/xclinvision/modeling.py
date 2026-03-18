@@ -19,7 +19,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Standardized mapping for timm architectures
 TIMM_MODEL_MAP = {
     "densenet": "densenet121",
     "resnet50": "resnet50",
@@ -191,7 +190,6 @@ class EnsembleClassifier(nn.Module):
     def get_individual_predictions(self, x: torch.Tensor) -> List[torch.Tensor]:
         return [model(x) for model in self.models]
 
-
 def build_model(
     model_name: str = "densenet", 
     num_classes: int = 3, 
@@ -239,7 +237,6 @@ def build_model(
     _add_gradcam_support(model, model_name)
     
     return model
-
 
 def _add_gradcam_support(model: nn.Module, architecture: str):
     """Monkey-patch Grad-CAM support securely using types.MethodType."""
@@ -307,7 +304,8 @@ def get_model_normalization(model: nn.Module, model_name: str) -> Dict[str, tupl
             "std":  model.default_cfg.get('std', (0.229, 0.224, 0.225))
         }
     # Fallback standard ImageNet
-    return {"mean": (0.485, 0.456, 0.406), "std": (0.229, 0.224, 0.225)}
+    return {"mean": (0.485, 0.456, 0.406), 
+            "std": (0.229, 0.224, 0.225)}
 
 
 def freeze_backbone(model: nn.Module, unfreeze_head: bool = True) -> None:
@@ -377,9 +375,6 @@ def unfreeze_layers(model: nn.Module, num_layers: int = 0) -> None:
         target_seq = model.features
     elif hasattr(model, 'layers') and isinstance(model.layers, nn.Sequential):
         target_seq = model.layers
-    # Fix #22: timm ConvNext exposes feature blocks as model.stages (nn.Sequential).
-    # Without this branch, the fallback (target_seq = model) iterates all top-level
-    # children including the head, effectively unfreezing the whole model at once.
     elif hasattr(model, 'stages') and isinstance(model.stages, nn.Sequential):
         target_seq = model.stages
     else:
@@ -387,7 +382,6 @@ def unfreeze_layers(model: nn.Module, num_layers: int = 0) -> None:
         
     valid_blocks = []
     for child in target_seq.children():
-        # Only consider blocks that actually have learnable parameters
         if list(child.parameters()) and \
            not isinstance(child, (nn.Linear, nn.AdaptiveAvgPool2d, nn.Flatten, nn.Dropout)):
             valid_blocks.append(child)
@@ -397,7 +391,6 @@ def unfreeze_layers(model: nn.Module, num_layers: int = 0) -> None:
     for block in blocks_to_unfreeze:
         for param in block.parameters():
             param.requires_grad = True
-    
     counts = get_param_counts(model)
     logger.info(f"Progressive unfreeze (last {num_layers} blocks): {counts['trainable_m']:.2f}M trainable ({counts['trainable_pct']:.1f}%)")
 
@@ -473,7 +466,7 @@ if __name__ == "__main__":
     TEST_MODELS = [
         "densenet", "resnet50", "efficientnet_b0", "efficientnet_b2",
         "convnext_tiny", "vit_small", "swin_t",
-        "biomedclip",  # Uncomment if open_clip installed
+        "biomedclip",
     ]
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -505,3 +498,5 @@ if __name__ == "__main__":
             print(f"{status} Ensemble ({method}): {result.get('output_shape', 'FAILED')}")
     
     print(f"\n{'='*70}")
+
+    

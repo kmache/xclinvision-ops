@@ -56,7 +56,6 @@ def read_image_grayscale(source: Union[str, Path, bytes]) -> Optional[np.ndarray
         logger.error("read_image_grayscale failed for %s: %s", source if not isinstance(source, bytes) else "<bytes>", exc)
         return None
 
-
 def _decode_dicom_dataset(ds) -> np.ndarray:
     """Convert a loaded pydicom Dataset to an 8-bit grayscale numpy array.
 
@@ -65,12 +64,10 @@ def _decode_dicom_dataset(ds) -> np.ndarray:
     """
     arr = ds.pixel_array.astype(np.float64)
 
-    # Apply Rescale Slope / Intercept if present
     slope = float(getattr(ds, "RescaleSlope", 1))
     intercept = float(getattr(ds, "RescaleIntercept", 0))
     arr = arr * slope + intercept
 
-    # Apply VOI windowing if present, otherwise min-max normalise
     wc = getattr(ds, "WindowCenter", None)
     ww = getattr(ds, "WindowWidth", None)
     if wc is not None and ww is not None:
@@ -82,7 +79,6 @@ def _decode_dicom_dataset(ds) -> np.ndarray:
     arr = (arr - mn) / (mx - mn) * 255.0 if mx - mn > 0 else np.zeros_like(arr)
     img = arr.astype(np.uint8)
 
-    # MONOCHROME1 = inverted (white=0); flip so anatomy is bright
     if getattr(ds, "PhotometricInterpretation", "MONOCHROME2") == "MONOCHROME1":
         img = 255 - img
 
@@ -91,7 +87,7 @@ def _decode_dicom_dataset(ds) -> np.ndarray:
 
 def _read_dicom_grayscale(path: Path) -> Optional[np.ndarray]:
     """Decode a DICOM file to 8-bit grayscale via pydicom."""
-    import pydicom  # lazy import — only paid when DICOM files are present
+    import pydicom 
     return _decode_dicom_dataset(pydicom.dcmread(path))
 
 
@@ -103,7 +99,6 @@ def _read_bytes_grayscale(data: bytes) -> Optional[np.ndarray]:
         import io as _io
         return _decode_dicom_dataset(pydicom.dcmread(_io.BytesIO(data)))
 
-    # Standard image formats
     buf = np.frombuffer(data, dtype=np.uint8)
     img = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
     return img
@@ -173,7 +168,6 @@ def is_side_by_side_double(img: np.ndarray, min_aspect: float = 1.5) -> bool:
     if aspect < min_aspect:
         return False
 
-    # Check 1: dark centre strip
     strip_w = max(int(w * 0.05), 3)
     cx = w // 2
     centre_strip = img[:, cx - strip_w : cx + strip_w]
@@ -183,7 +177,6 @@ def is_side_by_side_double(img: np.ndarray, min_aspect: float = 1.5) -> bool:
     if overall_mean > 10 and strip_mean < overall_mean * 0.45:
         return True
 
-    # Check 2: horizontal projection dip
     col_means = img.mean(axis=0).astype(np.float64)
     kernel_size = max(w // 40, 3) | 1
     smoothed = np.convolve(col_means, np.ones(kernel_size) / kernel_size, mode='same')
@@ -201,7 +194,6 @@ def is_side_by_side_double(img: np.ndarray, min_aspect: float = 1.5) -> bool:
         return True
 
     return False
-
 
 def clean_dark_overlays(
         image: np.ndarray, 
@@ -287,7 +279,6 @@ def process_and_filter_xray(
     else:
         return None, "Filtered: No content detected (Blank image)"
 
-    # CLAHE & Letterbox
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     img = clahe.apply(img)
 
@@ -385,7 +376,7 @@ def load_dataset_metadata(raw_dir: Union[Path, str]) -> pd.DataFrame:
         class_dirs = [d for d in sorted(split_path.iterdir()) if d.is_dir()]
         
         for class_dir in tqdm(class_dirs, desc=f"Scanning {split}", leave=False):
-            # Standardize class names
+
             class_name = class_dir.name.lower()
             
             img_files = [f for f in class_dir.iterdir() 
@@ -399,7 +390,6 @@ def load_dataset_metadata(raw_dir: Union[Path, str]) -> pd.DataFrame:
                     "filename": img_file.name,
                 })
     
-    # Pre-define columns to prevent errors on empty sets
     df = pd.DataFrame(records, columns=["split", "class", "filepath", "filename"])
     
     if not df.empty:
@@ -408,7 +398,6 @@ def load_dataset_metadata(raw_dir: Union[Path, str]) -> pd.DataFrame:
         logger.error("No images found in %s!", raw_dir)
         
     return df
-
 
 @dataclass
 class PipelineReport:
@@ -521,15 +510,12 @@ def run_processing_pipeline(
 
     # -------------------------------------------------------------------
     # PHASE 1b: Cross-split leakage guard
-    # If the same hash (same class) appears in multiple splits, keep only
-    # the training copy to prevent data leakage into val/test.
     # -------------------------------------------------------------------
     if detect_duplicates:
         _split_priority = {"train": 0, "val": 1, "test": 2}
         keeper_df = df[df['filepath'].isin(keeper_filepaths)].copy()
         for img_hash, grp in keeper_df.groupby('hash'):
             if grp['split'].nunique() > 1:
-                # Keep the copy from the lowest-priority split (prefer train)
                 grp_sorted = grp.sort_values(
                     'split', key=lambda s: s.map(_split_priority)
                 )
@@ -563,7 +549,6 @@ def run_processing_pipeline(
         filepath = row["filepath"]
         processed_img, status = process_and_filter_xray(filepath, target_size, min_area_ratio)
 
-        # Handle SUCCESS
         if processed_img is not None:
             out_name = f"{Path(row['filename']).stem}.{output_format}"
             dest = processed_dir / row["split"] / row["class"] / out_name
@@ -580,7 +565,6 @@ def run_processing_pipeline(
             })
             report.processed += 1
             
-        # Handle QUARANTINE (Failure/Filtered)
         else:
             is_error = status.startswith("Error")
             q_folder = "corrupted" if is_error else "flagged"
@@ -600,7 +584,6 @@ def run_processing_pipeline(
                 "reason": status
             })
 
-    # Save Manifests
     if processed_records:
         processed_dir.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(processed_records).to_csv(processed_dir / "manifest.csv", index=False)
@@ -613,7 +596,6 @@ def run_processing_pipeline(
         duplicate_dir.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(duplicate_records).to_csv(duplicate_dir / "duplicate_manifest.csv", index=False)
 
-    # Print Summary
     print("\n" + "=" * 60)
     print("PROCESSING PIPELINE COMPLETE")
     print("=" * 60)

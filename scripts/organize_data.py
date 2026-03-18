@@ -102,8 +102,6 @@ def _discover_classes(source_dir: Path) -> List[str]:
         )
     return classes
 
-
-
 def _detect_layout(source_dir: Path, classes: List[str]) -> str:
     """Return 'pre-split' if every class folder contains train/val/test, else 'flat'."""
     for cls in classes:
@@ -415,8 +413,6 @@ if __name__ == "__main__":
 
     _print_summary(splits, classes)
 
-    # Cross-check discovered class names against system.yaml so mismatches are
-    # caught here rather than silently failing during train.py manifest loading.
     try:
         import yaml as _yaml
         _sys_cfg = PROJECT_ROOT / "configs" / "system.yaml"
@@ -437,4 +433,4 @@ if __name__ == "__main__":
                     sorted(_cfg_classes),
                 )
     except Exception:
-        pass  # cross-check is best-effort; never block data organisation
+        pass  
