@@ -41,6 +41,9 @@ class PredictResponse(BaseModel):
     uncertainty_level: Optional[str] = None
     explanation: Optional[Dict] = None
     processing_time_ms: float
+    # Multi-label fields (populated only when classification_mode == "multilabel")
+    predictions_multilabel: Optional[List[int]] = None
+    class_names_predicted: Optional[List[str]] = None
 
 
 class ExplainRequest(BaseModel):

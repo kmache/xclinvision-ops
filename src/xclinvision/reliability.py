@@ -31,7 +31,6 @@ class ReliabilityAnalyzer:
         self.model.eval()
         embeddings = []
         
-        # Determine image size from model if possible, default to 224
         img_size = 224
         if hasattr(self.model, "default_cfg") and "input_size" in self.model.default_cfg:
             img_size = self.model.default_cfg["input_size"][-1]
@@ -49,7 +48,6 @@ class ReliabilityAnalyzer:
         )
         
         if isinstance(images, np.ndarray):
-            # If it's a single image, wrap it in a list. If it's a batch, list(images) will work too.
             if images.ndim == 3 or images.ndim == 2:
                 images = [images]
             else:
@@ -57,7 +55,6 @@ class ReliabilityAnalyzer:
                 
         with torch.no_grad():
             for img in images:
-                # Ensure input is an RGB image (H, W, 3) 
                 if img.ndim == 2:
                     img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
                 elif img.ndim == 3 and img.shape[2] == 1:
@@ -65,11 +62,9 @@ class ReliabilityAnalyzer:
                 elif img.ndim == 3 and img.shape[2] == 4:
                     img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
                     
-                # Apply normalization and shape alignment [C, H, W]
                 transformed = transform(image=img)
                 img_tensor = transformed["image"].unsqueeze(0).to(self.device).float()
                 
-                # Extract features safely depending on the model's architecture
                 if hasattr(self.model, "vision_encoder"):
                     # BiomedCLIP specific
                     features = self.model.vision_encoder(img_tensor)
@@ -84,7 +79,6 @@ class ReliabilityAnalyzer:
                     # General get_features method
                     features = self.model.get_features(img_tensor)
                 else:
-                    # Fallback (returns output from base forward if no better method is found)
                     features = self.model(img_tensor)
                     if features.ndim > 2:
                         features = features.mean(dim=[-2, -1]) if features.ndim == 4 else features.mean(dim=1)
@@ -104,18 +98,13 @@ class ReliabilityAnalyzer:
         The decision threshold is derived from *training* distances so it
         reflects the learned distribution rather than the test set itself.
         """
-        # Compute mean and covariance of training embeddings
         train_mean = np.mean(train_embeddings, axis=0)
         train_cov = np.cov(train_embeddings.T)
         
-        # H-3 fix: 1e-6 is far too small for high-dimensional embeddings (e.g.
-        # 768-dim ViT/Swin features) where the covariance matrix is rank-deficient
-        # when n_samples < feature_dim.  Use 1e-2 to ensure stable inversion.
         train_cov += np.eye(train_cov.shape[0]) * 1e-2
         
         # Compute inverse covariance
         try:
-            # Prefer pseudo-inverse: robust to rank-deficiency even after regularization
             inv_cov = np.linalg.pinv(train_cov)
         except np.linalg.LinAlgError:
             inv_cov = np.eye(train_cov.shape[0])
@@ -123,14 +112,11 @@ class ReliabilityAnalyzer:
         
         def _mahalanobis(embeddings: np.ndarray) -> np.ndarray:
             diffs = embeddings - train_mean
-            # Vectorised: sqrt(diag(diffs @ inv_cov @ diffs.T))
             return np.sqrt(np.einsum("ij,jk,ik->i", diffs, inv_cov, diffs))
-
-        # Threshold derived from the training set
+        
         train_distances = _mahalanobis(train_embeddings)
         threshold = np.percentile(train_distances, threshold_percentile)
 
-        # Compute test distances and flag OOD samples
         test_distances = _mahalanobis(test_embeddings)
         is_ood = test_distances > threshold
         
@@ -142,17 +128,15 @@ class ReliabilityAnalyzer:
         train_embeddings: np.ndarray,
     ) -> Dict[str, float]:
         """Compute drift between training and test embeddings."""
-        # Frechet Inception Distance (FID-like)
+
         mu_train = np.mean(train_embeddings, axis=0)
         sigma_train = np.cov(train_embeddings.T)
         
         mu_test = np.mean(test_embeddings, axis=0)
         sigma_test = np.cov(test_embeddings.T)
         
-        # Compute FID using scipy
         diff = mu_train - mu_test
         
-        # sqrtm returns complex numbers due to numerical noise; take the real part
         covmean = sqrtm(sigma_train.dot(sigma_test))
         if np.iscomplexobj(covmean):
             covmean = covmean.real
@@ -162,10 +146,9 @@ class ReliabilityAnalyzer:
         else:
             fid = np.sum(diff ** 2) + np.trace(sigma_train + sigma_test - 2 * covmean)
             
-        # Cosine distance between means (guarded against zero-norm)
         norm_product = np.linalg.norm(mu_train) * np.linalg.norm(mu_test)
         if norm_product == 0:
-            cosine_dist = 1.0  # maximally dissimilar when a mean is zero
+            cosine_dist = 1.0 
         else:
             cosine_dist = 1 - np.dot(mu_train, mu_test) / norm_product
         
@@ -197,7 +180,6 @@ class ReliabilityAnalyzer:
             "confidence": orig_conf,
         }
         
-        # Test each perturbation
         for perturb in perturbations:
             perturbed = self._apply_perturbation(image, perturb)
             pert_result = pipeline.predict(perturbed)
@@ -226,7 +208,6 @@ class ReliabilityAnalyzer:
                 "Install it with: pip install opencv-python"
             ) from exc
         
-        # Safely cast to float32 for math operations
         img_float = image.astype(np.float32)
         
         if perturbation == "noise":
@@ -235,7 +216,7 @@ class ReliabilityAnalyzer:
             
         elif perturbation == "blur":
             kernel_size = int(5 + severity * 10) // 2 * 2 + 1
-            # cv2 functions prefer uint8
+
             perturbed = cv2.GaussianBlur(image, (kernel_size, kernel_size), 0)
             
         elif perturbation == "brightness":
@@ -251,9 +232,10 @@ class ReliabilityAnalyzer:
 class FailureAnalyzer:
     """Analyze model failure modes."""
     
-    def __init__(self, class_names: Optional[List[str]] = None):
+    def __init__(self, class_names: Optional[List[str]] = None, multilabel: bool = False):
         from xclinvision.config import get_class_names
         self.class_names = class_names or get_class_names()
+        self.multilabel = multilabel
         
     def analyze_failures(
         self,
@@ -262,6 +244,17 @@ class FailureAnalyzer:
         y_probs: np.ndarray,
     ) -> Dict:
         """Analyze failure patterns."""
+        if self.multilabel:
+            return self._analyze_multilabel(y_true, y_pred, y_probs)
+        return self._analyze_multiclass(y_true, y_pred, y_probs)
+
+    def _analyze_multiclass(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_probs: np.ndarray,
+    ) -> Dict:
+        """Analyze failure patterns for multiclass classification."""
         failures = {
             "false_positives": {},
             "false_negatives": {},
@@ -269,21 +262,18 @@ class FailureAnalyzer:
         }
         
         for i, class_name in enumerate(self.class_names):
-            # False positives
             fp_mask = (y_pred == i) & (y_true != i)
             failures["false_positives"][class_name] = {
                 "count": int(np.sum(fp_mask)),
                 "indices": np.where(fp_mask)[0].tolist(),
             }
             
-            # False negatives
             fn_mask = (y_true == i) & (y_pred != i)
             failures["false_negatives"][class_name] = {
                 "count": int(np.sum(fn_mask)),
                 "indices": np.where(fn_mask)[0].tolist(),
             }
             
-        # High confidence errors
         max_probs = np.max(y_probs, axis=1)
         incorrect = y_pred != y_true
         high_conf_incorrect = incorrect & (max_probs > 0.8)
@@ -292,6 +282,51 @@ class FailureAnalyzer:
             "count": int(np.sum(high_conf_incorrect)),
             "indices": np.where(high_conf_incorrect)[0].tolist(),
             "avg_confidence": float(np.mean(max_probs[high_conf_incorrect])) if np.sum(high_conf_incorrect) > 0 else 0.0,
+        }
+        
+        return failures
+
+    def _analyze_multilabel(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_probs: np.ndarray,
+    ) -> Dict:
+        """Analyze failure patterns for multilabel classification.
+        
+        y_true, y_pred: (N, C) binary arrays
+        y_probs: (N, C) probability arrays
+        """
+        failures = {
+            "false_positives": {},
+            "false_negatives": {},
+            "high_confidence_errors": {},
+        }
+        
+        for i, class_name in enumerate(self.class_names):
+            fp_mask = (y_pred[:, i] == 1) & (y_true[:, i] == 0)
+            failures["false_positives"][class_name] = {
+                "count": int(np.sum(fp_mask)),
+                "indices": np.where(fp_mask)[0].tolist(),
+            }
+            
+            fn_mask = (y_true[:, i] == 1) & (y_pred[:, i] == 0)
+            failures["false_negatives"][class_name] = {
+                "count": int(np.sum(fn_mask)),
+                "indices": np.where(fn_mask)[0].tolist(),
+            }
+        
+        # Any sample with at least one label error
+        any_error = np.any(y_pred != y_true, axis=1)
+        # Per-sample max confidence among erroneous labels
+        error_confs = np.where(y_pred != y_true, y_probs, 0.0)
+        max_error_conf = np.max(error_confs, axis=1)
+        high_conf_incorrect = any_error & (max_error_conf > 0.8)
+        
+        failures["high_confidence_errors"] = {
+            "count": int(np.sum(high_conf_incorrect)),
+            "indices": np.where(high_conf_incorrect)[0].tolist(),
+            "avg_confidence": float(np.mean(max_error_conf[high_conf_incorrect])) if np.sum(high_conf_incorrect) > 0 else 0.0,
         }
         
         return failures

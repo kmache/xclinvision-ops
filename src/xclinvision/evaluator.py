@@ -15,6 +15,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     roc_auc_score,
+    multilabel_confusion_matrix,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,8 +33,9 @@ class MetricsComputer:
     """
 
     def __init__(self, class_names: Optional[List[str]] = None):
-        from xclinvision.config import get_class_names
+        from xclinvision.config import get_class_names, is_multilabel
         self.class_names = class_names or get_class_names()
+        self.multilabel = is_multilabel()
 
     # ------------------------------------------------------------------
     # Full metric suite
@@ -45,16 +47,34 @@ class MetricsComputer:
         y_pred: np.ndarray,
         y_probs: np.ndarray,
     ) -> Dict[str, float]:
-        """Compute all evaluation metrics for multi-class classification.
+        """Compute all evaluation metrics.
+
+        Supports both multi-class (integer labels) and multi-label (binary
+        matrix) depending on ``self.multilabel``.
 
         Args:
-            y_true: Ground-truth integer labels, shape (N,).
-            y_pred: Predicted integer labels, shape (N,).
+            y_true: Ground-truth labels — shape (N,) for multiclass or
+                (N, num_classes) binary matrix for multilabel.
+            y_pred: Predicted labels — same shape convention as y_true.
             y_probs: Predicted probabilities, shape (N, num_classes).
 
         Returns:
             Flat dict mapping metric names to float values.
         """
+        if self.multilabel:
+            return self._compute_multilabel_metrics(y_true, y_pred, y_probs)
+        return self._compute_multiclass_metrics(y_true, y_pred, y_probs)
+
+    # ------------------------------------------------------------------
+    # Multi-class metrics (original)
+    # ------------------------------------------------------------------
+
+    def _compute_multiclass_metrics(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_probs: np.ndarray,
+    ) -> Dict[str, float]:
         n_classes = len(self.class_names)
         metrics: Dict[str, float] = {}
 
@@ -141,6 +161,89 @@ class MetricsComputer:
         return metrics
 
     # ------------------------------------------------------------------
+    # Multi-label metrics
+    # ------------------------------------------------------------------
+
+    def _compute_multilabel_metrics(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_probs: np.ndarray,
+    ) -> Dict[str, float]:
+        """Compute evaluation metrics for multi-label classification.
+
+        Args:
+            y_true: Binary ground-truth matrix, shape (N, num_classes).
+            y_pred: Binary prediction matrix, shape (N, num_classes).
+            y_probs: Predicted probabilities, shape (N, num_classes).
+        """
+        n_classes = len(self.class_names)
+        metrics: Dict[str, float] = {}
+
+        # ---- aggregate (sample-averaged) ---------------------------------
+        metrics["subset_accuracy"] = float(accuracy_score(y_true, y_pred))
+        metrics["macro_precision"] = float(
+            precision_score(y_true, y_pred, average="macro", zero_division=0)
+        )
+        metrics["macro_recall"] = float(
+            recall_score(y_true, y_pred, average="macro", zero_division=0)
+        )
+        metrics["macro_f1"] = float(
+            f1_score(y_true, y_pred, average="macro", zero_division=0)
+        )
+        metrics["weighted_f1"] = float(
+            f1_score(y_true, y_pred, average="weighted", zero_division=0)
+        )
+        metrics["sample_precision"] = float(
+            precision_score(y_true, y_pred, average="samples", zero_division=0)
+        )
+        metrics["sample_recall"] = float(
+            recall_score(y_true, y_pred, average="samples", zero_division=0)
+        )
+        metrics["sample_f1"] = float(
+            f1_score(y_true, y_pred, average="samples", zero_division=0)
+        )
+
+        # ---- per-class ---------------------------------------------------
+        per_precision = precision_score(y_true, y_pred, average=None, zero_division=0)
+        per_recall = recall_score(y_true, y_pred, average=None, zero_division=0)
+        per_f1 = f1_score(y_true, y_pred, average=None, zero_division=0)
+
+        for i, name in enumerate(self.class_names):
+            metrics[f"{name}_precision"] = float(per_precision[i])
+            metrics[f"{name}_recall"]    = float(per_recall[i])
+            metrics[f"{name}_f1"]        = float(per_f1[i])
+
+        # ---- per-class sensitivity / specificity via multilabel CM --------
+        mcm = multilabel_confusion_matrix(y_true, y_pred)
+        for i, name in enumerate(self.class_names):
+            tn, fp, fn, tp = mcm[i].ravel()
+            metrics[f"{name}_sensitivity"] = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+            metrics[f"{name}_specificity"] = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+            metrics[f"{name}_ppv"]         = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+            metrics[f"{name}_npv"]         = float(tn / (tn + fn)) if (tn + fn) > 0 else 0.0
+
+        # ---- AUC-ROC (per-label binary) -----------------------------------
+        try:
+            metrics["macro_auc"] = float(
+                roc_auc_score(y_true, y_probs, average="macro")
+            )
+            metrics["weighted_auc"] = float(
+                roc_auc_score(y_true, y_probs, average="weighted")
+            )
+            per_auc = roc_auc_score(y_true, y_probs, average=None)
+            for i, name in enumerate(self.class_names):
+                metrics[f"{name}_auc"] = float(per_auc[i])
+        except ValueError as exc:
+            logger.warning(f"AUC-ROC computation failed (multilabel): {exc}")
+            metrics["macro_auc"] = 0.0
+            metrics["weighted_auc"] = 0.0
+            for name in self.class_names:
+                metrics[f"{name}_auc"] = 0.0
+
+        return metrics
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -149,7 +252,9 @@ class MetricsComputer:
         y_true: np.ndarray,
         y_pred: np.ndarray,
     ) -> np.ndarray:
-        """Return the confusion matrix (rows = true, columns = predicted)."""
+        """Return confusion matrix (or multilabel confusion matrix)."""
+        if self.multilabel:
+            return multilabel_confusion_matrix(y_true, y_pred)
         return confusion_matrix(
             y_true, y_pred, labels=list(range(len(self.class_names)))
         )
@@ -187,7 +292,7 @@ class MetricsComputer:
         lines.append("=" * 60)
         lines.append("EVALUATION SUMMARY")
         lines.append("=" * 60)
-        lines.append(f"  Accuracy      : {metrics.get('accuracy', 0):.4f}")
+        lines.append(f"  Accuracy      : {metrics.get('accuracy', metrics.get('subset_accuracy', 0)):.4f}")
         lines.append(f"  Macro F1      : {metrics.get('macro_f1', 0):.4f}")
         lines.append(f"  Weighted F1   : {metrics.get('weighted_f1', 0):.4f}")
         lines.append(f"  Macro AUC     : {metrics.get('macro_auc', 0):.4f}")
@@ -199,12 +304,20 @@ class MetricsComputer:
             lines.append(f"  {name:<14}: Sens={sens:.3f}  Spec={spec:.3f}  F1={f1:.3f}")
         if y_true is not None and y_pred is not None:
             lines.append("")
-            lines.append("Confusion Matrix (rows=true, cols=pred):")
-            cm = self.compute_confusion_matrix(y_true, y_pred)
-            header = "  " + "  ".join(f"{n[:6]:>6}" for n in self.class_names)
-            lines.append(header)
-            for row, name in zip(cm, self.class_names):
-                lines.append(f"  {name[:6]:>6}  " + "  ".join(f"{v:>6}" for v in row))
+            if self.multilabel:
+                # multilabel_confusion_matrix returns (C, 2, 2) — show per-label TN/FP/FN/TP
+                mcm = self.compute_confusion_matrix(y_true, y_pred)
+                lines.append("Per-label Confusion Matrices (TN, FP, FN, TP):")
+                for i, name in enumerate(self.class_names):
+                    tn, fp, fn, tp = mcm[i].ravel()
+                    lines.append(f"  {name}: TN={tn}  FP={fp}  FN={fn}  TP={tp}")
+            else:
+                lines.append("Confusion Matrix (rows=true, cols=pred):")
+                cm = self.compute_confusion_matrix(y_true, y_pred)
+                header = "  " + "  ".join(f"{n[:6]:>6}" for n in self.class_names)
+                lines.append(header)
+                for row, name in zip(cm, self.class_names):
+                    lines.append(f"  {name[:6]:>6}  " + "  ".join(f"{v:>6}" for v in row))
         lines.append("=" * 60)
         lines.append("")
         logger.info("\n".join(lines))
@@ -391,7 +504,6 @@ class TemperatureScaler:
             Calibrated probabilities, shape (N, num_classes).
         """
         scaled = self.scale(logits)
-        # Numerically stable softmax
         exp = np.exp(scaled - np.max(scaled, axis=1, keepdims=True))
         return exp / np.sum(exp, axis=1, keepdims=True)
 

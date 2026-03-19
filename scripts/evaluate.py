@@ -43,7 +43,7 @@ from xclinvision.modeling import build_model, get_model_normalization
 from xclinvision.processing import get_processed_dir_for_size
 from xclinvision.reliability import FailureAnalyzer
 from xclinvision.trainer import XClinVisionModel
-from xclinvision.config import get_class_names, get_num_classes
+from xclinvision.config import get_class_names, get_num_classes, is_multilabel
 
 logging.basicConfig(
     level=logging.INFO,
@@ -101,7 +101,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--image-size", type=int, default=384,
-        help="Image resolution (must match training). Default: 224."
+        help="Image resolution (must match training). Default: 384."
     )
     parser.add_argument(
         "--batch-size", type=int, default=32,
@@ -137,6 +137,8 @@ def collect_predictions(
     device: torch.device,
     desc: str = "Inference",
     tta: bool = False,
+    norm_mean: tuple = (0.485, 0.456, 0.406),
+    norm_std: tuple = (0.229, 0.224, 0.225),
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run model over all batches and collect arrays.
 
@@ -161,8 +163,8 @@ def collect_predictions(
             # corrupting the normalized tensor distribution:
             #   x_bright = Normalize((x * std + mean) * 1.05)
             # Algebraically: x_bright = x * 1.05 + mean * 0.05 / std
-            mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
-            std  = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
+            mean = torch.tensor(norm_mean, device=x.device).view(1, 3, 1, 1)
+            std  = torch.tensor(norm_std, device=x.device).view(1, 3, 1, 1)
             x_bright = x * 1.05 + mean * 0.05 / std
 
             logits_flip   = model(torch.flip(x, dims=[-1]))   # horizontal flip
@@ -173,13 +175,20 @@ def collect_predictions(
 
     y_true  = np.concatenate(all_targets, axis=0)
     logits  = np.concatenate(all_logits,  axis=0)
-    y_probs = _softmax(logits)
+    if is_multilabel():
+        y_probs = _sigmoid(logits)
+    else:
+        y_probs = _softmax(logits)
     return y_true, logits, y_probs
 
 
 def _softmax(logits: np.ndarray) -> np.ndarray:
     exp = np.exp(logits - np.max(logits, axis=1, keepdims=True))
     return exp / np.sum(exp, axis=1, keepdims=True)
+
+
+def _sigmoid(logits: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-logits))
 
 
 # ---------------------------------------------------------------------------
@@ -267,8 +276,13 @@ def main() -> None:
     logger.info("Running inference …")
     y_true, logits_eval, y_probs = collect_predictions(
         model, eval_loader, device, desc=f"Eval ({args.split})", tta=args.tta,
+        norm_mean=norm_stats["mean"], norm_std=norm_stats["std"],
     )
-    y_pred = np.argmax(y_probs, axis=1)
+    _multilabel = is_multilabel()
+    if _multilabel:
+        y_pred = (y_probs > 0.5).astype(int)
+    else:
+        y_pred = np.argmax(y_probs, axis=1)
 
     # ------------------------------------------------------------------
     # 4. Optional: Temperature Scaling (calibration)
@@ -289,20 +303,32 @@ def main() -> None:
         val_loader = data_module.val_dataloader()
 
         y_val, logits_val, _ = collect_predictions(
-            model, val_loader, device, desc="Calibration (val)"
+            model, val_loader, device, desc="Calibration (val)",
+            norm_mean=norm_stats["mean"], norm_std=norm_stats["std"],
         )
 
         temperature_scaler = TemperatureScaler()
-        learned_temperature = temperature_scaler.fit(logits_val, y_val)
-        logger.info(f"Optimal temperature: T = {learned_temperature:.4f}")
+        if _multilabel:
+            logger.warning(
+                "Temperature scaling is designed for multiclass (softmax). "
+                "Skipping calibration for multilabel mode."
+            )
+            temperature_scaler = None
+        else:
+            learned_temperature = temperature_scaler.fit(logits_val, y_val)
+            logger.info(f"Optimal temperature: T = {learned_temperature:.4f}")
 
         # Re-calibrate eval predictions
-        y_probs = temperature_scaler.predict_proba(logits_eval)
-        y_pred  = np.argmax(y_probs, axis=1)
+        if temperature_scaler is not None:
+            y_probs = temperature_scaler.predict_proba(logits_eval)
+            if _multilabel:
+                y_pred = (y_probs > 0.5).astype(int)
+            else:
+                y_pred  = np.argmax(y_probs, axis=1)
 
-        # Persist scaler
-        temp_path = output_dir / f"{args.model_name}_temperature.json"
-        temperature_scaler.save(str(temp_path))
+            # Persist scaler
+            temp_path = output_dir / f"{args.model_name}_temperature.json"
+            temperature_scaler.save(str(temp_path))
 
     # ------------------------------------------------------------------
     # 5. Metrics
@@ -327,10 +353,19 @@ def main() -> None:
     # ------------------------------------------------------------------
     logger.info("Computing calibration metrics …")
     calibrator = CalibrationAnalyzer(num_bins=15)
-    ece = calibrator.compute_ece(y_true, y_probs)
-    bin_centers, bin_accs, bin_counts = calibrator.compute_calibration_curve(
-        y_true, y_probs
-    )
+    if _multilabel:
+        # CalibrationAnalyzer uses argmax internally — not meaningful for multilabel.
+        # Skip ECE / calibration curve for now.
+        ece = 0.0
+        bin_centers = np.linspace(0, 1, 15)
+        bin_accs = np.zeros(15)
+        bin_counts = np.zeros(15, dtype=int)
+        logger.info("Skipping ECE / calibration curve (not defined for multilabel).")
+    else:
+        ece = calibrator.compute_ece(y_true, y_probs)
+        bin_centers, bin_accs, bin_counts = calibrator.compute_calibration_curve(
+            y_true, y_probs
+        )
 
     metrics["calibration"] = {
         "expected_calibration_error": float(ece),
@@ -347,7 +382,7 @@ def main() -> None:
     # 7. Failure analysis
     # ------------------------------------------------------------------
     logger.info("Analysing failures …")
-    failure_analyzer = FailureAnalyzer(class_names=class_names)
+    failure_analyzer = FailureAnalyzer(class_names=class_names, multilabel=is_multilabel())
     failures = failure_analyzer.analyze_failures(y_true, y_pred, y_probs)
     metrics["failure_analysis"] = failures
 
@@ -374,18 +409,37 @@ def main() -> None:
         f"prob_{name}": y_probs[:, i]
         for i, name in enumerate(class_names)
     }
-    df_preds = pd.DataFrame(
-        {
-            "filepath":         filepaths,
-            "true_label":       y_true,
-            "true_class":       [class_names[lbl] for lbl in y_true],
-            "predicted_label":  y_pred,
-            "predicted_class":  [class_names[p] for p in y_pred],
-            "confidence":       np.max(y_probs, axis=1),
-            "correct":          (y_true == y_pred),
-            **prob_cols,
+
+    if _multilabel:
+        # y_true / y_pred are (N, C) binary matrices
+        true_label_cols = {
+            f"true_{name}": y_true[:, i] for i, name in enumerate(class_names)
         }
-    )
+        pred_label_cols = {
+            f"pred_{name}": y_pred[:, i] for i, name in enumerate(class_names)
+        }
+        df_preds = pd.DataFrame(
+            {
+                "filepath": filepaths,
+                **true_label_cols,
+                **pred_label_cols,
+                "confidence": np.max(y_probs, axis=1),
+                **prob_cols,
+            }
+        )
+    else:
+        df_preds = pd.DataFrame(
+            {
+                "filepath":         filepaths,
+                "true_label":       y_true,
+                "true_class":       [class_names[lbl] for lbl in y_true],
+                "predicted_label":  y_pred,
+                "predicted_class":  [class_names[p] for p in y_pred],
+                "confidence":       np.max(y_probs, axis=1),
+                "correct":          (y_true == y_pred),
+                **prob_cols,
+            }
+        )
     csv_path = output_dir / f"{args.model_name}_{args.split}_predictions.csv"
     df_preds.to_csv(csv_path, index=False)
     logger.info(f"Per-sample CSV saved to {csv_path}")
@@ -406,8 +460,9 @@ def main() -> None:
     logger.info(f"Full report saved to {report_path}")
 
     # Final summary line
+    acc_key = 'subset_accuracy' if _multilabel else 'accuracy'
     logger.info(
-        f"Done — Accuracy={metrics['accuracy']:.4f}  "
+        f"Done — Accuracy={metrics[acc_key]:.4f}  "
         f"MacroF1={metrics['macro_f1']:.4f}  "
         f"MacroAUC={metrics['macro_auc']:.4f}  "
         f"ECE={ece:.4f}"

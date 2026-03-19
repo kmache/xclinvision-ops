@@ -16,13 +16,11 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-# Walk up from src/xclinvision/config.py → repo root
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SYSTEM_CONFIG = _REPO_ROOT / "configs" / "system.yaml"
 
 _FALLBACK_CLASS_NAMES: List[str] = ["Normal", "Pneumonia", "Cardiomegaly"]
 
-# Module-level cache so the file is read at most once per process.
 _cached_class_names: List[str] | None = None
 
 
@@ -68,6 +66,42 @@ def get_num_classes() -> int:
     return len(get_class_names())
 
 
+_cached_classification_mode: str | None = None
+
+
+def get_classification_mode() -> str:
+    """Return the classification mode from ``configs/system.yaml``.
+
+    Supported values: ``"multiclass"`` (default) or ``"multilabel"``.
+    """
+    global _cached_classification_mode
+    if _cached_classification_mode is not None:
+        return _cached_classification_mode
+
+    if _SYSTEM_CONFIG.exists():
+        try:
+            with open(_SYSTEM_CONFIG, "r") as fh:
+                cfg = yaml.safe_load(fh) or {}
+            mode = cfg.get("model", {}).get("classification_mode", "multiclass")
+            if mode in ("multiclass", "multilabel"):
+                _cached_classification_mode = mode
+                return _cached_classification_mode
+            logger.warning(
+                "Invalid classification_mode '%s' in %s — defaulting to 'multiclass'.",
+                mode, _SYSTEM_CONFIG,
+            )
+        except Exception as exc:
+            logger.warning("Failed to read classification_mode from %s: %s", _SYSTEM_CONFIG, exc)
+
+    _cached_classification_mode = "multiclass"
+    return _cached_classification_mode
+
+
+def is_multilabel() -> bool:
+    """Convenience check: ``True`` when classification mode is multilabel."""
+    return get_classification_mode() == "multilabel"
+
+
 # ---------------------------------------------------------------------------
 # Clinical rules
 # ---------------------------------------------------------------------------
@@ -107,6 +141,7 @@ def _reset_class_names_cache() -> None:
     swapped between test cases so that the next call to ``get_class_names()``
     re-reads the config from disk.
     """
-    global _cached_class_names, _cached_clinical_rules
+    global _cached_class_names, _cached_clinical_rules, _cached_classification_mode
     _cached_class_names = None
     _cached_clinical_rules = None
+    _cached_classification_mode = None

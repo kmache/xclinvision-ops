@@ -19,6 +19,10 @@ augmentation:
 # data directories / manifest match.  num_classes is derived automatically.
 model:
   class_names: ["Normal", "Pneumonia", "Cardiomegaly"]
+  # Classification mode: "multiclass" (one label per image, softmax + CE) or
+  # "multilabel" (multiple labels per image, sigmoid + BCE).  When using
+  # multilabel, the manifest CSV must contain one binary column per class name.
+  classification_mode: "multiclass"
 
 # Clinical plausibility rules (optional, disease-agnostic).
 # Each entry maps a class name (case-insensitive) to the expected XAI

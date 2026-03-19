@@ -25,11 +25,8 @@ import numpy as np
 from torchmetrics import MetricCollection, Accuracy, F1Score, AUROC
 from sklearn.metrics import classification_report, confusion_matrix
 
-from .config import get_class_map, get_class_names
+from .config import get_class_map, get_class_names, is_multilabel
 from .modeling import freeze_backbone, unfreeze_layers, get_param_counts
-
-# Determine PL major version once at import time so _apply_unfreeze_schedule
-_PL_MAJOR = int(pl.__version__.split(".")[0])
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +124,29 @@ class FocalLoss(nn.Module):
         return (self.alpha * focal_term * ce_loss).mean()
 
 
+class MultilabelFocalLoss(nn.Module):
+    """Focal Loss for multi-label classification using sigmoid + BCE."""
+
+    def __init__(
+        self,
+        alpha: float = 1.0,
+        gamma: float = 2.0,
+        pos_weight: Optional[torch.Tensor] = None,
+    ):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.register_buffer("pos_weight", pos_weight)
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce = F.binary_cross_entropy_with_logits(
+            inputs, targets, pos_weight=self.pos_weight, reduction="none",
+        )
+        pt = torch.exp(-bce)
+        focal = self.alpha * (1 - pt) ** self.gamma * bce
+        return focal.mean()
+
+
 # ---------------------------------------------------------------------------
 # Lightning Module
 # ---------------------------------------------------------------------------
@@ -170,18 +190,26 @@ class XClinVisionModel(pl.LightningModule):
         self.mixup_alpha = mixup_alpha
         self.mixup_prob = mixup_prob  # fraction of batches where Mixup is applied
         self._oom_steps = 0  # L-2: track OOM-skipped batches per epoch
+        self.multilabel = is_multilabel()
 
         # Loss function
         weight_tensor = (
             torch.tensor(class_weights, dtype=torch.float32) if class_weights else None
         )
-        self.criterion = self._setup_loss(loss_type, weight_tensor, label_smoothing)
+        self.criterion = self._setup_loss(loss_type, weight_tensor, label_smoothing, self.multilabel)
 
-        metrics = MetricCollection({
-            "acc": Accuracy(task="multiclass", num_classes=num_classes, average="macro"),
-            "f1_macro": F1Score(task="multiclass", num_classes=num_classes, average="macro"),
-            "auc": AUROC(task="multiclass", num_classes=num_classes, average="macro"),
-        })
+        if self.multilabel:
+            metrics = MetricCollection({
+                "acc": Accuracy(task="multilabel", num_labels=num_classes),
+                "f1_macro": F1Score(task="multilabel", num_labels=num_classes, average="macro"),
+                "auc": AUROC(task="multilabel", num_labels=num_classes, average="macro"),
+            })
+        else:
+            metrics = MetricCollection({
+                "acc": Accuracy(task="multiclass", num_classes=num_classes, average="macro"),
+                "f1_macro": F1Score(task="multiclass", num_classes=num_classes, average="macro"),
+                "auc": AUROC(task="multiclass", num_classes=num_classes, average="macro"),
+            })
         self.train_metrics = metrics.clone(prefix="train_")
         self.val_metrics = metrics.clone(prefix="val_")
         self.test_metrics = metrics.clone(prefix="test_")
@@ -207,8 +235,13 @@ class XClinVisionModel(pl.LightningModule):
         loss_type: str,
         weight: Optional[torch.Tensor],
         label_smoothing: float = 0.1,
+        multilabel: bool = False,
     ) -> nn.Module:
         """Setup loss function with optional class weighting."""
+        if multilabel:
+            if loss_type == "focal":
+                return MultilabelFocalLoss(pos_weight=weight)
+            return nn.BCEWithLogitsLoss(pos_weight=weight)
         if loss_type == "focal":
             return FocalLoss(weight=weight, label_smoothing=label_smoothing)
         elif loss_type == "ce":
@@ -294,10 +327,12 @@ class XClinVisionModel(pl.LightningModule):
     def training_step(self, batch, _batch_idx):
         x, y = batch
         try:
-            # Apply Mixup probabilistically so hard examples still appear
-            # unblended ~50 % of the time (helps boundary learning late in training).
+            # Mixup is only applied in multiclass mode; multilabel targets
+            # are float vectors which would require a different blending
+            # strategy — skip for now.
             use_mixup = (
-                self.mixup_alpha > 0
+                not self.multilabel
+                and self.mixup_alpha > 0
                 and self.training
                 and torch.rand(1).item() < self.mixup_prob
             )
@@ -318,10 +353,6 @@ class XClinVisionModel(pl.LightningModule):
             return None
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        # Fix #7: skip metric updates during Mixup steps.  Blended logits vs.
-        # hard labels produce a systematically low accuracy/F1 signal that
-        # pollutes the training metrics dashboard.  Only update when the batch
-        # is un-mixed so the metrics reflect true model capability.
         if not use_mixup:
             self.train_metrics.update(logits.detach(), y)
         return loss
@@ -354,8 +385,13 @@ class XClinVisionModel(pl.LightningModule):
                 f"img_size={x.shape[-1]}). Consider reducing --batch-size."
             )
             return None
-        probs = F.softmax(logits, dim=1)
-        preds = torch.argmax(logits, dim=1)
+
+        if self.multilabel:
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).int()
+        else:
+            probs = F.softmax(logits, dim=1)
+            preds = torch.argmax(logits, dim=1)
 
         self.log("val_loss", loss, on_epoch=True, prog_bar=True)
         self.val_metrics.update(logits, y)
@@ -374,8 +410,13 @@ class XClinVisionModel(pl.LightningModule):
         x, y = batch
         logits = self(x)
         loss = self.criterion(logits, y)
-        probs = F.softmax(logits, dim=1)
-        preds = torch.argmax(logits, dim=1)
+
+        if self.multilabel:
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).int()
+        else:
+            probs = F.softmax(logits, dim=1)
+            preds = torch.argmax(logits, dim=1)
 
         self.log("test_loss", loss, on_epoch=True, prog_bar=True)
         self.test_metrics.update(logits, y)
@@ -467,11 +508,12 @@ class MetricsCallback(Callback):
         super().__init__()
         self.save_predictions = save_predictions
         self.output_dir = output_dir
+        self.multilabel = is_multilabel()
         self._reset()
 
     def _reset(self):
-        self.val_preds: List[int] = []
-        self.val_targets: List[int] = []
+        self.val_preds: List[np.ndarray] = []
+        self.val_targets: List[np.ndarray] = []
         self.val_probs: List[np.ndarray] = []  # each row is shape (num_classes,)
 
     def on_validation_batch_end(
@@ -499,18 +541,29 @@ class MetricsCallback(Callback):
         targets = np.array(self.val_targets)
 
         try:
-            # Always use all classes to prevent dimension mismatch during sanity checks
             target_names = getattr(pl_module, 'class_names', get_class_names())
             all_labels = list(range(len(target_names)))
 
-            report = classification_report(
-                targets,
-                preds,
-                labels=all_labels,
-                target_names=target_names,
-                output_dict=True,
-                zero_division=0,
-            )
+            if self.multilabel:
+                # For multilabel: preds and targets are (N, C) binary arrays.
+                # Compute per-label classification report using sklearn.
+                from sklearn.metrics import classification_report as _cr
+                report = _cr(
+                    targets,
+                    preds,
+                    target_names=target_names,
+                    output_dict=True,
+                    zero_division=0,
+                )
+            else:
+                report = classification_report(
+                    targets,
+                    preds,
+                    labels=all_labels,
+                    target_names=target_names,
+                    output_dict=True,
+                    zero_division=0,
+                )
 
             # Log per-class metrics
             for cls_name, metrics in report.items():
@@ -519,8 +572,9 @@ class MetricsCallback(Callback):
                         if isinstance(value, (int, float)):
                             pl_module.log(f"val_{cls_name}_{metric_name}", float(value))
 
-            cm = confusion_matrix(targets, preds, labels=all_labels)
-            logger.info(f"\nConfusion Matrix (epoch {trainer.current_epoch}):\n{cm}")
+            cm = confusion_matrix(targets, preds, labels=all_labels) if not self.multilabel else None
+            if cm is not None:
+                logger.info(f"\nConfusion Matrix (epoch {trainer.current_epoch}):\n{cm}")
 
             # Save predictions if requested
             if self.save_predictions and self.output_dir:
@@ -539,13 +593,22 @@ class MetricsCallback(Callback):
         os.makedirs(self.output_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        save_data = {
-            "epoch": epoch,
-            "timestamp": timestamp,
-            "predictions": [int(p) for p in self.val_preds],
-            "targets": [int(t) for t in self.val_targets],
-            "probabilities": [p.tolist() for p in self.val_probs],
-        }
+        if self.multilabel:
+            save_data = {
+                "epoch": epoch,
+                "timestamp": timestamp,
+                "predictions": [p.tolist() if hasattr(p, 'tolist') else list(p) for p in self.val_preds],
+                "targets": [t.tolist() if hasattr(t, 'tolist') else list(t) for t in self.val_targets],
+                "probabilities": [p.tolist() for p in self.val_probs],
+            }
+        else:
+            save_data = {
+                "epoch": epoch,
+                "timestamp": timestamp,
+                "predictions": [int(p) for p in self.val_preds],
+                "targets": [int(t) for t in self.val_targets],
+                "probabilities": [p.tolist() for p in self.val_probs],
+            }
 
         filepath = os.path.join(self.output_dir, f"val_predictions_{timestamp}.json")
         with open(filepath, "w") as f:
@@ -599,6 +662,15 @@ class BestModelExportCallback(Callback):
         any failure (missing datamodule, empty loader, optimisation error).
         """
         from xclinvision.evaluator import TemperatureScaler
+
+        # Temperature scaling uses CrossEntropyLoss (expects integer labels);
+        # skip for multilabel where labels are binary vectors.
+        if is_multilabel():
+            logger.info(
+                "BestModelExportCallback: skipping temperature calibration "
+                "(not supported for multilabel mode)."
+            )
+            return None
 
         if trainer.datamodule is None:
             logger.warning(

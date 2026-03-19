@@ -89,6 +89,9 @@ class PredictionResponse(BaseModel):
     uncertainty_level: Optional[str] = None
     explanation: Optional[Dict] = None
     processing_time_ms: float
+    # Multi-label fields (populated only when classification_mode == "multilabel")
+    predictions_multilabel: Optional[List[int]] = None
+    class_names_predicted: Optional[List[str]] = None
 
 
 class FeedbackRequest(BaseModel):
@@ -126,7 +129,7 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
       XCLINVISION_IMAGE_SIZE   - input image size used during training (default: 384)
     """
     import torch
-    from xclinvision.modeling import build_model
+    from xclinvision.modeling import build_model, get_model_normalization
     from xclinvision.inference import InferencePipeline
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -156,11 +159,19 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
         raise ValueError(f"Unrecognised checkpoint format in {model_path}")
 
     model.eval()
+
+    # Fix #22: use model-specific normalization stats so the inference pipeline
+    # matches the training distribution.  Without this, BiomedCLIP and other
+    # non-ImageNet models would silently use the wrong mean/std.
+    norm_stats = get_model_normalization(model, architecture)
+
     return InferencePipeline(
         model=model,
         architecture=architecture,
         device=device,
         image_size=image_size,
+        dataset_mean=list(norm_stats["mean"]),
+        dataset_std=list(norm_stats["std"]),
     )
 
 
@@ -418,6 +429,8 @@ async def predict(
         uncertainty_level=result.get("uncertainty_level"),
         explanation=explanation_out,
         processing_time_ms=processing_time,
+        predictions_multilabel=result.get("predictions_multilabel"),
+        class_names_predicted=result.get("class_names_predicted"),
     )
 
 
@@ -946,7 +959,9 @@ async def llm_chat(request: ChatRequest):
         )
 
         # Build a combined prompt with history and new message
-        agent = create_agent()
+        # Fix #19: use module-level cached agent to avoid re-initialising
+        # the LLM client on every chat request.
+        agent = _get_agent()
         history_text = "\n".join(
             f"{'User' if m.role == 'user' else 'AI'}: {m.content}"
             for m in request.history[-5:]  # Last 5 messages for context
@@ -954,8 +969,6 @@ async def llm_chat(request: ChatRequest):
 
         # Use agent's report generation as a workaround for chat
         # (the agent only has generate_report; we adapt)
-        from xclinvision.agent import ClinicalContext as _CC
-
         report = agent.generate_report(context)
         base_text = report.get("findings", "") + " " + report.get("impression", "")
 

@@ -12,7 +12,7 @@ from PIL import Image
 
 from xclinvision.evaluator import TemperatureScaler
 from xclinvision.processing import process_and_filter_xray, read_image_grayscale
-from xclinvision.config import get_class_names
+from xclinvision.config import get_class_names, is_multilabel
 from xclinvision.xai import generate_explanation
 
 logger = logging.getLogger(__name__)
@@ -26,7 +26,7 @@ def _resolve_device(device: Union[str, torch.device]) -> torch.device:
     if isinstance(device, torch.device):
         return device
     if device.startswith("cuda") and not torch.cuda.is_available():
-        logger.warning("CUDA requested but unavailable – falling back to CPU.")
+        logger.warning("CUDA requested but unavailable falling back to CPU.")
         return torch.device("cpu")
     return torch.device(device)
 
@@ -38,11 +38,9 @@ def _enable_mc_dropout(model: nn.Module) -> None:
         if isinstance(m, (nn.Dropout, nn.Dropout2d, nn.AlphaDropout)):
             m.train()
 
-
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
-
 class InferencePipeline:
     """End-to-end inference pipeline for chest X-ray classification.
 
@@ -90,6 +88,7 @@ class InferencePipeline:
         self.class_names = class_names or get_class_names()
         self.dataset_mean = dataset_mean if dataset_mean is not None else [0.485, 0.456, 0.406]
         self.dataset_std = dataset_std if dataset_std is not None else [0.229, 0.224, 0.225]
+        self.multilabel = is_multilabel()
 
     # -----------------------------------------------------------------------
     # Temperature scaling helper (DRY — used by predict, predict_batch, compute_uncertainty)
@@ -142,13 +141,8 @@ class InferencePipeline:
                 gray = arr
 
         # --- Apply full preprocessing pipeline (CLAHE, crop, letterbox) ---
-        # Fix #1: training images are preprocessed via process_and_filter_xray().
-        # Skipping this step during inference creates a train/inference distribution
-        # mismatch that degrades real-world accuracy.
         processed, status = process_and_filter_xray(gray, target_size=self.image_size)
         if processed is None:
-            # Fallback: plain resize if preprocessing rejects the image (e.g.
-            # blank or corrupt). Log the reason so it is visible in server logs.
             logger.warning(
                 "process_and_filter_xray rejected image (%s); "
                 "falling back to plain resize. Predictions may be less reliable.",
@@ -156,7 +150,6 @@ class InferencePipeline:
             )
             processed = cv2.resize(gray, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
 
-        # Convert to 3-channel RGB (models expect 3 channels)
         img = cv2.cvtColor(processed, cv2.COLOR_GRAY2RGB)
         vis_image = img.copy()
 
@@ -213,9 +206,20 @@ class InferencePipeline:
         with torch.no_grad():
             logits = self._apply_temperature(self.model(x))
 
-            probs = F.softmax(logits, dim=1)
-            pred_class = int(torch.argmax(probs, dim=1).item())
-            confidence = float(probs[0, pred_class].item())
+            if self.multilabel:
+                probs = torch.sigmoid(logits)
+                preds_binary = (probs > 0.5).int()[0]  # (num_classes,)
+                active_indices = preds_binary.nonzero(as_tuple=True)[0].tolist()
+                pred_class = active_indices[0] if active_indices else int(torch.argmax(probs, dim=1).item())
+                confidence = float(probs[0, pred_class].item())
+                predicted_names = [
+                    self.class_names[i] for i in active_indices
+                ] if active_indices else [self.class_names[pred_class]]
+            else:
+                probs = F.softmax(logits, dim=1)
+                pred_class = int(torch.argmax(probs, dim=1).item())
+                confidence = float(probs[0, pred_class].item())
+                predicted_names = None
 
         result: Dict[str, Any] = {
             "prediction": pred_class,
@@ -226,6 +230,9 @@ class InferencePipeline:
             "confidence": confidence,
             "class_names": self.class_names,
         }
+        if self.multilabel:
+            result["predictions_multilabel"] = preds_binary.cpu().tolist()
+            result["class_names_predicted"] = predicted_names
 
         if return_uncertainty:
             uncertainty = self.compute_uncertainty(x)
@@ -278,7 +285,10 @@ class InferencePipeline:
             self.model.eval()
             with torch.no_grad():
                 logits = self._apply_temperature(self.model(x_batch))
-                probs_batch = F.softmax(logits, dim=1).cpu().numpy()
+                if self.multilabel:
+                    probs_batch = torch.sigmoid(logits).cpu().numpy()
+                else:
+                    probs_batch = F.softmax(logits, dim=1).cpu().numpy()
             
             batched_mc_preds = None
             if return_uncertainty:
@@ -287,12 +297,26 @@ class InferencePipeline:
                 with torch.no_grad():
                     for _ in range(self.mc_samples):
                         mc_logits = self._apply_temperature(self.model(x_batch))
-                        mc_preds_list.append(F.softmax(mc_logits, dim=1).cpu().numpy())
+                        if self.multilabel:
+                            mc_preds_list.append(torch.sigmoid(mc_logits).cpu().numpy())
+                        else:
+                            mc_preds_list.append(F.softmax(mc_logits, dim=1).cpu().numpy())
                 self.model.eval()
                 batched_mc_preds = np.array(mc_preds_list) # Shape: (mc_samples, batch_size, num_classes)
 
             for i, (vis_image, prob) in enumerate(zip(vis_images, probs_batch)):
-                pred_class = int(np.argmax(prob))
+                if self.multilabel:
+                    preds_binary = (prob > 0.5).astype(int)
+                    active_indices = np.where(preds_binary)[0].tolist()
+                    pred_class = active_indices[0] if active_indices else int(np.argmax(prob))
+                    predicted_names = [
+                        self.class_names[j] for j in active_indices
+                    ] if active_indices else [self.class_names[pred_class]]
+                else:
+                    pred_class = int(np.argmax(prob))
+                    preds_binary = None
+                    predicted_names = None
+
                 result: Dict[str, Any] = {
                     "prediction": pred_class,
                     "class_name": self.class_names[pred_class]
@@ -302,6 +326,9 @@ class InferencePipeline:
                     "confidence": float(prob[pred_class]),
                     "class_names": self.class_names,
                 }
+                if self.multilabel:
+                    result["predictions_multilabel"] = preds_binary.tolist()
+                    result["class_names_predicted"] = predicted_names
                 if return_uncertainty:
                     item_preds = batched_mc_preds[:, i, :] # Shape: (mc_samples, num_classes)
                     mean_pred = item_preds.mean(axis=0)
@@ -359,12 +386,15 @@ class InferencePipeline:
         with torch.no_grad():
             for _ in range(self.mc_samples):
                 logits = self._apply_temperature(self.model(x))
-                mc_preds.append(F.softmax(logits, dim=1).cpu().numpy())
+                if self.multilabel:
+                    mc_preds.append(torch.sigmoid(logits).cpu().numpy())
+                else:
+                    mc_preds.append(F.softmax(logits, dim=1).cpu().numpy())
 
-        self.model.eval()  # restore deterministic mode
+        self.model.eval()
 
-        preds = np.array(mc_preds)        # (mc_samples, 1, num_classes)
-        mean_pred = preds.mean(axis=0)    # (1, num_classes)
+        preds = np.array(mc_preds)     
+        mean_pred = preds.mean(axis=0) 
 
         epistemic = float(preds.var(axis=0).mean())
 

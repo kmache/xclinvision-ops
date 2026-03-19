@@ -14,7 +14,7 @@ import torch
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-from xclinvision.config import get_class_map, get_class_names
+from xclinvision.config import get_class_map, get_class_names, is_multilabel
 from xclinvision.processing import read_image_grayscale
 
 logger = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ def get_val_transforms(
 # 2. PyTorch Dataset
 # ---------------------------------------------------------------------------
 class ChestXrayDataset(Dataset):
-    """Chest X-ray dataset for multi-class classification."""
+    """Chest X-ray dataset for multi-class or multi-label classification."""
     
     def __init__(self, df: pd.DataFrame, transform: Optional[Callable] = None, cache_size: int = 0, fallback_size: int = 384):
         self.df = df.reset_index(drop=True)
@@ -113,16 +113,28 @@ class ChestXrayDataset(Dataset):
         
         self._cache_size = cache_size
         self.fallback_size = fallback_size
-        class_map = get_class_map()
-        mapped = self.df['class'].str.lower().map(class_map)
-        invalid_mask = mapped.isna()
-        if invalid_mask.any():
-            bad_vals = self.df.loc[invalid_mask, 'class'].unique().tolist()
-            raise ValueError(
-                f"Unknown class labels found in manifest: {bad_vals}. "
-                f"Expected one of: {list(class_map.keys())}"
-            )
-        self.labels = mapped.tolist()
+        self.multilabel = is_multilabel()
+
+        if self.multilabel:
+            class_names = get_class_names()
+            missing = set(class_names) - set(self.df.columns)
+            if missing:
+                raise ValueError(
+                    f"Multilabel mode requires one binary column per class in the "
+                    f"manifest CSV. Missing columns: {sorted(missing)}"
+                )
+            self.labels = self.df[class_names].values.astype(np.float32)
+        else:
+            class_map = get_class_map()
+            mapped = self.df['class'].str.lower().map(class_map)
+            invalid_mask = mapped.isna()
+            if invalid_mask.any():
+                bad_vals = self.df.loc[invalid_mask, 'class'].unique().tolist()
+                raise ValueError(
+                    f"Unknown class labels found in manifest: {bad_vals}. "
+                    f"Expected one of: {list(class_map.keys())}"
+                )
+            self.labels = mapped.tolist()
         self._image_cache: dict = {}
             
     def _load_image_impl(self, image_path: str) -> np.ndarray:
@@ -147,14 +159,17 @@ class ChestXrayDataset(Dataset):
     def __len__(self) -> int:
         return len(self.df)
     
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         image_path = self.df.loc[idx, 'filepath_processed']
-        label = self.labels[idx]
-        
         image = self._load_image(image_path)
         if self.transform:
             image = self.transform(image=image)["image"]
-            
+
+        if self.multilabel:
+            label = torch.tensor(self.labels[idx], dtype=torch.float32)
+        else:
+            label = self.labels[idx]
+
         return image, label
 
 # ---------------------------------------------------------------------------
@@ -195,8 +210,13 @@ class ChestXrayDataModule(pl.LightningDataModule):
             raise FileNotFoundError(f"Manifest not found: {self.manifest_path}")
             
         df = pd.read_csv(self.manifest_path)
-        if {'split', 'class', 'filepath_processed'} - set(df.columns):
-            raise ValueError("Manifest missing required columns")
+        required = {'split', 'filepath_processed'}
+        if is_multilabel():
+            required |= set(get_class_names())
+        else:
+            required.add('class')
+        if required - set(df.columns):
+            raise ValueError(f"Manifest missing required columns: {required - set(df.columns)}")
 
         if stage in ("fit", None) and self.train_dataset is None:
             self.train_dataset = ChestXrayDataset(df[df['split'] == 'train'], get_train_transforms(self.image_size, self.mean, self.std, self.horizontal_flip), self._cache_per_worker, fallback_size=self.image_size)
@@ -206,10 +226,22 @@ class ChestXrayDataModule(pl.LightningDataModule):
             self.predict_dataset = self.test_dataset
 
     def get_class_weights(self) -> torch.Tensor:
+        class_names = get_class_names()
+        num_classes = len(class_names)
+
+        if is_multilabel():
+            # For multilabel: pos_weight = num_neg / num_pos per class
+            label_matrix = self.train_dataset.labels  # np.ndarray (N, C)
+            pos_counts = label_matrix.sum(axis=0)  # (C,)
+            neg_counts = len(label_matrix) - pos_counts
+            weights = torch.tensor(
+                neg_counts / np.maximum(pos_counts, 1), dtype=torch.float32
+            )
+            return weights
+
         class_map = get_class_map()
         counts = self.train_dataset.df['class'].str.lower().value_counts().to_dict()
         
-        num_classes = max(class_map.values()) + 1
         weights = torch.zeros(num_classes, dtype=torch.float32)
         
         total = sum(counts.values()) or 1
@@ -222,6 +254,17 @@ class ChestXrayDataModule(pl.LightningDataModule):
 
     def get_sampler(self) -> Optional[WeightedRandomSampler]:
         if not self.use_weighted_sampler: return None
+        if is_multilabel():
+            # Weighted sampling for multilabel: use inverse frequency of rarest
+            # positive label per sample to up-weight rare combinations.
+            label_matrix = self.train_dataset.labels  # np.ndarray (N, C)
+            pos_freq = label_matrix.sum(axis=0) / len(label_matrix)  # (C,)
+            inv_freq = 1.0 / np.maximum(pos_freq, 1e-6)              # (C,)
+            sample_weights = (label_matrix * inv_freq).sum(axis=1)    # (N,)
+            sample_weights = torch.DoubleTensor(sample_weights)
+            return WeightedRandomSampler(
+                weights=sample_weights, num_samples=len(sample_weights), replacement=True
+            )
         weights = self.get_class_weights()
         sample_weights = torch.DoubleTensor([weights[l].item() for l in self.train_dataset.labels])
         return WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
@@ -252,6 +295,24 @@ class ChestXrayDataModule(pl.LightningDataModule):
         if self.train_dataset is None or self.val_dataset is None or self.test_dataset is None:
             self.setup()
             
+        if is_multilabel():
+            class_names = get_class_names()
+            stats = {
+                'train_samples': len(self.train_dataset),
+                'val_samples': len(self.val_dataset),
+                'test_samples': len(self.test_dataset),
+                'class_distribution': {
+                    name: {
+                        'train': int(self.train_dataset.labels[:, i].sum()),
+                        'val': int(self.val_dataset.labels[:, i].sum()),
+                        'test': int(self.test_dataset.labels[:, i].sum()),
+                    }
+                    for i, name in enumerate(class_names)
+                },
+                'class_weights': self.get_class_weights().tolist(),
+            }
+            return stats
+
         train_counts = self.train_dataset.df['class'].str.lower().value_counts().to_dict()
         val_counts = self.val_dataset.df['class'].str.lower().value_counts().to_dict()
         test_counts = self.test_dataset.df['class'].str.lower().value_counts().to_dict()
