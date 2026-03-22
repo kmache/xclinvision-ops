@@ -48,7 +48,8 @@ data/raw/*
 data/processed/*
 data/vector_db/*   
 data/NIH-ChestX-ray3
-data/processed/
+data/processed_* 
+data/vinbigdata-chest-xray-abnormalities-detection/
 NIH_ChestX-ray14/
 data/duplicate/
 data/quarantine/
@@ -56,7 +57,7 @@ data/test_sample/
 new_data/
 
 !data/raw/.gitkeep
-!data/processed/.gitkeep 
+!data/processed/.manifest.csv
 !data/vector_db/.gitkeep
 
 

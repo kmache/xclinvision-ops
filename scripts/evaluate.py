@@ -43,7 +43,7 @@ from xclinvision.modeling import build_model, get_model_normalization
 from xclinvision.processing import get_processed_dir_for_size
 from xclinvision.reliability import FailureAnalyzer
 from xclinvision.trainer import XClinVisionModel
-from xclinvision.config import get_class_names, get_num_classes, is_multilabel
+from xclinvision.config import get_class_names, get_num_classes, is_multilabel, PipelineConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -251,8 +251,10 @@ def main() -> None:
     # 2. Data
     # ------------------------------------------------------------------
     logger.info("Initialising DataModule …")
+    eval_config = PipelineConfig.from_yaml()
     data_module = ChestXrayDataModule(
         manifest_path=manifest_path,
+        config=eval_config,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         image_size=args.image_size,

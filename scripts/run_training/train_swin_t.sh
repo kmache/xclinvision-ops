@@ -19,7 +19,7 @@ python3 scripts/train.py \
   --model   swin_t \
   --epochs  50 \
   --batch-size 32 \
-  --image-size  512 \
+  --image-size  384 \
   --lr      1e-4 \
   --loss    focal \
   --weight-decay 1e-4 \

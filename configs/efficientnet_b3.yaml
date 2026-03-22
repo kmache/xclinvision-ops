@@ -6,21 +6,7 @@ architecture:
   pretrained: true
   # num_classes: NOT set here — derived at runtime from system.yaml model.class_names
   dropout_rate: 0.3
-  head:
-    type: sequential
-    layers:
-      - type: adaptive_avg_pool2d
-        output_size: [1, 1]
-      - type: flatten
-      - type: linear
-        in_features: 1536
-        out_features: 512
-      - type: relu
-      - type: dropout
-        p: 0.3
-      - type: linear
-        in_features: 512
-        # out_features: NOT set here — determined at build time from system.yaml model.class_names
+  # head: managed by timm — no custom head definition needed
 
 transfer_learning:
   freeze_backbone: false

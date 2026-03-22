@@ -64,6 +64,7 @@ class InferencePipeline:
         class_names: Optional[List[str]] = None,
         dataset_mean: Optional[List[float]] = None,
         dataset_std: Optional[List[float]] = None,
+        thresholds: Optional[Dict[str, float]] = None,
     ):
         """
         Args:
@@ -89,18 +90,54 @@ class InferencePipeline:
         self.dataset_mean = dataset_mean if dataset_mean is not None else [0.485, 0.456, 0.406]
         self.dataset_std = dataset_std if dataset_std is not None else [0.229, 0.224, 0.225]
         self.multilabel = is_multilabel()
+        # Per-class thresholds: dict mapping class_name -> threshold (default 0.5)
+        if thresholds is not None:
+            self._thresholds = thresholds
+        else:
+            self._thresholds = {n: 0.5 for n in self.class_names}
+        self._threshold_array = np.array([self._thresholds.get(n, 0.5) for n in self.class_names])
+        # Cache a torch tensor version on the correct device for GPU-side comparison
+        self._threshold_tensor = torch.tensor(
+            self._threshold_array, device=self.device, dtype=torch.float32
+        )
 
     # -----------------------------------------------------------------------
     # Temperature scaling helper (DRY — used by predict, predict_batch, compute_uncertainty)
     # -----------------------------------------------------------------------
     def _apply_temperature(self, logits: torch.Tensor) -> torch.Tensor:
-        """Apply temperature scaling to raw logits (in-place safe)."""
+        """Apply temperature scaling to raw logits BEFORE activation.
+
+        Temperature scaling divides logits by T (a positive scalar) to
+        sharpen or flatten the probability distribution *before* sigmoid
+        or softmax is applied.  This must happen before any activation.
+
+        Supports:
+        - TemperatureScaler objects (.temperature float attribute)
+        - Raw float/int temperature values
+        - Torch Tensor temperature values
+        """
         if self.temperature_scaler is None:
             return logits
-        if hasattr(self.temperature_scaler, "T") and isinstance(self.temperature_scaler.T, torch.Tensor):
-            return logits / self.temperature_scaler.T
-        scaled = self.temperature_scaler.scale(logits.cpu().numpy())
-        return torch.from_numpy(scaled).to(self.device)
+
+        # Extract the scalar T from whichever representation we have
+        if isinstance(self.temperature_scaler, (int, float)):
+            T = float(self.temperature_scaler)
+        elif hasattr(self.temperature_scaler, "temperature"):
+            T = float(self.temperature_scaler.temperature)
+        elif hasattr(self.temperature_scaler, "T") and isinstance(self.temperature_scaler.T, torch.Tensor):
+            return logits / self.temperature_scaler.T.to(logits.device)
+        else:
+            logger.warning(
+                "temperature_scaler has no recognised temperature attribute; "
+                "returning unscaled logits."
+            )
+            return logits
+
+        if T <= 0:
+            logger.warning("Temperature T=%.4f is non-positive; clamping to 0.01", T)
+            T = 0.01
+
+        return logits / T
 
     # -----------------------------------------------------------------------
     # Pre-processing
@@ -208,7 +245,7 @@ class InferencePipeline:
 
             if self.multilabel:
                 probs = torch.sigmoid(logits)
-                preds_binary = (probs > 0.5).int()[0]  # (num_classes,)
+                preds_binary = (probs >= self._threshold_tensor).int()[0]  # (num_classes,)
                 active_indices = preds_binary.nonzero(as_tuple=True)[0].tolist()
                 pred_class = active_indices[0] if active_indices else int(torch.argmax(probs, dim=1).item())
                 confidence = float(probs[0, pred_class].item())
@@ -306,7 +343,7 @@ class InferencePipeline:
 
             for i, (vis_image, prob) in enumerate(zip(vis_images, probs_batch)):
                 if self.multilabel:
-                    preds_binary = (prob > 0.5).astype(int)
+                    preds_binary = (prob >= self._threshold_array).astype(int)
                     active_indices = np.where(preds_binary)[0].tolist()
                     pred_class = active_indices[0] if active_indices else int(np.argmax(prob))
                     predicted_names = [

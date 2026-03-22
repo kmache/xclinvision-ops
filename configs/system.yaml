@@ -1,9 +1,4 @@
 # XClinVision System Configuration
-# Only keys actually consumed by the codebase are kept here.
-# Per-model settings (architecture, input size, explainability) live in
-# configs/<model>.yaml and are deep-merged on top of this file at runtime.
-
-# Paths (used by scripts/train.py)
 paths:
   raw_data_dir: "./data/raw"
   processed_data_dir: "./data/processed"
@@ -18,34 +13,22 @@ augmentation:
 # To change the set of diseases, update class_names below and ensure your
 # data directories / manifest match.  num_classes is derived automatically.
 model:
-  class_names: ["Normal", "Pneumonia", "Cardiomegaly"]
-  # Classification mode: "multiclass" (one label per image, softmax + CE) or
-  # "multilabel" (multiple labels per image, sigmoid + BCE).  When using
-  # multilabel, the manifest CSV must contain one binary column per class name.
-  classification_mode: "multiclass"
+  class_names: ['No finding', 'Cardiomegaly', 'Aortic enlargement', 'Pleural thickening',  'Pulmonary fibrosis']
+  alpha: 1.2
+  classification_mode: "multilabel" # "multilabel" or "multiclass"
 
-# Clinical plausibility rules (optional, disease-agnostic).
-# Each entry maps a class name (case-insensitive) to the expected XAI
-# activation pattern so that clinical_plausibility_score() can evaluate
-# whether the Grad-CAM focus is anatomically plausible.
-#
-# Supported rule types:
-#   normal_class: true         – expect LOW overall activation
-#   expected_regions: [list]   – expect HIGH activation in these LUNG_REGIONS keys
-#   expected_region_key: "key" – expect HIGH activation in a single region key
-#
-# If a class has no rule, a generic activation-spread heuristic is used.
-# To add a new disease, add an entry here — no code changes required.
 clinical_rules:
-  Normal:
+  No finding:
     normal_class: true
-  Pneumonia:
-    expected_regions: ["left_upper", "left_middle", "left_lower",
-                       "right_upper", "right_middle", "right_lower"]
   Cardiomegaly:
     expected_region_key: "cardiac"
+  Aortic enlargement:
+    expected_region_key: "cardiac"
+  Pleural thickening:
+    expected_regions: ["left_lower", "right_lower", "left_middle", "right_middle"]
+  Pulmonary fibrosis:
+    expected_regions: ["left_lower", "right_lower", "left_middle", "right_middle", "left_upper", "right_upper"]
 
-# Training defaults (can be overridden by CLI flags)
 training:
   label_smoothing: 0.1
   optimizer:
@@ -58,7 +41,7 @@ training:
   # File Upload
   upload:
     max_file_size: 10_485_760  # 10MB
-    allowed_extensions: [".jpg", ".jpeg", ".png", ".dcm"]
+    allowed_extensions: [".jpg", ".jpeg", ".png", ".dcm", ".dicom"]
 
 # Dashboard Configuration
 dashboard:
@@ -74,8 +57,6 @@ dashboard:
     text_color: "#262730"
 
 # Database Configuration
-# IMPORTANT: Set the DATABASE_URL environment variable instead of
-# hardcoding credentials.  The placeholder below is for documentation only.
 database:
   url: "${DATABASE_URL:-postgresql://localhost:5432/xclinvision}"
   pool_size: 5

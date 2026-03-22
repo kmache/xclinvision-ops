@@ -59,7 +59,7 @@ LUNG_REGIONS: Dict[str, Tuple[float, float, float, float]] = {
     "apical":  (0.20, 0.00, 0.80, 0.20),
 }
 
-#: ImageNet statistics — used for normalization.
+#: Fallback standard ImageNet statistics.
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -359,41 +359,53 @@ class CAMQualityReport:
     max_activation: float = 0.0
     coverage: float = 0.0  
     is_degenerate: bool = False  
-    lung_focus_ratio: float = 0.0  
+    roi_focus_ratio: float = 0.0  
 
     @property
     def passes_qc(self) -> bool:
-        return (not self.is_degenerate) and (self.lung_focus_ratio > 0.20)
+        return (not self.is_degenerate) and (self.roi_focus_ratio > 0.20)
 
 def assess_cam_quality(
     cam: np.ndarray,
     threshold: float = 0.15,
     degenerate_low: float = 0.005,
     degenerate_high: float = 0.995,
+    expected_regions: Optional[List[str]] = None,
 ) -> CAMQualityReport:
+    """Assess heatmap quality.
+    
+    Dynamically constructs an expected Region of Interest (ROI) mask. If the 
+    underlying clinical rule defines expected regions (e.g., cardiac), QC evaluates
+    focus within that targeted anatomy rather than general lung space.
+    """
     total = float(cam.mean())
     mx = float(cam.max())
     pixels_above = float((cam > threshold).mean())
     is_deg = total < degenerate_low or total > degenerate_high
 
     h, w = cam.shape[:2]
-    lung_mask = np.zeros((h, w), dtype=np.float32)
-    for name, (x1, y1, x2, y2) in LUNG_REGIONS.items():
-        if name == "cardiac":
-            continue 
-        lung_mask[int(y1 * h):int(y2 * h), int(x1 * w):int(x2 * w)] = 1.0
-    lung_mask = np.clip(lung_mask, 0, 1)
+    roi_mask = np.zeros((h, w), dtype=np.float32)
+    
+    # Default to lung fields if no specific rule specifies otherwise
+    target_zones = expected_regions if expected_regions else [k for k in LUNG_REGIONS.keys() if k != "cardiac"]
+    
+    for name in target_zones:
+        if name in LUNG_REGIONS:
+            x1, y1, x2, y2 = LUNG_REGIONS[name]
+            roi_mask[int(y1 * h):int(y2 * h), int(x1 * w):int(x2 * w)] = 1.0
+            
+    roi_mask = np.clip(roi_mask, 0, 1)
 
-    lung_act = float((cam * lung_mask).sum())
+    roi_act = float((cam * roi_mask).sum())
     total_act = float(cam.sum()) + 1e-8
-    lung_ratio = lung_act / total_act
+    roi_ratio = roi_act / total_act
 
     return CAMQualityReport(
         total_activation=total,
         max_activation=mx,
         coverage=pixels_above,
         is_degenerate=is_deg,
-        lung_focus_ratio=lung_ratio,
+        roi_focus_ratio=roi_ratio,
     )
 
 
@@ -412,16 +424,16 @@ class ExplainabilityEngine:
         target_layer: Optional[nn.Module] = None,
         device: str = "cpu",
         img_size: int = 384,
-        dataset_mean: Optional[np.ndarray] = None,
-        dataset_std: Optional[np.ndarray] = None,
+        dataset_mean: Optional[Union[np.ndarray, List[float]]] = None,
+        dataset_std: Optional[Union[np.ndarray, List[float]]] = None,
     ) -> None:
         self.model = model
         self.class_names = class_names
         self.architecture = architecture
         self.device = device
         self.img_size = img_size
-        self.dataset_mean = dataset_mean if dataset_mean is not None else IMAGENET_MEAN
-        self.dataset_std = dataset_std if dataset_std is not None else IMAGENET_STD
+        self.dataset_mean = np.array(dataset_mean, dtype=np.float32) if dataset_mean is not None else IMAGENET_MEAN
+        self.dataset_std = np.array(dataset_std, dtype=np.float32) if dataset_std is not None else IMAGENET_STD
         self._target_layer = target_layer or self._resolve_target_layer()
 
         if self._target_layer is None:
@@ -463,6 +475,17 @@ class ExplainabilityEngine:
         alpha: float = 0.5,
     ) -> Dict[str, Any]:
         """Generate heatmap. Accepts preprocessed Tensor or raw Numpy array."""
+        
+        # Look up expected anatomical regions based on the target class' clinical rules
+        class_name = ""
+        expected_regions = None
+        if target_class is not None and target_class < len(self.class_names):
+            class_name = self.class_names[target_class]
+            rules = get_clinical_rules().get(class_name.lower(), {})
+            expected_regions = rules.get("expected_regions") or (
+                [rules["expected_region_key"]] if rules.get("expected_region_key") else None
+            )
+
         if self._target_layer is None:
             logger.error("No target layer found. Returning empty heatmap.")
             h, w = self.img_size, self.img_size
@@ -487,7 +510,7 @@ class ExplainabilityEngine:
                 "heatmap": overlay,
                 "grayscale_cam": empty_cam,
                 "region_scores": score_lung_regions(empty_cam),
-                "quality": assess_cam_quality(empty_cam),
+                "quality": assess_cam_quality(empty_cam, expected_regions=expected_regions),
                 "target_class": target_class if target_class is not None else 0,
                 "method": "gradcam++ (fallback)",
             }
@@ -512,6 +535,7 @@ class ExplainabilityEngine:
             grayscale_cam, used_class = cam_gen.generate(input_tensor, target_class=target_class)
         finally:
             cam_gen.remove_hooks()
+            del cam_gen  # Aggressive memory cleanup
 
         if vis_image.dtype == np.uint8:
             vis_image = vis_image.astype(np.float32) / 255.0
@@ -520,7 +544,7 @@ class ExplainabilityEngine:
 
         overlay = create_overlay(vis_image, grayscale_cam, alpha=alpha)
         region_scores = score_lung_regions(grayscale_cam)
-        quality = assess_cam_quality(grayscale_cam)
+        quality = assess_cam_quality(grayscale_cam, expected_regions=expected_regions)
 
         return {
             "heatmap": overlay,
@@ -566,6 +590,59 @@ class ExplainabilityEngine:
             "quality": heatmap_result["quality"],
         }
 
+    def explain_multilabel_prediction(
+        self,
+        image: np.ndarray,
+        positive_indices: List[int],
+        probabilities: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Generate heatmaps for ALL positive labels in a single multilabel image.
+
+        Args:
+            image: Raw input image (H, W) or (H, W, C).
+            positive_indices: List of class indices predicted positive.
+            probabilities: Full probability vector, shape (num_classes,).
+
+        Returns:
+            Dict with per-class explanations under ``"per_class"`` key.
+        """
+        per_class: Dict[str, Dict[str, Any]] = {}
+
+        for idx in positive_indices:
+            class_name = (
+                self.class_names[idx]
+                if idx < len(self.class_names)
+                else f"class_{idx}"
+            )
+            confidence = float(probabilities[idx])
+
+            heatmap_result = self.generate_heatmap(image, target_class=idx)
+            findings = extract_findings(
+                heatmap_result["region_scores"],
+                class_name=class_name,
+                confidence=confidence,
+            )
+            plausibility = clinical_plausibility_score(
+                heatmap_result["region_scores"],
+                class_name=class_name,
+            )
+            per_class[class_name] = {
+                "class_index": idx,
+                "confidence": confidence,
+                "visualization": heatmap_result,
+                "key_findings": findings,
+                "clinical_plausibility": plausibility,
+                "quality": heatmap_result["quality"],
+            }
+
+        return {
+            "positive_classes": [
+                self.class_names[i] if i < len(self.class_names) else f"class_{i}"
+                for i in positive_indices
+            ],
+            "per_class": per_class,
+        }
+
 
 # =========================================================================
 # ValidationXAI — trainer integration
@@ -582,6 +659,8 @@ class ValidationXAI:
         class_names: List[str] = DEFAULT_CLASS_NAMES,
         img_size: int = 384,
         device: Optional[str] = None,
+        dataset_mean: Optional[Union[np.ndarray, List[float]]] = None,
+        dataset_std: Optional[Union[np.ndarray, List[float]]] = None,
     ) -> None:
         self.model = model
         self.architecture = architecture
@@ -600,13 +679,26 @@ class ValidationXAI:
             architecture=architecture,
             device=self.device,
             img_size=img_size,
+            dataset_mean=dataset_mean,
+            dataset_std=dataset_std,
         )
+
+    def _tensor_to_numpy(self, tensor: torch.Tensor) -> np.ndarray:
+        """Denormalizes a tensor dynamically based on the exact normalization stats."""
+        img = tensor.cpu().numpy().transpose(1, 2, 0)
+        # Correctly inverse the (x - mean) / std operation
+        img = (img * self.engine.dataset_std) + self.engine.dataset_mean
+        img = np.clip(img * 255, 0, 255).astype(np.uint8)
+        return img
 
     def process_dataset(
         self,
         dataloader: Any,
         max_samples: int = 100,
     ) -> Dict[str, Any]:
+        from xclinvision.config import is_multilabel
+
+        _multilabel = is_multilabel()
         self.model.eval()
         processed = 0
         plausibility_scores: List[float] = []
@@ -626,28 +718,40 @@ class ValidationXAI:
 
                 try:
                     img_np = self._tensor_to_numpy(images[i])
-                    label = int(labels[i].item())
                     tensor_batch = images[i : i + 1].to(self.device)
 
-                    result = self.engine.generate_heatmap(
-                        input_data=tensor_batch,
-                        original_image=img_np,
-                        target_class=label,
-                    )
-                    
-                    region_scores = result["region_scores"]
-                    quality: CAMQualityReport = result["quality"]
-                    class_name = self.class_names[label] if label < len(self.class_names) else f"class_{label}"
+                    if _multilabel:
+                        # labels[i] is a binary vector — iterate over all positive labels
+                        label_vec = labels[i]
+                        positive_indices = (label_vec > 0.5).nonzero(as_tuple=False).squeeze(-1).tolist()
+                        if isinstance(positive_indices, int):
+                            positive_indices = [positive_indices]
+                        if not positive_indices:
+                            # Safe fallback to the first class
+                            positive_indices = [0]
+                    else:
+                        positive_indices = [int(labels[i].item())]
 
-                    plaus = clinical_plausibility_score(region_scores, class_name)
-                    plausibility_scores.append(plaus)
-                    per_class[label].append(plaus)
+                    for label_idx in positive_indices:
+                        result = self.engine.generate_heatmap(
+                            input_data=tensor_batch,
+                            original_image=img_np,
+                            target_class=label_idx,
+                        )
 
-                    if not quality.passes_qc:
-                        qc_failures += 1
+                        region_scores = result["region_scores"]
+                        quality: CAMQualityReport = result["quality"]
+                        class_name = self.class_names[label_idx] if label_idx < len(self.class_names) else f"class_{label_idx}"
 
-                    for rname, rscore in region_scores.items():
-                        region_accum[rname].append(rscore)
+                        plaus = clinical_plausibility_score(region_scores, class_name)
+                        plausibility_scores.append(plaus)
+                        per_class[label_idx].append(plaus)
+
+                        if not quality.passes_qc:
+                            qc_failures += 1
+
+                        for rname, rscore in region_scores.items():
+                            region_accum[rname].append(rscore)
 
                 except Exception as exc:
                     logger.warning("XAI failed for sample %d: %s", processed, exc)
@@ -687,13 +791,6 @@ class ValidationXAI:
 
         return metrics
 
-    @staticmethod
-    def _tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
-        img = tensor.cpu().numpy().transpose(1, 2, 0)
-        img = img * IMAGENET_STD + IMAGENET_MEAN
-        img = np.clip(img * 255, 0, 255).astype(np.uint8)
-        return img
-
 
 # =========================================================================
 # Public convenience function 
@@ -708,6 +805,8 @@ def generate_explanation(
     architecture: str = "unknown",
     device: str = "cpu",
     img_size: int = 384,
+    dataset_mean: Optional[Union[np.ndarray, List[float]]] = None,
+    dataset_std: Optional[Union[np.ndarray, List[float]]] = None,
 ) -> Dict[str, Any]:
     engine = ExplainabilityEngine(
         model,
@@ -715,5 +814,9 @@ def generate_explanation(
         architecture=architecture,
         device=device,
         img_size=img_size,
+        dataset_mean=dataset_mean,
+        dataset_std=dataset_std,
     )
     return engine.explain_prediction(image, prediction, confidence)
+
+

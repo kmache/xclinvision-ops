@@ -9,23 +9,57 @@ Typical usage
 From the CLI::
 
     python processing.py --raw-dir data/raw --processed-dir data/processed \
-        --quarantine-dir data/quarantine --target-size 224
+        --quarantine-dir data/quarantine --target-size 384
 """
 import hashlib
+import json
 import logging
 import shutil
 from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Optional, Tuple, Union
+
 import cv2
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 
+from xclinvision.config import PipelineConfig
+
 logger = logging.getLogger(__name__)
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".dcm"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".dcm", ".dicom"}
+
+# ---------------------------------------------------------------------------
+# Enums and Dataclasses
+# ---------------------------------------------------------------------------
+
+class ProcessCategory(str, Enum):
+    SUCCESS = "success"
+    FILTERED = "filtered" 
+    ERROR = "error"   
+
+
+@dataclass
+class XrayProcessResult:
+    image: Optional[np.ndarray]
+    category: ProcessCategory
+    reason: str
+
+
+@dataclass
+class PipelineReport:
+    total_images: int = 0
+    processed: int = 0
+    quarantined_corrupted: int = 0
+    quarantined_flagged: int = 0
+    duplicates_same_class: int = 0
+    duplicates_cross_class: int = 0
+    duplicates_cross_split: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -33,35 +67,21 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".dcm"}
 # ---------------------------------------------------------------------------
 
 def read_image_grayscale(source: Union[str, Path, bytes]) -> Optional[np.ndarray]:
-    """Read an image as 8-bit grayscale, with transparent DICOM support.
-
-    Parameters
-    ----------
-    source : str | Path | bytes
-        File path (any format incl. DICOM) or raw file bytes.
-
-    Returns
-    -------
-    np.ndarray (H, W, dtype=uint8) or None on failure.
-    """
+    """Read an image as 8-bit grayscale, with transparent DICOM support."""
     try:
         if isinstance(source, bytes):
             return _read_bytes_grayscale(source)
         path = Path(source)
-        if path.suffix.lower() == ".dcm":
+        if path.suffix.lower() in {".dcm", ".dicom"}:
             return _read_dicom_grayscale(path)
         img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-        return img  # None if cv2 can't decode
+        return img  
     except Exception as exc:
         logger.error("read_image_grayscale failed for %s: %s", source if not isinstance(source, bytes) else "<bytes>", exc)
         return None
 
 def _decode_dicom_dataset(ds) -> np.ndarray:
-    """Convert a loaded pydicom Dataset to an 8-bit grayscale numpy array.
-
-    Centralises the slope/intercept, VOI windowing, and MONOCHROME1 logic so
-    it is not duplicated between path-based and bytes-based DICOM readers.
-    """
+    """Convert a loaded pydicom Dataset to an 8-bit grayscale numpy array."""
     arr = ds.pixel_array.astype(np.float64)
 
     slope = float(getattr(ds, "RescaleSlope", 1))
@@ -84,16 +104,13 @@ def _decode_dicom_dataset(ds) -> np.ndarray:
 
     return img
 
-
 def _read_dicom_grayscale(path: Path) -> Optional[np.ndarray]:
     """Decode a DICOM file to 8-bit grayscale via pydicom."""
     import pydicom 
     return _decode_dicom_dataset(pydicom.dcmread(path))
 
-
 def _read_bytes_grayscale(data: bytes) -> Optional[np.ndarray]:
     """Decode raw bytes to grayscale — tries DICOM first, then cv2."""
-    # DICOM preamble: 128 bytes + 'DICM' magic at offset 128
     if len(data) > 132 and data[128:132] == b"DICM":
         import pydicom
         import io as _io
@@ -106,57 +123,37 @@ def _read_bytes_grayscale(data: bytes) -> Optional[np.ndarray]:
 DEFAULT_MIN_AREA_RATIO = 0.15
 MIN_ASPECT_RATIO = 0.35
 MAX_ASPECT_RATIO = 3.0
-
-# Bump this when processing logic changes to invalidate cached processed data.
 PROCESSING_VERSION = "v2"
 
-
 # ---------------------------------------------------------------------------
-# Shared processed-data directory resolution (used by train.py & evaluate.py)
+# Shared processed-data directory resolution
 # ---------------------------------------------------------------------------
 
 def _class_names_hash(class_names: list) -> str:
-    """Return a short hash of the class list so a changed disease set busts the cache."""
     key = ",".join(sorted(str(c).lower() for c in class_names))
     return hashlib.sha1(key.encode()).hexdigest()[:6]
 
+def compute_pixel_hash(image_path: Path) -> str:
+    img = read_image_grayscale(image_path)
+    if img is None: return ""
+    return hashlib.sha256(img.tobytes()).hexdigest()
 
 def get_processed_dir_for_size(
     base_processed_dir: str,
     image_size: int,
     class_names: list | None = None,
 ) -> Path:
-    """Construct the processed-data directory for a given image size + class set.
-
-    The directory name encodes both the image size and a hash of the class list
-    so that changing ``system.yaml`` ``model.class_names`` automatically
-    invalidates the old cache.
-
-    This is the **single source of truth** — both ``scripts/train.py`` and
-    ``scripts/evaluate.py`` must import and call this function instead of
-    defining their own variants.
-
-    Examples
-    --------
-    >>> get_processed_dir_for_size("data/processed", 384, ["Normal", "Pneumonia"])
-    PosixPath('data/processed_384_v2_a3f9c1')
-    """
     base = Path(base_processed_dir)
     cls_hash = _class_names_hash(class_names) if class_names else "default"
     return base.parent / f"{base.name}_{image_size}_{PROCESSING_VERSION}_{cls_hash}"
 
-
 def compute_image_hash(image_path: Path) -> str:
-    """Compute SHA-256 hash of image file for duplicate detection."""
+    """Compute SHA-256 hash of image file bytes in chunks to cap memory footprint."""
     hasher = hashlib.sha256()
-    try:
-        with open(image_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                hasher.update(chunk)
-        return hasher.hexdigest()
-    except Exception as e:
-        logging.error(f"Failed to hash {image_path}: {e}")
-        return ""
+    with open(image_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 # ---------------------------------------------------------------------------
 # 1. Core Processing & Filtering Function
@@ -213,8 +210,6 @@ def clean_dark_overlays(
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    mask = np.zeros((h, w), dtype=np.uint8)
-    found_any = False
     
     for cnt in contours:
         area = cv2.contourArea(cnt)
@@ -229,11 +224,8 @@ def clean_dark_overlays(
             continue
         
         if area / (cw * ch) > 0.6:
-            cv2.drawContours(mask, [cnt], -1, 255, -1)
-            found_any = True
-            
-    if found_any:
-        return cv2.inpaint(image, mask, 3, cv2.INPAINT_TELEA)
+            cv2.drawContours(image, [cnt], -1, 0, -1)
+
     return image
 
 
@@ -241,7 +233,7 @@ def process_and_filter_xray(
         input_data: Union[str, Path, np.ndarray], 
         target_size: int = 384,
         min_area_ratio: float = DEFAULT_MIN_AREA_RATIO
-        ) -> Tuple[Optional[np.ndarray], str]:
+        ) -> XrayProcessResult:
     """Smart cropping, artifact cleaning, CLAHE, and resizing to square."""
     if isinstance(input_data, (str, Path)):
         img = read_image_grayscale(input_data)
@@ -249,18 +241,18 @@ def process_and_filter_xray(
         img = input_data if len(input_data.shape) == 2 else cv2.cvtColor(input_data, cv2.COLOR_BGR2GRAY)
             
     if img is None: 
-        return None, "Error: Load Failed (Corrupted or empty file)"
+        return XrayProcessResult(None, ProcessCategory.ERROR, "Load Failed (Corrupted or empty file)")
     if img.std() < 2.0: 
-        return None, f"Error: Image is blank or near-uniform (std={img.std():.2f})"
+        return XrayProcessResult(None, ProcessCategory.ERROR, f"Image is blank or near-uniform (std={img.std():.2f})")
 
     img = clean_dark_overlays(img)
 
     if is_side_by_side_double(img):
-        return None, "Filtered: Side-by-side double image detected"
+        return XrayProcessResult(None, ProcessCategory.FILTERED, "Side-by-side double image detected")
 
-    # Smart Crop
-    mask = cv2.threshold(img, 10, 255, cv2.THRESH_BINARY)[1]
-    mask_white = cv2.threshold(img, 253, 255, cv2.THRESH_BINARY_INV)[1]
+    # Smart Crop (Broadened thresholds for inverse-intensity DICOM safety)
+    mask = cv2.threshold(img, 1, 255, cv2.THRESH_BINARY)[1]
+    mask_white = cv2.threshold(img, 254, 255, cv2.THRESH_BINARY_INV)[1]
     combined_mask = cv2.bitwise_and(mask, mask_white)
 
     coords = cv2.findNonZero(combined_mask)
@@ -269,15 +261,15 @@ def process_and_filter_xray(
         area_ratio = (w * h) / (img.shape[0] * img.shape[1])
         
         if area_ratio < min_area_ratio:
-            return None, f"Filtered: X-ray area too small ({area_ratio:.2f})"
+            return XrayProcessResult(None, ProcessCategory.FILTERED, f"X-ray area too small ({area_ratio:.2f})")
 
         crop_ar = w / h
         if crop_ar < MIN_ASPECT_RATIO or crop_ar > MAX_ASPECT_RATIO:
-            return None, f"Filtered: Abnormal Aspect Ratio ({crop_ar:.2f})"
+            return XrayProcessResult(None, ProcessCategory.FILTERED, f"Abnormal Aspect Ratio ({crop_ar:.2f})")
         
         img = img[y:y+h, x:x+w]
     else:
-        return None, "Filtered: No content detected (Blank image)"
+        return XrayProcessResult(None, ProcessCategory.FILTERED, "No content detected (Blank image)")
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     img = clahe.apply(img)
@@ -294,22 +286,21 @@ def process_and_filter_xray(
     left, right = delta_w // 2, delta_w - (delta_w // 2)
     img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
 
-    return img, "Success"
+    return XrayProcessResult(img, ProcessCategory.SUCCESS, "Success")
+
 
 # ---------------------------------------------------------------------------
 # 2. Visualization Tool
 # ---------------------------------------------------------------------------
 def visualize_crop_step(image_path):
-    """Visualizes the auto-cropping logic for EDA and debugging."""
     img = cv2.imread(str(image_path))
     if img is None:
         print("Could not load image.")
         return
     
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    _, mask_black = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
-    _, mask_white = cv2.threshold(gray, 253, 255, cv2.THRESH_BINARY_INV)
+    _, mask_black = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+    _, mask_white = cv2.threshold(gray, 254, 255, cv2.THRESH_BINARY_INV)
     combined_mask = cv2.bitwise_and(mask_black, mask_white)
 
     coords = cv2.findNonZero(combined_mask)
@@ -337,7 +328,6 @@ def visualize_crop_step(image_path):
     plt.imshow(cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB))
     plt.title(f"3. Final Crop\nNew Size: {cropped_img.shape[:2]}")
     plt.axis('off')
-
     plt.tight_layout()
     plt.show()
 
@@ -346,68 +336,127 @@ def visualize_advanced_processing(image_path):
     if orig is None: return
     
     cleaned = clean_dark_overlays(orig)
-    processed, status = process_and_filter_xray(image_path)
+    result = process_and_filter_xray(image_path)
     
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     axes[0].imshow(orig, cmap='gray'); axes[0].set_title("Original")
     axes[1].imshow(cleaned, cmap='gray'); axes[1].set_title("After Dark Overlay Removal")
-    if processed is not None:
-        axes[2].imshow(processed, cmap='gray'); axes[2].set_title(f"Final (Status: {status})")
+    if result.image is not None:
+        axes[2].imshow(result.image, cmap='gray'); axes[2].set_title(f"Final (Status: {result.reason})")
     else:
-        axes[2].text(0.5, 0.5, f"QUARANTINED\n{status}", ha='center', color='red')
+        axes[2].text(0.5, 0.5, f"QUARANTINED\n{result.reason}", ha='center', color='red')
     
     for ax in axes: ax.axis('off')
     plt.tight_layout(); plt.show()
 
+
 # ---------------------------------------------------------------------------
 # 3. Pipeline Orchestrator
 # ---------------------------------------------------------------------------
-def load_dataset_metadata(raw_dir: Union[Path, str]) -> pd.DataFrame:
-    """Load metadata by scanning raw_dir/{split}/{class}/ for images."""
-    raw_dir = Path(raw_dir)
-    records =[]
-    
-    for split in ["train", "val", "test"]:
-        split_path = raw_dir / split
-        if not split_path.exists():
-            logger.warning("Split directory not found: %s", split_path)
-            continue
-            
-        class_dirs = [d for d in sorted(split_path.iterdir()) if d.is_dir()]
+def load_dataset_metadata(
+    raw_dir: Union[Path, str],
+    mode: Optional[str] = None,
+    *,
+    config: Optional[PipelineConfig] = None,
+) -> pd.DataFrame:
+    if config is not None:
+        mode = config.classification_mode
+    elif mode is None:
+        from xclinvision.config import PipelineConfig as _PC
+        mode = _PC.from_yaml().classification_mode
         
-        for class_dir in tqdm(class_dirs, desc=f"Scanning {split}", leave=False):
+    raw_dir = Path(raw_dir)
+    records: list[dict] = []
 
-            class_name = class_dir.name.lower()
-            
-            img_files = [f for f in class_dir.iterdir() 
-                        if f.is_file() and f.suffix.lower() in IMAGE_EXTS]
-            
-            for img_file in tqdm(img_files, desc=f"  {class_name}", leave=False):
+    if mode == "multilabel":
+        labels_path = raw_dir / "labels.csv"
+        if not labels_path.exists():
+            logger.error("labels.csv not found in %s", raw_dir)
+            return pd.DataFrame(columns=["split", "class", "filepath", "filename"])
+
+        label_df = pd.read_csv(labels_path)
+        valid_filenames = set(label_df["filename"].astype(str))
+
+        for split in ["train", "val", "test"]:
+            split_file = raw_dir / "splits" / f"{split}.txt"
+            if not split_file.exists():
+                logger.warning("Split file not found: %s", split_file)
+                continue
+
+            filenames = [line.strip() for line in split_file.read_text().splitlines() if line.strip()]
+            for fname in tqdm(filenames, desc=f"Scanning {split}", leave=False):
+                if fname not in valid_filenames:
+                    continue
+                img_path = raw_dir / "images" / fname
+                if not img_path.exists():
+                    continue
                 records.append({
-                    "split": split,
-                    "class": class_name,
-                    "filepath": str(img_file),
-                    "filename": img_file.name,
+                    "split": split, "class": "multi",
+                    "filepath": str(img_path), "filename": fname,
                 })
-    
+    else:
+        for split in ["train", "val", "test"]:
+            split_path = raw_dir / split
+            if not split_path.exists():
+                continue
+
+            class_dirs = [d for d in sorted(split_path.iterdir()) if d.is_dir()]
+            for class_dir in tqdm(class_dirs, desc=f"Scanning {split}", leave=False):
+                class_name = class_dir.name.lower()
+                img_files = [f for f in class_dir.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_EXTS]
+                for img_file in tqdm(img_files, desc=f"  {class_name}", leave=False):
+                    records.append({
+                        "split": split, "class": class_name,
+                        "filepath": str(img_file), "filename": img_file.name,
+                    })
+
     df = pd.DataFrame(records, columns=["split", "class", "filepath", "filename"])
-    
+
     if not df.empty:
-        logger.info("Found %d images across %d splits", len(df), df["split"].nunique())
+        logger.info("Found %d images across %d splits (mode=%s)", len(df), df["split"].nunique(), mode)
     else:
         logger.error("No images found in %s!", raw_dir)
-        
+
     return df
 
-@dataclass
-class PipelineReport:
-    total_images: int = 0
-    processed: int = 0
-    quarantined_corrupted: int = 0
-    quarantined_flagged: int = 0
-    duplicates_same_class: int = 0
-    duplicates_cross_class: int = 0
-    duplicates_cross_split: int = 0
+def _process_image_worker(args):
+    """Exception-safe top-level worker for multiprocessing."""
+    row_dict, target_size, min_area_ratio, output_format, processed_dir, quarantine_dir = args
+
+    try:
+        result = process_and_filter_xray(row_dict["filepath"], target_size, min_area_ratio)
+    except Exception as exc:
+        logger.debug("Worker exception on %s: %s", row_dict["filepath"], exc)
+        result = XrayProcessResult(None, ProcessCategory.ERROR, f"Worker exception: {exc}")
+
+    return {
+        "result": result,
+        "row": row_dict,
+        "output_format": output_format,
+        "processed_dir": processed_dir,
+        "quarantine_dir": quarantine_dir,
+    }
+
+
+def _merge_multilabels_into_manifest(manifest_df: pd.DataFrame, labels_path: Path) -> pd.DataFrame:
+    labels_df = pd.read_csv(labels_path)
+    labels_df["_stem"] = labels_df["filename"].apply(lambda x: Path(x).stem)
+    manifest_df = manifest_df.copy()
+    manifest_df["_stem"] = manifest_df["filepath_processed"].apply(lambda x: Path(x).stem)
+
+    label_cols = [c for c in labels_df.columns if c not in ("filename", "_stem")]
+    merged = manifest_df.merge(labels_df[["_stem"] + label_cols], on="_stem", how="left")
+    merged.drop(columns=["_stem"], inplace=True)
+
+    for col in label_cols:
+        if merged[col].isna().any():
+            raise ValueError(f"NaN in label column '{col}' after merge")
+        merged[col] = merged[col].astype(int)
+
+    drop_cols = [c for c in ("class", "source_dataset", "filepath_original") if c in merged.columns] + ["No finding"]
+    merged.drop(columns=drop_cols, inplace=True)
+    return merged
+
 
 def run_processing_pipeline(
     raw_dir: Union[str, Path],
@@ -418,14 +467,24 @@ def run_processing_pipeline(
     min_area_ratio: float = DEFAULT_MIN_AREA_RATIO,
     output_format: str = "png",
     detect_duplicates: bool = True,
+    mode: Optional[str] = None,
+    *,
+    config: Optional[PipelineConfig] = None,
 ) -> PipelineReport:
     
     raw_dir, processed_dir, quarantine_dir = Path(raw_dir), Path(processed_dir), Path(quarantine_dir)
     duplicate_dir = Path(duplicate_dir) if duplicate_dir else processed_dir.parent / "duplicate"
     report = PipelineReport()
+    
+    if config is not None:
+        mode = config.classification_mode
+    elif mode is None:
+        from xclinvision.config import PipelineConfig as _PC
+        mode = _PC.from_yaml().classification_mode
+    is_multilabel = mode == "multilabel"
 
-    logger.info("Scanning raw dataset at %s …", raw_dir)
-    df = load_dataset_metadata(raw_dir)
+    logger.info("Scanning raw dataset at %s (mode=%s) …", raw_dir, mode)
+    df = load_dataset_metadata(raw_dir, mode=mode)
     report.total_images = len(df) 
 
     source_meta_path = raw_dir / "source_metadata.csv"
@@ -446,10 +505,7 @@ def run_processing_pipeline(
     # -------------------------------------------------------------------
     # PHASE 1: Scan, hash, and resolve duplicates BEFORE processing
     # -------------------------------------------------------------------
-    cross_class_hashes: set = set()       
     keeper_filepaths: set = set()          
-    hash_to_entries: dict = {}             
-
     processed_records = []
     quarantine_records = []
     duplicate_records = []
@@ -463,30 +519,22 @@ def run_processing_pipeline(
 
         for img_hash, group_df in df.groupby('hash'):
             entries = group_df.to_dict('records')
-            hash_to_entries[img_hash] = entries
             unique_classes = group_df['class'].unique()
 
-            if len(unique_classes) > 1:
-                cross_class_hashes.add(img_hash)
+            if len(unique_classes) > 1 and not is_multilabel:
                 report.duplicates_cross_class += len(entries)
-                logger.warning(
-                    "Cross-class duplicate (%s): appears in classes %s (%d files)",
-                    entries[0]['filename'], set(unique_classes), len(entries)
-                )
                 for entry in entries:
                     dest = duplicate_dir / "conflicts" / entry['split'] / entry['class'] / entry['filename']
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(entry['filepath'], dest)
                     duplicate_records.append({
-                        "filepath_original": entry['filepath'],
-                        "filepath_duplicate": str(dest),
-                        "split": entry['split'],
-                        "class": entry['class'],
+                        "filepath_original": entry['filepath'], "filepath_duplicate": str(dest),
+                        "split": entry['split'], "class": entry['class'],
                         "reason": f"Cross-class conflict (classes: {', '.join(sorted(unique_classes))})"
                     })
                 continue 
 
-            # --- Same-class duplicates: keep first, move rest ---
+            # Same-class duplicates
             if len(entries) > 1:
                 report.duplicates_same_class += len(entries) - 1
                 keeper = entries[0]
@@ -497,65 +545,67 @@ def run_processing_pipeline(
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(dup_entry['filepath'], dest)
                     duplicate_records.append({
-                        "filepath_original": dup_entry['filepath'],
-                        "filepath_duplicate": str(dest),
-                        "split": dup_entry['split'],
-                        "class": dup_entry['class'],
+                        "filepath_original": dup_entry['filepath'], "filepath_duplicate": str(dest),
+                        "split": dup_entry['split'], "class": dup_entry['class'],
                         "reason": f"Same-class duplicate (kept: {keeper['filename']})"
                     })
             else:
                 keeper_filepaths.add(entries[0]['filepath'])
-    else:
-        keeper_filepaths = set(df['filepath'].tolist())
-
-    # -------------------------------------------------------------------
-    # PHASE 1b: Cross-split leakage guard
-    # -------------------------------------------------------------------
-    if detect_duplicates:
+                
+        # Cross-split leakage guard
         _split_priority = {"train": 0, "val": 1, "test": 2}
         keeper_df = df[df['filepath'].isin(keeper_filepaths)].copy()
         for img_hash, grp in keeper_df.groupby('hash'):
             if grp['split'].nunique() > 1:
-                grp_sorted = grp.sort_values(
-                    'split', key=lambda s: s.map(_split_priority)
-                )
-                keep_fp = grp_sorted.iloc[0]['filepath']
+                grp_sorted = grp.sort_values('split', key=lambda s: s.map(_split_priority))
                 leak_fps = set(grp_sorted.iloc[1:]['filepath'])
                 report.duplicates_cross_split += len(leak_fps)
                 keeper_filepaths -= leak_fps
                 for _, row in grp_sorted.iloc[1:].iterrows():
-                    logger.warning(
-                        "Cross-split duplicate removed: %s (%s/%s) — kept in %s",
-                        row['filename'], row['split'], row['class'],
-                        grp_sorted.iloc[0]['split'],
-                    )
                     dest = duplicate_dir / "cross_split" / row['split'] / row['class'] / row['filename']
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(row['filepath'], dest)
                     duplicate_records.append({
-                        "filepath_original": row['filepath'],
-                        "filepath_duplicate": str(dest),
-                        "split": row['split'],
-                        "class": row['class'],
+                        "filepath_original": row['filepath'], "filepath_duplicate": str(dest),
+                        "split": row['split'], "class": row['class'],
                         "reason": f"Cross-split leak (kept in {grp_sorted.iloc[0]['split']})",
                     })
+    else:
+        keeper_filepaths = set(df['filepath'].tolist())
 
     # -------------------------------------------------------------------
     # PHASE 2: Process the unique / clean set
     # -------------------------------------------------------------------
     df_keepers = df[df['filepath'].isin(keeper_filepaths)].copy()
     logger.info("Processing %d unique images…", len(df_keepers))
-    for _, row in tqdm(df_keepers.iterrows(), total=len(df_keepers), desc="Processing X-rays"):
-        filepath = row["filepath"]
-        processed_img, status = process_and_filter_xray(filepath, target_size, min_area_ratio)
 
-        if processed_img is not None:
+    worker_args = [
+        (row.to_dict(), target_size, min_area_ratio, output_format, str(processed_dir), str(quarantine_dir))
+        for _, row in df_keepers.iterrows()
+    ]
+
+    # I/O heavy process: crank up the workers
+    n_workers = min(12, cpu_count())
+    logger.info("Launching pool with %d workers…", n_workers)
+
+    with Pool(processes=n_workers) as pool:
+        results = list(tqdm(pool.imap(_process_image_worker, worker_args), total=len(worker_args), desc="Processing X-rays"))
+
+    for res in results:
+        row = res["row"]
+        result: XrayProcessResult = res["result"]
+        filepath = row["filepath"]
+
+        if result.category == ProcessCategory.SUCCESS and result.image is not None:
             out_name = f"{Path(row['filename']).stem}.{output_format}"
-            dest = processed_dir / row["split"] / row["class"] / out_name
+            if is_multilabel:
+                dest = processed_dir / "images" / out_name
+            else:
+                dest = processed_dir / row["split"] / row["class"] / out_name
+                
             dest.parent.mkdir(parents=True, exist_ok=True)
-            
-            cv2.imwrite(str(dest), processed_img)
-            
+            cv2.imwrite(str(dest), result.image)
+
             processed_records.append({
                 "filepath_original": filepath,
                 "filepath_processed": str(dest),
@@ -564,26 +614,32 @@ def run_processing_pipeline(
                 "source_dataset": row.get("source_dataset", "unknown"),
             })
             report.processed += 1
-            
-        else:
-            is_error = status.startswith("Error")
-            q_folder = "corrupted" if is_error else "flagged"
-            
-            if is_error: report.quarantined_corrupted += 1
-            else: report.quarantined_flagged += 1
 
-            dest = quarantine_dir / q_folder / row["split"] / row["class"] / row["filename"]
+        else:
+            q_folder = "corrupted" if result.category == ProcessCategory.ERROR else "flagged"
+
+            if result.category == ProcessCategory.ERROR:
+                report.quarantined_corrupted += 1
+            else:
+                report.quarantined_flagged += 1
+
+            if is_multilabel:
+                dest = quarantine_dir / q_folder / row["filename"]
+            else:
+                dest = quarantine_dir / q_folder / row["split"] / row["class"] / row["filename"]
+                
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(filepath, dest) 
-            
+            shutil.copy2(filepath, dest)
+
             quarantine_records.append({
                 "filepath_original": filepath,
                 "filepath_quarantine": str(dest),
                 "split": row["split"],
                 "class": row["class"],
-                "reason": status
+                "reason": result.reason,
             })
 
+    # Save manifests
     if processed_records:
         processed_dir.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(processed_records).to_csv(processed_dir / "manifest.csv", index=False)
@@ -596,20 +652,52 @@ def run_processing_pipeline(
         duplicate_dir.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(duplicate_records).to_csv(duplicate_dir / "duplicate_manifest.csv", index=False)
 
-    print("\n" + "=" * 60)
-    print("PROCESSING PIPELINE COMPLETE")
-    print("=" * 60)
-    unique_count = len(keeper_filepaths)
-    print(f"  Total raw images:              {report.total_images}")
-    print(f"  Cross-class conflicts moved:   {report.duplicates_cross_class}")
-    print(f"  Same-class duplicates moved:   {report.duplicates_same_class}")
-    print(f"  Cross-split leaks removed:     {report.duplicates_cross_split}")
-    print(f"  Unique images to process:      {unique_count}")
-    print("-" * 60)
-    print(f"  Processed (clean):             {report.processed}")
-    print(f"  Quarantined (corrupted):       {report.quarantined_corrupted}")
-    print(f"  Quarantined (flagged):         {report.quarantined_flagged}")
-    print("=" * 60)
+    # Multilabel adjustments
+    if is_multilabel:
+        labels_src = raw_dir / "labels.csv"
+        manifest_path = processed_dir / "manifest.csv"
+        if labels_src.exists() and manifest_path.exists():
+            manifest_df = pd.read_csv(manifest_path)
+            manifest_df = _merge_multilabels_into_manifest(manifest_df, labels_src)
+            manifest_df = manifest_df.sample(frac=1, random_state=42).reset_index(drop=True)
+            manifest_df.to_csv(manifest_path, index=False)
+            logger.info("Merged multilabel targets into %s", manifest_path)
+        splits_src = raw_dir / "splits"
+        if splits_src.exists():
+            dest_splits = processed_dir / "splits"
+            if dest_splits.exists():
+                shutil.rmtree(dest_splits)
+            shutil.copytree(splits_src, dest_splits)
+
+    # Save metadata JSON for reproducibility
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    meta_info = {
+        "processing_version": PROCESSING_VERSION,
+        "target_size": target_size,
+        "min_area_ratio": min_area_ratio,
+        "timestamp": datetime.now().isoformat(),
+        "mode": mode,
+        "report": {
+            "total_images": report.total_images,
+            "processed": report.processed,
+            "quarantined_corrupted": report.quarantined_corrupted,
+            "quarantined_flagged": report.quarantined_flagged,
+            "duplicates_same_class": report.duplicates_same_class,
+            "duplicates_cross_class": report.duplicates_cross_class,
+            "duplicates_cross_split": report.duplicates_cross_split
+        }
+    }
+    with open(processed_dir / "meta.json", "w") as f:
+        json.dump(meta_info, f, indent=2)
+
+    logger.info(
+        "PROCESSING PIPELINE COMPLETE | Processed: %d | Quarantined: %d (Corrupted: %d, Flagged: %d) | Duplicates removed: %d",
+        report.processed,
+        report.quarantined_corrupted + report.quarantined_flagged,
+        report.quarantined_corrupted,
+        report.quarantined_flagged,
+        report.duplicates_same_class + report.duplicates_cross_class + report.duplicates_cross_split
+    )
 
     return report
 
@@ -629,10 +717,16 @@ def main() -> None:
     parser.add_argument("--output-format", type=str, default="png", choices=["png", "jpg"])
     parser.add_argument("--duplicate-dir", type=str, default="data/duplicate", help="Output dir for cross-class duplicate images")
     parser.add_argument("--skip-duplicate-check", action="store_true", help="Skip duplicate detection across splits")
+    parser.add_argument("--mode", type=str, default=None, choices=["multiclass", "multilabel"], help="Override classification_mode from system.yaml")
 
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+
+    from xclinvision.config import PipelineConfig
+    cfg = PipelineConfig.from_yaml()
+    mode = args.mode if args.mode else cfg.classification_mode
+    logger.info("Classification mode: %s", mode)
 
     run_processing_pipeline(
         raw_dir=args.raw_dir,
@@ -642,8 +736,11 @@ def main() -> None:
         target_size=args.target_size,
         min_area_ratio=args.min_area,
         output_format=args.output_format,
-        detect_duplicates=not args.skip_duplicate_check
+        detect_duplicates=not args.skip_duplicate_check,
+        mode=mode,
     )
 
 if __name__ == "__main__":
     main()
+
+

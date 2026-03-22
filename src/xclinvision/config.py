@@ -4,13 +4,18 @@ The single source of truth is ``configs/system.yaml`` under the key
 ``model.class_names``.  Every module that needs class names or the
 class→index mapping should call :func:`get_class_names` /
 :func:`get_class_map` instead of hardcoding values.
+
+Alternatively, create a :class:`PipelineConfig` object and pass it
+into ``ChestXrayDataModule`` / ``XClinVisionModel`` constructors
+for fully injectable, test-friendly configuration.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import yaml
 
@@ -20,6 +25,73 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SYSTEM_CONFIG = _REPO_ROOT / "configs" / "system.yaml"
 
 _FALLBACK_CLASS_NAMES: List[str] = ["Normal", "Pneumonia", "Cardiomegaly"]
+
+
+# ---------------------------------------------------------------------------
+# Injectable config object
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PipelineConfig:
+    """Injectable configuration for the entire pipeline.
+
+    Pass an instance into ``ChestXrayDataModule``, ``XClinVisionModel``,
+    ``MetricsComputer``, etc. to avoid hidden global state.
+    """
+
+    class_names: List[str] = field(default_factory=lambda: list(_FALLBACK_CLASS_NAMES))
+    classification_mode: str = "multilabel"  # "multiclass" or "multilabel"
+    clinical_rules: Dict[str, Dict] = field(default_factory=dict)
+
+    # --- derived helpers (computed, not stored) ---
+    @property
+    def class_map(self) -> Dict[str, int]:
+        return {name.lower(): idx for idx, name in enumerate(self.class_names)}
+
+    @property
+    def num_classes(self) -> int:
+        return len(self.class_names)
+
+    @property
+    def multilabel(self) -> bool:
+        return self.classification_mode == "multilabel"
+
+    @classmethod
+    def from_yaml(cls, config_path: Optional[Path] = None) -> "PipelineConfig":
+        """Load config from a YAML file (defaults to system.yaml)."""
+        path = config_path or _SYSTEM_CONFIG
+        if not path.exists():
+            logger.warning("Config file %s not found — using fallback defaults.", path)
+            return cls()
+
+        try:
+            with open(path, "r") as fh:
+                cfg = yaml.safe_load(fh) or {}
+        except Exception as exc:
+            logger.warning("Failed to read config from %s: %s", path, exc)
+            return cls()
+
+        model_cfg = cfg.get("model", {})
+        names = model_cfg.get("class_names")
+        if not isinstance(names, list) or len(names) < 2:
+            names = list(_FALLBACK_CLASS_NAMES)
+
+        mode = model_cfg.get("classification_mode", "multiclass")
+        if mode not in ("multiclass", "multilabel"):
+            mode = "multiclass"
+            
+        if mode == "multilabel":
+            names = [n for n in names if n.lower() != 'no finding']
+
+        raw_rules = cfg.get("clinical_rules")
+        rules = {k.lower(): v for k, v in raw_rules.items()} if isinstance(raw_rules, dict) else {}
+
+        return cls(class_names=names, classification_mode=mode, clinical_rules=rules)
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton (backward compatible)
+# ---------------------------------------------------------------------------
 
 _cached_class_names: List[str] | None = None
 
@@ -39,7 +111,10 @@ def get_class_names() -> List[str]:
             with open(_SYSTEM_CONFIG, "r") as fh:
                 cfg = yaml.safe_load(fh) or {}
             names = cfg.get("model", {}).get("class_names")
+            mode = cfg.get("model", {}).get("classification_mode", "multiclass")
             if isinstance(names, list) and len(names) >= 2:
+                if mode == "multilabel":
+                    names = [n for n in names if n.lower() != 'no finding']
                 _cached_class_names = names
                 return list(_cached_class_names)
         except Exception as exc:
@@ -72,7 +147,7 @@ _cached_classification_mode: str | None = None
 def get_classification_mode() -> str:
     """Return the classification mode from ``configs/system.yaml``.
 
-    Supported values: ``"multiclass"`` (default) or ``"multilabel"``.
+    Supported values: ``"multiclass"`` or ``"multilabel"`` (default).
     """
     global _cached_classification_mode
     if _cached_classification_mode is not None:
@@ -82,7 +157,7 @@ def get_classification_mode() -> str:
         try:
             with open(_SYSTEM_CONFIG, "r") as fh:
                 cfg = yaml.safe_load(fh) or {}
-            mode = cfg.get("model", {}).get("classification_mode", "multiclass")
+            mode = cfg.get("model", {}).get("classification_mode", "multilabel")
             if mode in ("multiclass", "multilabel"):
                 _cached_classification_mode = mode
                 return _cached_classification_mode

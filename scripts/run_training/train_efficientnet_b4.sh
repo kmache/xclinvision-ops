@@ -18,8 +18,8 @@ python3 scripts/train.py \
   --config  configs/efficientnet_b4.yaml \
   --model   efficientnet_b4 \
   --epochs  50 \
-  --batch-size 16 \
-  --image-size  512 \
+  --batch-size 32 \
+  --image-size  384 \
   --lr      1e-4 \
   --loss    focal \
   --weight-decay 1e-4 \

@@ -355,61 +355,117 @@ class CalibrationAnalyzer:
         self,
         y_true: np.ndarray,
         y_probs: np.ndarray,
+        multilabel: bool = False,
     ) -> float:
         """Compute Expected Calibration Error.
 
-        Partitions samples into confidence bins; ECE is the weighted mean
-        absolute difference between average confidence and average accuracy
-        within each bin.
+        For multiclass: partitions samples into confidence bins based on
+        argmax probability.
+        For multilabel: computes per-label binary ECE and returns the mean.
 
         Args:
-            y_true: Ground-truth integer labels, shape (N,).
+            y_true: Ground-truth labels. Shape (N,) for multiclass or (N, C) for multilabel.
             y_probs: Predicted probabilities, shape (N, num_classes).
+            multilabel: If True, treat as multilabel binary calibration.
 
         Returns:
             ECE ∈ [0, 1] (lower is better-calibrated).
         """
+        if multilabel:
+            return self._compute_ece_multilabel(y_true, y_probs)
+
         y_pred      = np.argmax(y_probs, axis=1)
         confidences = np.max(y_probs, axis=1)
         accuracies  = (y_pred == y_true).astype(float)
 
+        return self._bin_ece(confidences, accuracies)
+
+    def _compute_ece_multilabel(
+        self,
+        y_true: np.ndarray,
+        y_probs: np.ndarray,
+    ) -> float:
+        """Compute mean per-label binary ECE for multilabel classification."""
+        num_labels = y_probs.shape[1]
+        eces = []
+        for c in range(num_labels):
+            confidences = y_probs[:, c]
+            accuracies = (y_true[:, c] == (confidences >= 0.5).astype(int)).astype(float)
+            eces.append(self._bin_ece(confidences, accuracies))
+        return float(np.mean(eces))
+
+    def _bin_ece(self, confidences: np.ndarray, accuracies: np.ndarray) -> float:
+        """Compute binned ECE from confidence and accuracy arrays."""
         bin_boundaries = np.linspace(0, 1, self.num_bins + 1)
         ece = 0.0
-
+        n = len(confidences)
         for i in range(self.num_bins):
             lo, hi = bin_boundaries[i], bin_boundaries[i + 1]
-            in_bin  = (confidences >= lo) & (confidences <= hi) if i == 0 else (confidences > lo) & (confidences <= hi)
-            bin_n   = int(np.sum(in_bin))
+            in_bin = (confidences >= lo) & (confidences <= hi) if i == 0 else (confidences > lo) & (confidences <= hi)
+            bin_n = int(np.sum(in_bin))
             if bin_n > 0:
                 avg_conf = float(np.mean(confidences[in_bin]))
                 avg_acc  = float(np.mean(accuracies[in_bin]))
-                ece += (bin_n / len(y_true)) * abs(avg_conf - avg_acc)
-
+                ece += (bin_n / n) * abs(avg_conf - avg_acc)
         return ece
 
     def compute_calibration_curve(
         self,
         y_true: np.ndarray,
         y_probs: np.ndarray,
+        multilabel: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute reliability diagram data.
+
+        For multilabel, averages per-label binary calibration curves.
 
         Returns:
             bin_centers   (num_bins,) – mid-point of each confidence bin
             bin_accuracies(num_bins,) – mean accuracy within each bin
             bin_counts    (num_bins,) – number of samples in each bin
         """
+        if multilabel:
+            return self._calibration_curve_multilabel(y_true, y_probs)
+
         y_pred      = np.argmax(y_probs, axis=1)
         confidences = np.max(y_probs, axis=1)
         accuracies  = (y_pred == y_true).astype(float)
 
+        return self._bin_calibration_curve(confidences, accuracies)
+
+    def _calibration_curve_multilabel(
+        self,
+        y_true: np.ndarray,
+        y_probs: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Average per-label binary calibration curves for multilabel."""
+        num_labels = y_probs.shape[1]
+        all_accs = np.zeros(self.num_bins)
+        all_counts = np.zeros(self.num_bins, dtype=int)
+        centers = None
+        for c in range(num_labels):
+            confidences = y_probs[:, c]
+            accuracies = (y_true[:, c] == (confidences >= 0.5).astype(int)).astype(float)
+            bc, ba, bn = self._bin_calibration_curve(confidences, accuracies)
+            centers = bc
+            all_accs += ba * bn
+            all_counts += bn
+        safe_counts = np.maximum(all_counts, 1)
+        return centers, all_accs / safe_counts, all_counts
+
+    def _bin_calibration_curve(
+        self,
+        confidences: np.ndarray,
+        accuracies: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Compute binned calibration curve from confidence and accuracy arrays."""
         bin_boundaries = np.linspace(0, 1, self.num_bins + 1)
         bin_centers, bin_accuracies, bin_counts = [], [], []
 
         for i in range(self.num_bins):
             lo, hi = bin_boundaries[i], bin_boundaries[i + 1]
-            in_bin  = (confidences >= lo) & (confidences <= hi) if i == 0 else (confidences > lo) & (confidences <= hi)
-            bin_n   = int(np.sum(in_bin))
+            in_bin = (confidences >= lo) & (confidences <= hi) if i == 0 else (confidences > lo) & (confidences <= hi)
+            bin_n = int(np.sum(in_bin))
             midpoint = float((lo + hi) / 2)
             bin_centers.append(midpoint)
             bin_accuracies.append(float(np.mean(accuracies[in_bin])) if bin_n > 0 else 0.0)
@@ -523,4 +579,84 @@ class TemperatureScaler:
         self._is_fitted = True
         logger.info(f"TemperatureScaler loaded: T = {self.temperature:.4f}")
 
-        
+
+# ---------------------------------------------------------------------------
+# Per-class Threshold Optimization (multilabel)
+# ---------------------------------------------------------------------------
+
+class ThresholdOptimizer:
+    """Find optimal per-class decision thresholds for multilabel classification.
+
+    Searches a grid of thresholds per class to maximise per-class F1 on a
+    validation set.  Results are saved as a JSON sidecar file alongside model
+    weights.
+    """
+
+    def __init__(self, class_names: Optional[List[str]] = None):
+        from xclinvision.config import get_class_names
+        self.class_names = class_names or get_class_names()
+        self.thresholds: Dict[str, float] = {n: 0.5 for n in self.class_names}
+        self._is_fitted: bool = False
+
+    def fit(
+        self,
+        y_true: np.ndarray,
+        y_probs: np.ndarray,
+        search_range: Tuple[float, float] = (0.1, 0.9),
+        num_steps: int = 81,
+    ) -> Dict[str, float]:
+        """Search for optimal per-class thresholds that maximise F1.
+
+        Args:
+            y_true: Binary ground-truth matrix, shape (N, num_classes).
+            y_probs: Predicted probabilities, shape (N, num_classes).
+            search_range: Min/max threshold to search.
+            num_steps: Number of threshold candidates per class.
+
+        Returns:
+            Dict mapping class name → optimal threshold.
+        """
+        from sklearn.metrics import f1_score as _f1
+
+        candidates = np.linspace(search_range[0], search_range[1], num_steps)
+        best: Dict[str, float] = {}
+
+        for i, name in enumerate(self.class_names):
+            best_f1, best_t = -1.0, 0.5
+            for t in candidates:
+                preds = (y_probs[:, i] >= t).astype(int)
+                f1 = float(_f1(y_true[:, i], preds, zero_division=0))
+                if f1 > best_f1:
+                    best_f1, best_t = f1, float(t)
+            best[name] = round(best_t, 4)
+            logger.info(f"  {name}: threshold={best_t:.4f}  F1={best_f1:.4f}")
+
+        self.thresholds = best
+        self._is_fitted = True
+        return best
+
+    def apply(self, y_probs: np.ndarray) -> np.ndarray:
+        """Apply optimised thresholds to probability matrix.
+
+        Args:
+            y_probs: shape (N, num_classes).
+
+        Returns:
+            Binary predictions (N, num_classes).
+        """
+        thresholds = np.array([self.thresholds[n] for n in self.class_names])
+        return (y_probs >= thresholds).astype(int)
+
+    def save(self, path: str) -> None:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as f:
+            json.dump({"thresholds": self.thresholds}, f, indent=2)
+        logger.info(f"ThresholdOptimizer saved to {p}")
+
+    def load(self, path: str) -> None:
+        with open(path) as f:
+            data = json.load(f)
+        self.thresholds = data["thresholds"]
+        self._is_fitted = True
+        logger.info(f"ThresholdOptimizer loaded: {self.thresholds}")

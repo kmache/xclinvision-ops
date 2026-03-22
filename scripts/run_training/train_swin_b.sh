@@ -18,8 +18,8 @@ python3 scripts/train.py \
   --config  configs/swin_b.yaml \
   --model   swin_b \
   --epochs  50 \
-  --batch-size 16 \
-  --image-size  512 \
+  --batch-size 32 \
+  --image-size  384 \
   --lr      5e-5 \
   --loss    focal \
   --weight-decay 1e-4 \

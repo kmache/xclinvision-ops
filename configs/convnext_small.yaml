@@ -4,34 +4,51 @@ type: cnn
 architecture:
   backbone: convnext_small
   pretrained: true
-  # num_classes: NOT set here — derived at runtime from system.yaml model.class_names
   dropout_rate: 0.3
-  head:
-    type: sequential
-    layers:
-      - type: adaptive_avg_pool2d
-        output_size: [1, 1]
-      - type: flatten
-      - type: linear
-        in_features: 768
-        out_features: 512
-      - type: relu
-      - type: dropout
-        p: 0.3
-      - type: linear
-        in_features: 512
-        # out_features: NOT set here — determined at build time from system.yaml model.class_names
+  target_layer: stages.3  # For XAI
+
+input:
+  size: [384, 384]
+
+training:  # ← Add these
+  batch_size: 32
+  lr: 1e-4
+  weight_decay: 1e-4
+  label_smoothing: 0.15
+  loss: focal
 
 transfer_learning:
   freeze_backbone: false
   differential_lr:
     enabled: true
-    backbone_lr: 1.0e-5
-    head_lr: 1.0e-4
-
-input:
-  size: [384, 384]
+    backbone_lr: 1e-5
+    head_lr: 1e-4
 
 explainability:
   method: gradcam++
-  target_layer: stages.3
+
+
+
+# name: convnext_small
+# type: cnn
+
+# architecture:
+#   backbone: convnext_small
+#   pretrained: true
+#   # num_classes: NOT set here — derived at runtime from system.yaml model.class_names
+#   dropout_rate: 0.3
+#   # head: managed by timm — no custom head definition needed
+
+# transfer_learning:
+#   freeze_backbone: false
+#   differential_lr:
+#     enabled: true
+#     backbone_lr: 1.0e-5
+#     head_lr: 1.0e-4
+
+# input:
+#   size: [384, 384]
+
+# explainability:
+#   method: gradcam++
+#   target_layer: stages.3

@@ -18,9 +18,9 @@ python3 scripts/train.py \
   --config  configs/convnext_small.yaml \
   --model   convnext_small \
   --epochs  50 \
-  --batch-size 16 \
-  --image-size  512 \
-  --lr      1e-4 \
+  --batch-size 32 \
+  --image-size  384 \
+  --lr      5e-4 \
   --loss    focal \
   --weight-decay 1e-4 \
   --label-smoothing 0.15 \

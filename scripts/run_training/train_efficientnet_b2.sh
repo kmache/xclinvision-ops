@@ -18,12 +18,12 @@ python3 scripts/train.py \
   --config  configs/efficientnet_b2.yaml \
   --model   efficientnet_b2 \
   --epochs  50 \
-  --batch-size 16 \
-  --image-size  512 \
-  --lr      1e-4 \
-  --loss    focal \
+  --batch-size 24 \
+  --image-size  384 \
+  --lr      5e-4 \
+  --loss    ce \
   --weight-decay 1e-4 \
-  --label-smoothing 0.15 \
+  --accumulate-grad-batches 3 \
   --output-dir models \
   --num-workers 4 \
   --seed    42 \

@@ -7,22 +7,7 @@ architecture:
   pretrained: true
   # num_classes: NOT set here — derived at runtime from system.yaml model.class_names
   dropout_rate: 0.2
-  head:
-    type: sequential
-    layers:
-      - type: layernorm
-        normalized_shape: 512
-      - type: dropout
-        p: 0.2
-      - type: linear
-        in_features: 512  # BiomedCLIP vision feature dim
-        out_features: 256
-      - type: relu
-      - type: dropout
-        p: 0.2
-      - type: linear
-        in_features: 256
-        # out_features: NOT set here — determined at build time from system.yaml model.class_names
+  # head: managed by timm — no custom head definition needed
 
 transfer_learning:
   freeze_vision_encoder: false

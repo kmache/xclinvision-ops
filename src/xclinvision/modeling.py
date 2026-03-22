@@ -1,134 +1,134 @@
 """Model architectures for Chest X-ray Classification.
-modeling.py - Defines all model architectures, including custom BiomedCLIP wrapper, 
+modeling.py - Defines all TIMM model architectures, 
 ensemble logic, and advanced progressive unfreezing utilities.
 """
 
 import logging
-import types
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any
+from xml.parsers.expat import model
 
 import torch
 import torch.nn as nn
 import timm
-
-try:
-    import open_clip
-    OPEN_CLIP_AVAILABLE = True
-except ImportError:
-    OPEN_CLIP_AVAILABLE = False
+from timm.data import resolve_data_config
 
 logger = logging.getLogger(__name__)
 
-TIMM_MODEL_MAP = {
-    "densenet": "densenet121",
-    "resnet50": "resnet50",
-    "efficientnet_b0": "efficientnet_b0",
-    "efficientnet_b2": "efficientnet_b2",
-    "efficientnet_b3": "efficientnet_b3",
-    "efficientnet_b4": "efficientnet_b4",
-    "convnext_tiny": "convnext_tiny",
-    "convnext_small": "convnext_small",
-    "vit_tiny": "vit_tiny_patch16_224",
-    "vit_small": "vit_small_patch16_224",
-    "vit_base": "vit_base_patch16_224",
-    "swin_t": "swin_tiny_patch4_window7_224",
-    "swin_s": "swin_small_patch4_window7_224",
-    "swin_b": "swin_base_patch4_window7_224",
+# Model registry with architecture-specific metadata
+MODEL_REGISTRY = {
+    "densenet": {
+        "timm_name": "densenet121",
+        "default_img_size": 224,
+        "head_type": "linear",
+        "progressive": True,
+        "gradcam_target": "features",
+    },
+    "resnet50": {
+        "timm_name": "resnet50",
+        "default_img_size": 224,
+        "head_type": "linear",
+        "progressive": True,
+        "gradcam_target": "layer4",
+    },
+    "efficientnet_b0": {
+        "timm_name": "efficientnet_b0",
+        "default_img_size": 224,
+        "head_type": "linear",
+        "progressive": True,
+        "gradcam_target": "blocks",
+    },
+    "efficientnet_b2": {
+        "timm_name": "efficientnet_b2.ra_in1k",
+        "default_img_size": 260,
+        "head_type": "linear",
+        "progressive": True,
+        "gradcam_target": "blocks",
+    },
+    "efficientnet_b3": {
+        "timm_name": "efficientnet_b3",
+        "default_img_size": 300,
+        "head_type": "linear",
+        "progressive": True,
+        "gradcam_target": "blocks",
+    },
+    "efficientnet_b4": {
+        "timm_name": "efficientnet_b4",
+        "default_img_size": 380,
+        "head_type": "linear",
+        "progressive": True,
+        "gradcam_target": "blocks",
+    },
+    "convnext_tiny": {
+        "timm_name": "convnext_tiny",
+        "default_img_size": 224,
+        "head_type": "linear",
+        "progressive": True,
+        "gradcam_target": "stages[-1].blocks[-1]",
+    },
+    "convnext_small": {
+        "timm_name": "convnext_small.fb_in22k_ft_in1k_384",
+        "default_img_size": 384,
+        "head_type": "linear",
+        "progressive": True,
+        "gradcam_target": "stages[-1].blocks[-1]",
+    },
+    "vit_tiny": {
+        "timm_name": "vit_tiny_patch16_224",
+        "default_img_size": 224,
+        "head_type": "linear",
+        "progressive": True,
+        "gradcam_target": "blocks[-1].attn.qkv",
+    },
+    "vit_small": {
+        "timm_name": "vit_small_patch16_224",
+        "default_img_size": 224,
+        "head_type": "linear",
+        "progressive": True,
+        "gradcam_target": "blocks[-1].attn.qkv",
+    },
+    "vit_base": {
+        "timm_name": "vit_base_patch16_224",
+        "default_img_size": 224,
+        "head_type": "linear",
+        "progressive": True,
+        "gradcam_target": "blocks[-1].attn.qkv",
+    },
+    "swin_t": {
+        "timm_name": "swin_tiny_patch4_window7_224",
+        "default_img_size": 224,
+        "head_type": "linear",
+        "progressive": True,
+        "gradcam_target": "layers[-1].blocks[-1].attn.qkv",
+    },
+    "swin_s": {
+        "timm_name": "swin_small_patch4_window7_224",
+        "default_img_size": 224,
+        "head_type": "linear",
+        "progressive": True,
+        "gradcam_target": "layers[-1].blocks[-1].attn.qkv",
+    },
+    "swin_b": {
+        "timm_name": "swin_base_patch4_window7_224",
+        "default_img_size": 224,
+        "head_type": "linear",
+        "progressive": True,
+        "gradcam_target": "layers[-1].blocks[-1].attn.qkv",
+    },
 }
 
-class BiomedCLIPClassifier(nn.Module):
-    """
-    Custom wrapper for Microsoft's BiomedCLIP.
-    Extracts the pre-trained Vision Transformer from the CLIP model
-    and adds a linear classification head with ``num_classes`` outputs.
-    """
-    
-    def __init__(self, num_classes: int = 3, pretrained: bool = True, dropout: float = 0.2):
-        super().__init__()
-        
-        self.num_classes = num_classes
-        
-        if not OPEN_CLIP_AVAILABLE:
-            raise ImportError(
-                "open_clip is required for BiomedCLIP. "
-                "Install with: pip install open_clip_torch"
-            )
-        
-        logger.info("Loading Microsoft BiomedCLIP foundation model...")
-        hub_id = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
-        
-        try:
-            if pretrained:
-                model, _, _ = open_clip.create_model_and_transforms(hub_id)
-            else:
-                model = open_clip.create_model('ViT-B-16', pretrained=False)
-            self.vision_encoder = model.visual
-        except Exception as e:
-            logger.error(f"Failed to load BiomedCLIP: {e}")
-            raise
-        
-        dummy_input = torch.zeros(1, 3, 224, 224)
-        with torch.no_grad():
-            feat_dim = self.vision_encoder(dummy_input).shape[-1]
-            
-        self.head = nn.Sequential(
-            nn.Dropout(p=dropout),
-            nn.Linear(feat_dim, num_classes)
-        )
-        
-        self._target_layer = self._find_target_layer()
-        
-        if not pretrained:
-            self._random_init()
-    
-    def _find_target_layer(self) -> Optional[nn.Module]:
-        """Find the last attention block for visualization."""
-        try:
-            if hasattr(self.vision_encoder, 'transformer'):
-                blocks = list(self.vision_encoder.transformer.resblocks.children())
-                if blocks:
-                    last_block = blocks[-1]
-                    return getattr(last_block, 'attn', last_block)
-            
-            elif hasattr(self.vision_encoder, 'blocks'):
-                last_block = self.vision_encoder.blocks[-1]
-                return getattr(last_block, 'attn', last_block)
-            
-            for name, module in reversed(list(self.vision_encoder.named_modules())):
-                if 'attn' in name.lower() and hasattr(module, 'qkv'):
-                    return module
-            return None
-        except Exception as e:
-            logger.warning(f"Error finding target layer for BiomedCLIP: {e}")
-            return None
-    
-    def _random_init(self):
-        """Randomly initialize vision encoder."""
-        if hasattr(self.vision_encoder, 'init_parameters'):
-            self.vision_encoder.init_parameters()
-        else:
-            for param in self.vision_encoder.parameters():
-                if param.dim() > 1:
-                    nn.init.xavier_uniform_(param)
-                else:
-                    nn.init.zeros_(param)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[-1] != 224 or x.shape[-2] != 224:
-            x = torch.nn.functional.interpolate(x, size=(224, 224), mode='bicubic', align_corners=False)
-        features = self.vision_encoder(x)
-        return self.head(features)
-    
-    def get_gradcam_target(self) -> Optional[nn.Module]:
-        return self._target_layer
+# Future-proofing: per-architecture normalization overrides
+CUSTOM_NORMS = {
+    "cxr_custom": {"mean": (0.505,), "std": (0.252,)}  # Example for 1-channel CXR
+}
 
 
 class EnsembleClassifier(nn.Module):
     """
     Ensemble of multiple models for robust predictions.
-    Supports 'average' (logits) and 'vote' (probabilities) methods.
+    Outputs logits for consistent loss and metric computation.
     """
-    def __init__(self, models: List[nn.Module], method: str = 'average', weights: Optional[List[float]] = None, img_size: int = 224):
+    def __init__(self, models: List[nn.Module], method: str = 'average', 
+                 weights: Optional[List[float]] = None):
         super().__init__()
         if not models:
             raise ValueError("At least one model required for ensemble")
@@ -136,12 +136,11 @@ class EnsembleClassifier(nn.Module):
         self.models = nn.ModuleList(models)
         self.method = method.lower()
         self.weights = weights
-        self.img_size = img_size
         
-        if self.method not in ['average', 'vote', 'weighted']:
-            raise ValueError(f"Method must be 'average', 'vote', or 'weighted', got {method}")
+        if self.method not in ['average', 'weighted']:
+            raise ValueError(f"Method must be 'average' or 'weighted', got '{method}'")
 
-        if self.method == 'weighted' and weights is None:
+        if self.method == 'weighted' and not weights:
             raise ValueError("weights must be provided when method='weighted'")
         
         if weights is not None:
@@ -150,127 +149,185 @@ class EnsembleClassifier(nn.Module):
             if abs(sum(weights) - 1.0) > 1e-4:
                 raise ValueError(f"Weights must sum to 1.0, got {sum(weights):.4f}")
         
-        self._validate_models()
-    
-    def _validate_models(self):
-        first_model = self.models[0]
-        device = next(first_model.parameters()).device if list(first_model.parameters()) else torch.device('cpu')
-        dummy_input = torch.randn(1, 3, self.img_size, self.img_size, device=device)
-        
-        with torch.no_grad():
-            first_output = first_model(dummy_input)
-        
-        self.num_classes = first_output.shape[-1]
-        
-        for i, model in enumerate(self.models[1:], 1):
-            with torch.no_grad():
-                output = model(dummy_input)
-            if output.shape[-1] != self.num_classes:
-                raise ValueError(f"Model {i} output size {output.shape[-1]} != {self.num_classes}")
-        
-        logger.info(f"Ensemble validated: {len(self.models)} models, {self.num_classes} classes")
-    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         predictions = [model(x) for model in self.models]
-        
+        stacked = torch.stack(predictions, dim=0)
+
         if self.method == 'average':
-            stacked = torch.stack(predictions, dim=0)
             return stacked.mean(dim=0)
-        
         elif self.method == 'weighted' and self.weights is not None:
-            stacked = torch.stack(predictions, dim=0)
-            weights_tensor = torch.tensor(self.weights, device=x.device).view(-1, 1, 1)
+            shape = [-1] + [1] * (stacked.ndim - 1)
+            weights_tensor = torch.tensor(self.weights, device=x.device, dtype=stacked.dtype).view(*shape)
             return (stacked * weights_tensor).sum(dim=0)
         
-        else:  # vote
-            probs = torch.stack([torch.softmax(p, dim=1) for p in predictions], dim=0)
-            avg_probs = probs.mean(dim=0)
-            return torch.log(avg_probs + 1e-10)
+        # Fallback
+        return stacked.mean(dim=0)
     
     def get_individual_predictions(self, x: torch.Tensor) -> List[torch.Tensor]:
         return [model(x) for model in self.models]
 
+
 def build_model(
     model_name: str = "densenet", 
-    num_classes: int = 3, 
+    num_classes: int = 4, 
     pretrained: bool = True,
-    dropout: float = 0.2,
+    dropout: float = 0.4,
     drop_path_rate: Optional[float] = None,
-    img_size: int = 224
+    img_size: Optional[int] = None,
+    classification_mode: str = "multilabel",
 ) -> nn.Module:
-    """Factory function to build state-of-the-art architectures."""
+    """Factory function to build state-of-the-art architectures.
+    
+    Supports both multilabel and multiclass classification:
+      - multilabel: classifier bias initialised to -2.0 so sigmoid outputs
+        start low (~0.12), preventing dead gradients with Focal / BCE loss.
+      - multiclass: default (zero) bias is kept — softmax is shift-invariant
+        so the value has no effect, and zero is the cleaner convention.
+    """
     model_name = model_name.lower().strip()
     
-    if model_name == "biomedclip":
-        return BiomedCLIPClassifier(num_classes=num_classes, pretrained=pretrained, dropout=dropout)
-    
-    if model_name not in TIMM_MODEL_MAP:
-        available = list(TIMM_MODEL_MAP.keys()) + ['biomedclip']
+    if model_name not in MODEL_REGISTRY:
+        available = list(MODEL_REGISTRY.keys())
         raise ValueError(f"Model '{model_name}' not supported. Choose from: {available}")
     
-    timm_name = TIMM_MODEL_MAP[model_name]
-    logger.info(f"Building {timm_name} (pretrained={pretrained})...")
+    metadata = MODEL_REGISTRY[model_name]
+    timm_name = metadata["timm_name"]
+    final_img_size = img_size or metadata["default_img_size"]
+
+    logger.info(f"Building {timm_name} (pretrained={pretrained}, img_size={final_img_size})...")
     
-    model_kwargs = {
+    model_kwargs: Dict[str, Any] = {
         "pretrained": pretrained,
         "num_classes": num_classes,
-        "drop_rate": dropout,
+        # drop_rate MUST be 0 — the custom classifier head already
+        # contains Dropout(dropout).  timm applies drop_rate as a
+        # SECOND dropout in forward_head / ClassifierHead, giving an
+        # effective ~64% drop rate that cripples learning.
+        "drop_rate": 0.0,
     }
     
-    is_transformer = any(x in model_name for x in ['vit', 'swin', 'deit', 'convnext'])
-    if is_transformer:
-        if drop_path_rate is None:
-            drop_path_rate = 0.1
-        model_kwargs["drop_path_rate"] = drop_path_rate
-        logger.info(f"Using drop_path_rate={drop_path_rate} for {model_name}")
+    # Heuristics for modern architectures utilizing drop_path_rate
+    modern_archs = ['vit', 'swin', 'deit', 'convnext', 'xcit', 'cait']
+    is_modern = any(x in model_name for x in modern_archs)
+    
+    if is_modern:
+        # If not explicitly set, use a conservative fraction of the dropout rate
+        model_kwargs["drop_path_rate"] = drop_path_rate if drop_path_rate is not None else (dropout * 0.1)
+        logger.info(f"Using drop_path_rate={model_kwargs['drop_path_rate']} for {model_name}")
         
+    # Certain timm models (ViT/Swin/DeiT) accept img_size on creation to interpolate positional embeddings natively
     if any(x in model_name for x in ['vit', 'swin', 'deit']):
-        model_kwargs["img_size"] = img_size
+        model_kwargs["img_size"] = final_img_size
     
     try:
         model = timm.create_model(timm_name, **model_kwargs)
+
+        # Build a custom multi-layer classifier and swap it into the
+        # existing head structure.  This preserves any pooling / norm
+        # layers that timm wraps around the final Linear (critical for
+        # ConvNeXt, Swin, etc. whose ClassifierHead does global-pool
+        # before the fc layer).
+        in_features = model.num_features
+        custom_fc = nn.Sequential(
+            nn.Linear(in_features, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(512, num_classes),
+        )
+        _replace_classifier(model, custom_fc)
+
+        # Resolve what TIMM expects vs what we asked for (Crucial for CNNs that don't take img_size on init)
+        try:
+            data_cfg = resolve_data_config(model.default_cfg, model=model)
+            native_size = data_cfg.get('input_size', (3, 224, 224))[-1]
+            if final_img_size != native_size:
+                logger.warning(
+                    f"Requested img_size {final_img_size} differs from native resolution {native_size}. "
+                    "Ensure Datasets/Transforms resize the images appropriately."
+                )
+        except Exception as e:
+            logger.debug(f"Could not resolve data config for {timm_name}: {e}")
+
     except Exception as e:
         logger.error(f"Failed to create {timm_name}: {e}")
         raise
     
     model.num_classes = num_classes
-    _add_gradcam_support(model, model_name)
-    
+    model._img_size = final_img_size
+    model._metadata = metadata
+
+    # NOTE: Classifier bias is NOT initialised here.  The training module
+    # (XClinVisionModel) applies the bias init AFTER the loss function is
+    # known, because the optimal bias depends on the loss type:
+    #   - BCE / BCEWithLogitsLoss: bias = -2.0  (sigmoid starts ~0.12,
+    #     avoids dead gradients when most targets are 0).
+    #   - Focal loss: bias = 0.0  (sigmoid starts at 0.5, ensuring
+    #     equal focal weighting for positive and negative samples;
+    #     bias=-2.0 would suppress 96% of the negative gradient).
+
     return model
 
-def _add_gradcam_support(model: nn.Module, architecture: str):
-    """Monkey-patch Grad-CAM support securely using types.MethodType."""
-    target = None
-    if any(x in architecture for x in ['resnet', 'densenet', 'efficientnet', 'convnext', 'mobilenet']):
-        target = next((m for m in reversed(list(model.modules())) if isinstance(m, nn.Conv2d)), None)
-    elif any(x in architecture for x in ['vit', 'swin']):
-        target = _find_transformer_attention(model)
 
-    if target:
-        model.get_gradcam_target = types.MethodType(lambda self: target, model)
-        logger.debug(f"Grad-CAM target bound to {target.__class__.__name__}")
+def _replace_classifier(model: nn.Module, new_classifier: nn.Module) -> None:
+    """Replace only the final classifier inside a timm model's head.
+
+    Handles the different head layouts across timm architectures:
+      - ClassifierHead with ``.fc``  (ConvNeXt, Swin, newer ViT)
+      - Plain ``nn.Linear`` as ``model.head``  (older ViT / DeiT)
+      - ``model.fc``  (ResNet)
+      - ``model.classifier``  (EfficientNet, DenseNet)
+    """
+    if hasattr(model, 'head'):
+        if hasattr(model.head, 'fc'):
+            model.head.fc = new_classifier
+            return
+        if isinstance(model.head, nn.Linear):
+            model.head = new_classifier
+            return
+    if hasattr(model, 'fc') and isinstance(model.fc, nn.Linear):
+        model.fc = new_classifier
+        return
+    if hasattr(model, 'classifier') and isinstance(model.classifier, nn.Linear):
+        model.classifier = new_classifier
+        return
+    raise RuntimeError(
+        f"Could not locate classifier layer in {type(model).__name__}. "
+        "Manual integration required."
+    )
+
+
+def _init_classifier_bias(model: nn.Module, bias_value: float = -2.0) -> None:
+    """Initialize the final classifier bias of the custom head."""
+    last_linear = None
+
+    # Locate the classifier module (may be a Sequential or a plain Linear)
+    clf = None
+    try:
+        clf = model.get_classifier() if hasattr(model, 'get_classifier') else None
+    except (AttributeError, TypeError):
+        pass
+    if clf is None:
+        for attr in ('head', 'fc', 'classifier'):
+            candidate = getattr(model, attr, None)
+            if candidate is not None:
+                clf = candidate
+                break
+
+    if clf is not None:
+        if isinstance(clf, nn.Linear):
+            last_linear = clf
+        else:
+            for sub in reversed(list(clf.modules())):
+                if isinstance(sub, nn.Linear):
+                    last_linear = sub
+                    break
+
+    if last_linear is not None and last_linear.bias is not None:
+        nn.init.constant_(last_linear.bias, bias_value)
+        logger.info(f"Initialized classifier bias to {bias_value}")
     else:
-        logger.warning(f"No Grad-CAM target found for {architecture}")
-
-
-def _find_transformer_attention(model: nn.Module) -> Optional[nn.Module]:
-    """Find last attention module in transformer architecture."""
-    patterns = [
-        lambda m: m.blocks[-1].attn if hasattr(m, 'blocks') else None,
-        lambda m: m.layers[-1].blocks[-1].attn if hasattr(m, 'layers') else None,
-    ]
-    for pattern in patterns:
-        try:
-            result = pattern(model)
-            if result is not None and hasattr(result, 'qkv'):
-                return result
-        except Exception:
-            continue
-    
-    for name, module in reversed(list(model.named_modules())):
-        if 'attn' in name.lower() and hasattr(module, 'qkv'):
-            return module
-    return None
+        logger.warning("Could not find the final linear layer bias to initialize.")
 
 
 def get_param_counts(model: nn.Module) -> Dict[str, Union[int, float]]:
@@ -291,25 +348,27 @@ def get_param_counts(model: nn.Module) -> Dict[str, Union[int, float]]:
     }
 
 
-def get_model_normalization(model: nn.Module, model_name: str) -> Dict[str, tuple]:
+def get_model_normalization(model: nn.Module, model_name: Optional[str] = None) -> Dict[str, tuple]:
     """Retrieve the correct normalization mean/std for the architecture."""
-    if model_name.lower() == "biomedclip":
-        return {
-            "mean": (0.48145466, 0.4578275, 0.40821073),
-            "std":  (0.26862954, 0.26130258, 0.27577711)
-        }
+    if model_name and model_name in CUSTOM_NORMS:
+        return CUSTOM_NORMS[model_name]
+        
     if hasattr(model, 'default_cfg'):
         return {
             "mean": model.default_cfg.get('mean', (0.485, 0.456, 0.406)),
             "std":  model.default_cfg.get('std', (0.229, 0.224, 0.225))
         }
-    # Fallback standard ImageNet
-    return {"mean": (0.485, 0.456, 0.406), 
-            "std": (0.229, 0.224, 0.225)}
+    return {"mean": (0.485, 0.456, 0.406), "std": (0.229, 0.224, 0.225)}
 
 
 def freeze_backbone(model: nn.Module, unfreeze_head: bool = True) -> None:
     """Freeze all layers except the classification head."""
+    if isinstance(model, EnsembleClassifier):
+        for sub_model in model.models:
+            freeze_backbone(sub_model, unfreeze_head=unfreeze_head)
+        return
+
+    # Freeze all 
     for param in model.parameters():
         param.requires_grad = False
     
@@ -317,94 +376,147 @@ def freeze_backbone(model: nn.Module, unfreeze_head: bool = True) -> None:
         logger.info("Frozen entire model")
         return
     
-    if isinstance(model, EnsembleClassifier):
-        for sub_model in model.models:
-            freeze_backbone(sub_model, unfreeze_head=unfreeze_head)
-        return
-    
     unfrozen = False
-    
-    if isinstance(model, BiomedCLIPClassifier):
-        for param in model.head.parameters(): param.requires_grad = True
-        unfrozen = True
-    elif hasattr(model, 'get_classifier') and callable(model.get_classifier):
-        classifier = model.get_classifier()
-        if classifier is not None:
-            for param in classifier.parameters(): param.requires_grad = True
+
+    # Unfreeze the entire head module (pooling + norm + classifier).
+    # Walk the standard timm attribute names; the first one that carries
+    # parameters is the head we want.
+    for attr in ('head', 'fc', 'classifier'):
+        head_module = getattr(model, attr, None)
+        if head_module is not None and any(True for _ in head_module.parameters()):
+            for param in head_module.parameters():
+                param.requires_grad = True
             unfrozen = True
-    elif hasattr(model, 'fc') and model.fc is not None:
-        for param in model.fc.parameters(): param.requires_grad = True
-        unfrozen = True
-    elif hasattr(model, 'head') and model.head is not None:
-        for param in model.head.parameters(): param.requires_grad = True
-        unfrozen = True
-    elif hasattr(model, 'classifier') and model.classifier is not None:
-        for param in model.classifier.parameters(): param.requires_grad = True
-        unfrozen = True
-    
+            logger.info("Unfroze head module (model.%s)", attr)
+            break
+
     if not unfrozen:
-        last_module = list(model.children())[-1]
-        for param in last_module.parameters():
-            param.requires_grad = True
-        logger.warning(f"Unfroze last module as fallback: {type(last_module).__name__}")
+        logger.warning("Could not reliably unfreeze classification head.")
     
     counts = get_param_counts(model)
     logger.info(f"Frozen backbone: {counts['frozen_m']:.2f}M frozen, {counts['trainable_m']:.2f}M trainable ({counts['trainable_pct']:.1f}%)")
 
 
 def unfreeze_layers(model: nn.Module, num_layers: int = 0) -> None:
+    """Gradually unfreeze layers for progressive fine-tuning.
+    
+    Args:
+        model: The model to unfreeze layers in
+        num_layers: Number of layer blocks to unfreeze from the end. 
+                   0 means unfreeze all layers.
     """
-    Gradually unfreeze layers for progressive fine-tuning.
-    Smartly hunts for feature blocks in TIMM architectures.
-    """
+    metadata = getattr(model, '_metadata', {})
+    if not metadata.get('progressive', True):
+        logger.warning("Model architecture not flagged for progressive unfreezing; proceeding anyway.")
+
     if num_layers == 0:
         for param in model.parameters():
             param.requires_grad = True
         logger.info("Unfrozen all layers")
         return
-    
+
     if num_layers < 0:
         raise ValueError(f"num_layers must be >= 0, got {num_layers}")
-    
+
+    # First freeze everything, then unfreeze head + requested blocks
     freeze_backbone(model, unfreeze_head=True)
+
+    # Collect all trainable blocks (excluding head)
+    blocks_found = []
     
-    target_seq = None
-    if hasattr(model, 'blocks') and isinstance(model.blocks, nn.Sequential):
-        target_seq = model.blocks
-    elif hasattr(model, 'features') and isinstance(model.features, nn.Sequential):
-        target_seq = model.features
-    elif hasattr(model, 'layers') and isinstance(model.layers, nn.Sequential):
-        target_seq = model.layers
-    elif hasattr(model, 'stages') and isinstance(model.stages, nn.Sequential):
-        target_seq = model.stages
-    else:
-        target_seq = model 
-        
-    valid_blocks = []
-    for child in target_seq.children():
-        if list(child.parameters()) and \
-           not isinstance(child, (nn.Linear, nn.AdaptiveAvgPool2d, nn.Flatten, nn.Dropout)):
-            valid_blocks.append(child)
+    # Look for common block naming patterns in timm models
+    block_patterns = [
+        'blocks', 'layers', 'stages',  # EfficientNet, ResNet, ConvNeXt
+        'features',  # DenseNet
+    ]
     
+    found_blocks = False
+    for pattern in block_patterns:
+        if hasattr(model, pattern):
+            module = getattr(model, pattern)
+            if isinstance(module, (nn.Sequential, nn.ModuleList)):
+                blocks_found.extend(list(module.children()))
+                found_blocks = True
+                logger.debug(f"Found blocks in model.{pattern}")
+                break
+            elif isinstance(module, nn.Module):
+                # Try to get children if it's a container
+                children = list(module.children())
+                if children:
+                    blocks_found.extend(children)
+                    found_blocks = True
+                    logger.debug(f"Found blocks in model.{pattern} children")
+                    break
+    
+    # Fallback: try to find blocks anywhere in named modules
+    if not found_blocks:
+        for name, module in model.named_children():
+            if name in ('head', 'fc', 'classifier', 'global_pool', 'norm'):
+                continue
+            # Check if this module has trainable parameters
+            has_params = any(True for _ in module.parameters())
+            if has_params:
+                blocks_found.append(module)
+
+    if not blocks_found:
+        logger.warning("Could not identify layer blocks; unfreezing top-level children.")
+        blocks_found = [m for n, m in model.named_children() 
+                       if n not in ('head', 'fc', 'classifier', 'global_pool', 'norm')]
+
+    # Filter to blocks with parameters
+    valid_blocks = [b for b in blocks_found if any(True for _ in b.parameters())]
+    
+    if not valid_blocks:
+        logger.warning("No valid blocks found to unfreeze")
+        return
+
+    # Unfreeze the last num_layers blocks
     blocks_to_unfreeze = valid_blocks[-num_layers:] if num_layers < len(valid_blocks) else valid_blocks
-    
+
+    unfrozen_count = 0
     for block in blocks_to_unfreeze:
         for param in block.parameters():
-            param.requires_grad = True
+            if param.requires_grad == False:
+                param.requires_grad = True
+                unfrozen_count += 1
+
     counts = get_param_counts(model)
-    logger.info(f"Progressive unfreeze (last {num_layers} blocks): {counts['trainable_m']:.2f}M trainable ({counts['trainable_pct']:.1f}%)")
+    logger.info(
+        f"Progressive unfreeze (last {len(blocks_to_unfreeze)} blocks, {unfrozen_count} newly unfrozen): "
+        f"{counts['trainable_m']:.2f}M trainable ({counts['trainable_pct']:.1f}%)"
+    )
 
 
-def get_target_layer(model: nn.Module, architecture: str) -> Optional[nn.Module]:
-    if hasattr(model, 'get_gradcam_target') and callable(model.get_gradcam_target):
-        return model.get_gradcam_target()
-    
-    arch = architecture.lower()
-    if any(x in arch for x in ['resnet', 'densenet', 'efficientnet', 'convnext']):
+def get_target_layer(model: nn.Module) -> Optional[nn.Module]:
+    """
+    Lookup layer for Grad-CAM reliably based on model metadata lookup.
+    Properly parses index accesses like `stages[-1].blocks[-1]`.
+    """
+    metadata = getattr(model, '_metadata', None)
+    if not metadata or 'gradcam_target' not in metadata:
         return get_last_conv_layer(model)
-    elif any(x in arch for x in ['vit', 'swin', 'biomedclip']):
-        return _find_transformer_attention(model)
-    return None
+        
+    target_str = metadata['gradcam_target']
+    
+    try:
+        target = model
+        parts = target_str.split('.')
+        for part in parts:
+            if not part: continue
+            if '[' in part:
+                attr, idx_str = part.split('[')
+                idx = int(idx_str.rstrip(']'))
+
+                if attr:
+                    target = getattr(target, attr)[idx]
+                else:
+                    target = target[idx]
+            else:
+                target = getattr(target, part)
+        return target
+    except Exception as e:
+        logger.debug(f"Metadata Grad-CAM path {target_str} resolution failed: {e}")
+        return get_last_conv_layer(model)
 
 
 def get_last_conv_layer(model: nn.Module) -> Optional[nn.Module]:
@@ -418,38 +530,47 @@ def get_last_conv_layer(model: nn.Module) -> Optional[nn.Module]:
 # =============================================================================
 # TESTING
 # =============================================================================
-
-def _test_model(model_name: str, num_classes: int = 3, batch_size: int = 2, device: str = 'cpu', img_size: int = 384) -> Dict:
+def _test_model(model_name: str, num_classes: int = 3, batch_size: int = 2, device: str = 'cpu') -> Dict:
     try:
-        model = build_model(model_name, num_classes=num_classes, pretrained=False, img_size=img_size)
+        model = build_model(model_name, num_classes=num_classes, pretrained=False)
         model = model.to(device)
         model.eval()
         
+        # Test 1: Shape / Native Execution
+        img_size = getattr(model, '_img_size', 224) 
         dummy_input = torch.randn(batch_size, 3, img_size, img_size, device=device)
         with torch.no_grad():
             output = model(dummy_input)
-        
         assert output.shape == (batch_size, num_classes), f"Bad output shape: {output.shape}"
         
+        # Test 2: GradCAM Path Resolution
+        target = get_target_layer(model)
+        assert target is not None, "GradCAM target resolution failed to find a valid module"
+
+        # Test 3: Progressive / Head Freezing Behavior
+        freeze_backbone(model, unfreeze_head=True)
         counts = get_param_counts(model)
-        target = get_target_layer(model, model_name)
+        assert counts['trainable_pct'] < 10.0, f"Too many trainable params after head-only unfreeze: {counts['trainable_pct']:.1f}%"
         
         return {
             'name': model_name, 'status': '✓ PASS', 'output_shape': tuple(output.shape),
             'params_m': counts['total_m'], 'trainable_m': counts['trainable_m'],
-            'target_type': type(target).__name__ if target else 'None', 'error': None
+            'target_type': type(target).__name__, 'error': None,
+            'model_ref': model 
         }
     except Exception as e:
         return {
             'name': model_name, 'status': '✗ FAIL', 'output_shape': None,
-            'params_m': 0, 'trainable_m': 0, 'target_type': 'N/A', 'error': str(e)
+            'params_m': 0, 'trainable_m': 0, 'target_type': 'N/A', 'error': str(e),
+            'model_ref': None
         }
 
 
-def _test_ensemble(models: List[nn.Module], method: str = 'average', weights: Optional[List[float]] = None, img_size: int = 384) -> Dict:
+def _test_ensemble(models: List[nn.Module], method: str = 'average', weights: Optional[List[float]] = None) -> Dict:
     try:
-        ensemble = EnsembleClassifier(models, method=method, weights=weights, img_size=img_size)
+        ensemble = EnsembleClassifier(models, method=method, weights=weights)
         device = next(models[0].parameters()).device
+        img_size = getattr(models[0], '_img_size', 224)
         dummy_input = torch.randn(2, 3, img_size, img_size, device=device)
         
         with torch.no_grad():
@@ -466,7 +587,6 @@ if __name__ == "__main__":
     TEST_MODELS = [
         "densenet", "resnet50", "efficientnet_b0", "efficientnet_b2",
         "convnext_tiny", "vit_small", "swin_t",
-        "biomedclip",
     ]
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -487,16 +607,16 @@ if __name__ == "__main__":
         params = f"{r['params_m']:.2f}M" if r['params_m'] > 0 else "N/A"
         print(f"{r['name']:<20} {r['status']:<8} {params:<12} {r['target_type']}")
     
-    successful_models = [build_model(r['name'], pretrained=False, img_size=384).to(device) for r in results if r['status'] == '✓ PASS'][:2]
+    successful_models = [r['model_ref'] for r in results if r['status'] == '✓ PASS' and r['model_ref'] is not None][:2]
     
     if len(successful_models) >= 2:
         print(f"\n{'='*70}\nENSEMBLE TESTS\n{'='*70}")
-        for method in ['average', 'vote', 'weighted']:
+        for method in ['average', 'weighted']:
             weights = [1.0 / len(successful_models)] * len(successful_models) if method == 'weighted' else None
             result = _test_ensemble(successful_models, method=method, weights=weights)
             status = "✓" if result['status'] == '✓ PASS' else "✗"
             print(f"{status} Ensemble ({method}): {result.get('output_shape', 'FAILED')}")
+            if status == "✗":
+                print(f"   Reason: {result['error']}")
     
     print(f"\n{'='*70}")
-
-    

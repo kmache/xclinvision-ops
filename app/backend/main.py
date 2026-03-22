@@ -151,6 +151,10 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
             state_dict[new_key] = v
         model.load_state_dict(state_dict, strict=False)
         logger.info("Loaded Lightning checkpoint: %s", model_path)
+    elif isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        # BestModelExportCallback .pth payload
+        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        logger.info("Loaded exported .pth payload: %s", model_path)
     elif isinstance(checkpoint, dict):
         # Plain state_dict (e.g. torch.save(model.state_dict(), ...))
         model.load_state_dict(checkpoint, strict=False)
@@ -159,6 +163,19 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
         raise ValueError(f"Unrecognised checkpoint format in {model_path}")
 
     model.eval()
+
+    # Extract temperature and thresholds from the payload if present
+    temperature_value = None
+    thresholds_dict = None
+    if isinstance(checkpoint, dict):
+        raw_temp = checkpoint.get("temperature")
+        if raw_temp is not None:
+            temperature_value = float(raw_temp)
+            logger.info("Loaded temperature from payload: T=%.4f", temperature_value)
+        raw_thresh = checkpoint.get("thresholds")
+        if isinstance(raw_thresh, dict):
+            thresholds_dict = {str(k): float(v) for k, v in raw_thresh.items()}
+            logger.info("Loaded per-class thresholds from payload: %s", thresholds_dict)
 
     # Fix #22: use model-specific normalization stats so the inference pipeline
     # matches the training distribution.  Without this, BiomedCLIP and other
@@ -172,6 +189,8 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
         image_size=image_size,
         dataset_mean=list(norm_stats["mean"]),
         dataset_std=list(norm_stats["std"]),
+        temperature_scaler=temperature_value,
+        thresholds=thresholds_dict,
     )
 
 

@@ -10,11 +10,9 @@ import hashlib
 import json
 import logging
 import os
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 import torch
-
-logger = logging.getLogger(__name__)
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -25,9 +23,10 @@ import numpy as np
 from torchmetrics import MetricCollection, Accuracy, F1Score, AUROC
 from sklearn.metrics import classification_report, confusion_matrix
 
-from .config import get_class_map, get_class_names, is_multilabel
-from .modeling import freeze_backbone, unfreeze_layers, get_param_counts
+from .config import get_class_map, get_class_names, is_multilabel, PipelineConfig
+from .modeling import freeze_backbone, unfreeze_layers, get_param_counts, _init_classifier_bias
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Mixup / CutMix helpers
@@ -43,8 +42,6 @@ def mixup_data(
     Returns mixed inputs, pairs of targets, and the lambda coefficient.
     """
     if alpha > 0:
-        # Use torch.distributions so the random state lives on the torch RNG,
-        # which is seeded per-rank in DDP — avoiding mismatched lam values.
         lam = float(
             torch.distributions.Beta(
                 torch.tensor(alpha), torch.tensor(alpha)
@@ -57,7 +54,6 @@ def mixup_data(
     mixed_x = lam * x + (1 - lam) * x[index]
     return mixed_x, y, y[index], lam
 
-
 def mixup_criterion(
     criterion: nn.Module,
     logits: torch.Tensor,
@@ -65,14 +61,14 @@ def mixup_criterion(
     y_b: torch.Tensor,
     lam: float,
 ) -> torch.Tensor:
-    """Compute loss for Mixup-augmented batch."""
+    """Compute loss for Mixup-augmented batch (Multiclass)."""
     return lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
 
 # ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
 class FocalLoss(nn.Module):
-    """Focal Loss for handling class imbalance in medical imaging."""
+    """Focal Loss for handling class imbalance in medical imaging (Multiclass)."""
 
     def __init__(
         self,
@@ -82,55 +78,42 @@ class FocalLoss(nn.Module):
         label_smoothing: float = 0.0,
     ):
         super().__init__()
-        # alpha=1.0 is a uniform global scaling factor — it does NOT provide
-        # per-class reweighting (that role is fulfilled by the `weight` buffer).
-        # Reduce alpha below 1.0 to globally discount the focal modulation term.
         self.alpha = alpha
         self.gamma = gamma
-        # Register as buffer so it moves to the correct device automatically
         self.register_buffer("weight", weight)
         self.label_smoothing = label_smoothing
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # 1. Compute pt as the true-class probability via softmax + gather.
-        # This is the correct multi-class generalisation of focal loss:
-        # exp(-CE_unweighted) equals softmax[target] only in the binary case.
-        pt = (
-            F.softmax(inputs, dim=-1)
-            .gather(1, targets.unsqueeze(1))
-            .squeeze(1)
-            .detach()  # stop gradients through pt; only modulate the loss scale
+        # 1. Compute Base Cross Entropy (handles label smoothing natively)
+        ce_loss = F.cross_entropy(
+            inputs, targets, weight=self.weight,
+            label_smoothing=self.label_smoothing, reduction="none",
         )
+        
+        # 2. Extract probability of the true class (pt)
+        probs = F.softmax(inputs, dim=-1)
+        pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
 
-        # 2. Compute focal term
+        # 3. Compute focal term & modulate
         focal_term = (1 - pt) ** self.gamma
-
-        # 3. Compute base cross entropy (with optional label smoothing)
-        if self.label_smoothing > 0:
-            n_classes = inputs.size(-1)
-            targets_oh = F.one_hot(targets, n_classes).float()
-            targets_oh = targets_oh * (1 - self.label_smoothing) + (self.label_smoothing / n_classes)
-            # F.cross_entropy ignores the `weight` tensor when targets are float
-            # (soft labels). Apply class weights manually via the hard label index.
-            ce_loss = F.cross_entropy(inputs, targets_oh, reduction="none")
-            if self.weight is not None:
-                sample_weights = self.weight[targets]  # (B,)
-                ce_loss = ce_loss * sample_weights
-        else:
-            # Apply standard weighted cross entropy
-            ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction="none")
-            
-        # 4. Modulate and return
         return (self.alpha * focal_term * ce_loss).mean()
 
-
 class MultilabelFocalLoss(nn.Module):
-    """Focal Loss for multi-label classification using sigmoid + BCE."""
+    """Focal Loss for multi-label classification using sigmoid + BCE.
+
+    IMPORTANT: pos_weight is applied as a multiplicative alpha factor
+    OUTSIDE the BCE, not inside it.  Passing pos_weight inside
+    ``binary_cross_entropy_with_logits`` causes the focal term
+    ``(1-pt)^gamma`` to amplify the already-weighted BCE
+    exponentially, creating a ~1000:1 gradient imbalance between
+    positive and negative samples when the classifier is initialised
+    with a negative bias (sigmoid ≈ 0.12).
+    """
 
     def __init__(
         self,
         alpha: float = 1.0,
-        gamma: float = 2.0,
+        gamma: float = 1.5,
         pos_weight: Optional[torch.Tensor] = None,
     ):
         super().__init__()
@@ -139,11 +122,20 @@ class MultilabelFocalLoss(nn.Module):
         self.register_buffer("pos_weight", pos_weight)
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Unweighted BCE — pos_weight is applied separately below
         bce = F.binary_cross_entropy_with_logits(
-            inputs, targets, pos_weight=self.pos_weight, reduction="none",
+            inputs, targets, reduction="none",
         )
-        pt = torch.exp(-bce)
-        focal = self.alpha * (1 - pt) ** self.gamma * bce
+        probs = torch.sigmoid(inputs)
+        pt = targets * probs + (1 - targets) * (1 - probs)
+
+        # Class-balanced alpha: upweight positives, keep negatives at 1
+        if self.pos_weight is not None:
+            alpha_t = targets * self.pos_weight + (1 - targets) * 1.0
+        else:
+            alpha_t = self.alpha
+
+        focal = alpha_t * (1 - pt) ** self.gamma * bce
         return focal.mean()
 
 
@@ -160,37 +152,48 @@ class XClinVisionModel(pl.LightningModule):
     - Focal loss with class weighting
     - TorchMetrics for distributed-safe metrics tracking
     - Discriminative learning rates (backbone vs head)
+    
+    Args:
+        **kwargs: Unused arguments captured here to allow passing arbitrary 
+                  model-building configurations dynamically.
     """
     def __init__(
         self,
         model: nn.Module,
-        num_classes: int = 3,
-        learning_rate: float = 1e-4,
+        num_classes: int = 4,
+        learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
-        loss_type: str = "focal",
+        loss_type: str = "ce",
         label_smoothing: float = 0.1,
         class_weights: Optional[List[float]] = None,
         progressive_unfreezing: bool = True,
         unfreeze_schedule: Optional[List[int]] = None,
-        mixup_alpha: float = 0.2,
+        mixup_alpha: float = 0.0,
         mixup_prob: float = 0.5,
+        config: Optional[PipelineConfig] = None,
+        backbone_lr_factor: float = 0.1,
         **kwargs,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["model"])
+        self.save_hyperparameters(ignore=["model", "config"])
 
         self.model = model
         self.num_classes = num_classes
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.progressive_unfreezing = progressive_unfreezing
-        self.unfreeze_schedule = unfreeze_schedule or [1, 5, 10, 20]
+        self.unfreeze_schedule = unfreeze_schedule or [3]
         self.current_phase = 0
         self.label_smoothing = label_smoothing
         self.mixup_alpha = mixup_alpha
-        self.mixup_prob = mixup_prob  # fraction of batches where Mixup is applied
-        self._oom_steps = 0  # L-2: track OOM-skipped batches per epoch
-        self.multilabel = is_multilabel()
+        self.mixup_prob = mixup_prob
+        self._oom_steps = 0
+        self._consecutive_ooms = 0
+        self._config = config
+        self.backbone_lr_factor = backbone_lr_factor
+        self.class_names = kwargs.pop("class_names", config.class_names if config else get_class_names())
+        self.multilabel = config.multilabel if config else is_multilabel()
+        self.decision_threshold = 0.5
 
         # Loss function
         weight_tensor = (
@@ -198,10 +201,23 @@ class XClinVisionModel(pl.LightningModule):
         )
         self.criterion = self._setup_loss(loss_type, weight_tensor, label_smoothing, self.multilabel)
 
+        # Classifier bias depends on the loss function:
+        #  - BCE: bias=-2.0 so sigmoid starts ~0.12 (standard for sparse multilabel)
+        #  - Focal: bias=0.0 so sigmoid starts at 0.5 — with bias=-2.0 the focal
+        #    term (1-pt)^gamma suppresses 96% of the negative gradient, creating a
+        #    1000:1 gradient imbalance that prevents discrimination.
+        if self.multilabel:
+            if loss_type == "focal":
+                _init_classifier_bias(self.model, bias_value=0.0)
+                logger.info("Focal loss: classifier bias = 0.0 (balanced focal weighting)")
+            else:
+                _init_classifier_bias(self.model, bias_value=-2.0)
+                logger.info("BCE loss: classifier bias = -2.0 (low initial sigmoid)")
+
         if self.multilabel:
             metrics = MetricCollection({
-                "acc": Accuracy(task="multilabel", num_labels=num_classes),
-                "f1_macro": F1Score(task="multilabel", num_labels=num_classes, average="macro"),
+                "acc": Accuracy(task="multilabel", num_labels=num_classes, threshold=0.5),
+                "f1_macro": F1Score(task="multilabel", num_labels=num_classes, average="macro", threshold=0.5),
                 "auc": AUROC(task="multilabel", num_labels=num_classes, average="macro"),
             })
         else:
@@ -214,12 +230,9 @@ class XClinVisionModel(pl.LightningModule):
         self.val_metrics = metrics.clone(prefix="val_")
         self.test_metrics = metrics.clone(prefix="test_")
 
-        # Freeze the backbone right at init so configure_optimizers only sees the head.
-        # Start at phase 1 so _apply_unfreeze_schedule doesn't redundantly re-freeze
-        # the backbone on the very first epoch call (fix #13).
         if self.progressive_unfreezing:
             freeze_backbone(self.model, unfreeze_head=True)
-            self.current_phase = 1  # backbone already frozen — skip phase-1 re-freeze
+            self.current_phase = 1 
 
         # Log model info
         counts = get_param_counts(model)
@@ -242,10 +255,12 @@ class XClinVisionModel(pl.LightningModule):
             if loss_type == "focal":
                 return MultilabelFocalLoss(pos_weight=weight)
             return nn.BCEWithLogitsLoss(pos_weight=weight)
+        
         if loss_type == "focal":
             return FocalLoss(weight=weight, label_smoothing=label_smoothing)
         elif loss_type == "ce":
             return nn.CrossEntropyLoss(weight=weight, label_smoothing=label_smoothing)
+        
         raise ValueError(f"Unknown loss type: {loss_type}")
 
     # ---- progressive unfreezing -------------------------------------------
@@ -254,64 +269,50 @@ class XClinVisionModel(pl.LightningModule):
         if not self.progressive_unfreezing:
             return
 
-        target_phase = sum(1 for e in self.unfreeze_schedule if self.current_epoch >= e)
-
-        # Fix #13: only advance to higher phases \u2014 never go backwards.
-        # Using > instead of != means that if the backbone was already frozen at
-        # init (current_phase=1), the epoch-0 target_phase=0 does NOT trigger a
-        # spurious full-unfreeze, and the epoch-1 target_phase=1 is also skipped
-        # since the backbone is already in the correct state.
+        # Add 1 because Phase 1 is the starting phase
+        target_phase = 1 + sum(1 for e in self.unfreeze_schedule if self.current_epoch >= e)
         if target_phase > self.current_phase:
             self.current_phase = target_phase
-            # Phase 1: head only  |  Phase 2: last 2 blocks  |
-            # Phase 3: last 4 blocks  |  Phase 4+: full fine-tuning
-            actions = {
-                1: (lambda: freeze_backbone(self.model, unfreeze_head=True), "Training head only"),
-                2: (lambda: unfreeze_layers(self.model, num_layers=2), "Unfrozen last 2 blocks"),
-                3: (lambda: unfreeze_layers(self.model, num_layers=4), "Unfrozen last 4 blocks"),
-            }
-            if target_phase in actions:
-                fn, msg = actions[target_phase]
-                fn()
+            if target_phase == 1:
+                freeze_backbone(self.model, unfreeze_head=True)
+                msg = "Training head only"
             else:
+                # Any phase beyond 1: full fine-tuning with all layers
                 unfreeze_layers(self.model, num_layers=0)
                 msg = "Full fine-tuning"
                 
             self.print(f"Epoch {self.current_epoch}: Phase {target_phase} - {msg}")
-
-            # Fix P0: Rebuild optimizer so newly-unfrozen params actually receive
-            # gradient updates.  Without this, params unfrozen after init are
-            # absent from all optimizer param-groups and never get updated.
             self._rebuild_optimizers()
 
     def _rebuild_optimizers(self):
-        """Rebuild optimizer + LR scheduler after unfreezing new parameters.
-
-        Uses PL's public ``lr_schedulers`` / ``optimizers`` replacement pattern
-        rather than the private ``_configure_schedulers`` API so this remains
-        stable across PL minor versions.
-        """
+        """SAFER optimizer rebuild - avoid trainer.state corruption."""
         if self.trainer is None:
             return
+            
         opt_config = self.configure_optimizers()
-        optimizer = opt_config["optimizer"]
-        scheduler = opt_config["lr_scheduler"]["scheduler"]
-        interval = opt_config["lr_scheduler"].get("interval", "epoch")
-
-        # Replace the optimizer list in-place (public attribute, documented).
-        self.trainer.optimizers = [optimizer]
-
-        # Wrap scheduler in a LRSchedulerConfig (PL ≥ 2.0) or a plain dict (PL 1.x).
-        # The spurious _AcceleratorConnector import guard has been removed — it was
-        # a no-op that obscured the intent and broke on some PL builds.
-        try:
-            from pytorch_lightning.utilities.types import LRSchedulerConfig
-            self.trainer.lr_scheduler_configs = [
-                LRSchedulerConfig(scheduler=scheduler, interval=interval)
-            ]
-        except (ImportError, AttributeError):
-            # PL < 2.0 fallback: lr_schedulers is a plain list of dicts.
-            self.trainer.lr_schedulers = [{"scheduler": scheduler, "interval": interval}]
+        
+        # Clear and append optimizers safely
+        if hasattr(self.trainer, "optimizers") and isinstance(self.trainer.optimizers, list):
+            self.trainer.optimizers.clear()
+            self.trainer.optimizers.append(opt_config["optimizer"])
+        
+        # Handle LR schedulers safely
+        if "lr_scheduler" in opt_config:
+            scheduler_cfg = opt_config["lr_scheduler"]
+            scheduler = scheduler_cfg["scheduler"]
+            interval = scheduler_cfg.get("interval", "epoch")
+            
+            try:
+                from pytorch_lightning.utilities.types import LRSchedulerConfig
+                if hasattr(self.trainer, "lr_scheduler_configs") and isinstance(self.trainer.lr_scheduler_configs, list):
+                    self.trainer.lr_scheduler_configs.clear()
+                    self.trainer.lr_scheduler_configs.append(
+                        LRSchedulerConfig(scheduler=scheduler, interval=interval)
+                    )
+            except (ImportError, AttributeError):
+                if hasattr(self.trainer, "lr_schedulers") and isinstance(self.trainer.lr_schedulers, list):
+                    self.trainer.lr_schedulers.clear()
+                    self.trainer.lr_schedulers.append({"scheduler": scheduler, "interval": interval})
 
         trainable = sum(1 for p in self.model.parameters() if p.requires_grad)
         self.print(f"  → Optimizer rebuilt ({trainable} trainable params)")
@@ -321,40 +322,81 @@ class XClinVisionModel(pl.LightningModule):
         return self.model(x)
 
     def on_train_epoch_start(self):
-        """Apply progressive unfreezing at epoch start."""
         self._apply_unfreeze_schedule()
 
     def training_step(self, batch, _batch_idx):
         x, y = batch
+
         try:
-            # Mixup is only applied in multiclass mode; multilabel targets
-            # are float vectors which would require a different blending
-            # strategy — skip for now.
+            # Fade out mixup probability over the course of training
+            max_epochs = self.trainer.max_epochs if self.trainer else 100
+            current_mixup_prob = self.mixup_prob * max(0.0, 1.0 - (self.current_epoch / max(1, max_epochs)))
+            
             use_mixup = (
-                not self.multilabel
-                and self.mixup_alpha > 0
+                self.mixup_alpha > 0
                 and self.training
-                and torch.rand(1).item() < self.mixup_prob
+                and torch.rand(1).item() < current_mixup_prob
             )
+            
             if use_mixup:
                 mixed_x, y_a, y_b, lam = mixup_data(x, y, self.mixup_alpha)
                 logits = self(mixed_x)
-                loss = mixup_criterion(self.criterion, logits, y_a, y_b, lam)
+                
+                if self.multilabel:
+                    # Linear mix of binary target vectors is robust for BCE
+                    # Clamped to [0,1] to prevent BCE logits crashing
+                    mixed_y = torch.clamp(lam * y_a.float() + (1 - lam) * y_b.float(), 0.0, 1.0)
+                    loss = self.criterion(logits, mixed_y)
+                else:
+                    loss = mixup_criterion(self.criterion, logits, y_a, y_b, lam)
+                    
+                self.log("train_loss_mixup", loss, on_step=False, on_epoch=True)
+                
+                # Compute un-mixed logits solely for metric tracking
+                with torch.no_grad():
+                    clean_logits = self(x)
+                
+                # Torchmetrics ALWAYS needs long
+                y_metric = y.long()
+                clean_probs = torch.sigmoid(clean_logits.detach()) if self.multilabel else F.softmax(clean_logits.detach(), dim=1)
+                self.train_metrics.update(clean_probs, y_metric)
             else:
                 logits = self(x)
-                loss = self.criterion(logits, y)
+                if self.multilabel:
+                    assert logits.shape == y.shape, (
+                        f"Shape mismatch: logits {logits.shape} vs targets {y.shape}"
+                    )
+
+                # BCE expects floats, Multiclass CE expects long targets
+                # NOTE: Label smoothing for multilabel BCE is handled by
+                # the loss function or omitted entirely — manual target
+                # smoothing corrupts binary labels and causes plateau.
+                # if not self.multilabel and self.label_smoothing > 0:
+                #     y_loss = y.long()  # CrossEntropy handles label_smoothing natively
+                # else:
+                y_loss = y.float() if self.multilabel else y.long()
+                loss = self.criterion(logits, y_loss)
+                
+                # Torchmetrics ALWAYS use hard 0/1 labels
+                y_metric = y.long()
+                probs = torch.sigmoid(logits.detach()) if self.multilabel else F.softmax(logits.detach(), dim=1)
+                self.train_metrics.update(probs, y_metric)
+                
+            self._consecutive_ooms = 0  # Reset on success
+            
         except torch.OutOfMemoryError:
             torch.cuda.empty_cache()
             self._oom_steps += 1
+            self._consecutive_ooms += 1
             logger.warning(
                 f"[OOM] training_step skipped (batch_size={x.shape[0]}, "
                 f"img_size={x.shape[-1]}). Consider reducing --batch-size."
             )
+            if self._consecutive_ooms > 5:
+                raise RuntimeError("Too many consecutive OOM errors. Please reduce batch size.")
             return None
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        if not use_mixup:
-            self.train_metrics.update(logits.detach(), y)
         return loss
 
     def on_train_epoch_end(self):
@@ -367,34 +409,42 @@ class XClinVisionModel(pl.LightningModule):
                 self.log("train_oom_steps", float(self._oom_steps), prog_bar=False)
                 logger.warning(
                     f"Epoch {self.current_epoch}: {self._oom_steps} training "
-                    f"batch(es) were skipped due to OOM — metrics are computed "
-                    f"over the remaining batches only."
+                    f"batch(es) skipped due to OOM — metrics computed over remainder."
                 )
                 self._oom_steps = 0
             self.train_metrics.reset()
 
     def validation_step(self, batch, _batch_idx):
         x, y = batch
+
         try:
             logits = self(x)
-            loss = self.criterion(logits, y)
+            if self.multilabel:
+                assert logits.shape == y.shape, f"Shape mismatch: {logits.shape} vs {y.shape}"
+            # BCE expects floats, Multiclass CE expects long targets
+            y_loss = y.float() if self.multilabel else y.long()
+            loss = self.criterion(logits, y_loss)
+            self._consecutive_ooms = 0
         except torch.OutOfMemoryError:
             torch.cuda.empty_cache()
-            logger.warning(
-                f"[OOM] validation_step skipped (batch_size={x.shape[0]}, "
-                f"img_size={x.shape[-1]}). Consider reducing --batch-size."
-            )
+            self._consecutive_ooms += 1
+            logger.warning(f"[OOM] validation_step skipped. Consider reducing batch size.")
+            if self._consecutive_ooms > 5:
+                raise RuntimeError("Too many consecutive OOM errors. Please reduce batch size.")
             return None
 
         if self.multilabel:
             probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).int()
+            preds = (probs > self.decision_threshold).int()
         else:
             probs = F.softmax(logits, dim=1)
             preds = torch.argmax(logits, dim=1)
 
         self.log("val_loss", loss, on_epoch=True, prog_bar=True)
-        self.val_metrics.update(logits, y)
+        
+        # Torchmetrics ALWAYS needs long
+        y_metric = y.long()
+        self.val_metrics.update(probs, y_metric)
 
         return {"val_loss": loss.detach(), "preds": preds, "targets": y, "probs": probs}
 
@@ -402,100 +452,85 @@ class XClinVisionModel(pl.LightningModule):
         try:
             self.log_dict(self.val_metrics.compute(), prog_bar=True)
         except ValueError:
-            logger.warning("[OOM] Entire validation epoch was skipped — no samples to compute metrics.")
+            logger.warning("[OOM] Entire validation epoch was skipped.")
         finally:
             self.val_metrics.reset()
 
     def test_step(self, batch, _batch_idx):
         x, y = batch
         logits = self(x)
-        loss = self.criterion(logits, y)
+        # BCE expects floats, Multiclass CE expects long targets
+        y_loss = y.float() if self.multilabel else y.long()
+        loss = self.criterion(logits, y_loss)
 
         if self.multilabel:
             probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).int()
+            preds = (probs > self.decision_threshold).int()
         else:
             probs = F.softmax(logits, dim=1)
             preds = torch.argmax(logits, dim=1)
 
         self.log("test_loss", loss, on_epoch=True, prog_bar=True)
-        self.test_metrics.update(logits, y)
+        
+        # Torchmetrics ALWAYS needs long
+        y_metric = y.long()
+        self.test_metrics.update(probs, y_metric)
         return {"test_loss": loss.detach(), "preds": preds, "targets": y, "probs": probs}
 
     def on_test_epoch_end(self):
         try:
             self.log_dict(self.test_metrics.compute(), prog_bar=True)
         except ValueError:
-            logger.warning("[OOM] Entire test epoch was skipped — no samples to compute metrics.")
+            logger.warning("[OOM] Entire test epoch was skipped.")
         finally:
             self.test_metrics.reset()
 
     # ---- optimizer --------------------------------------------------------
     def configure_optimizers(self):
-        """Configure optimizer with discriminative learning rates and warmup."""
         backbone_params, head_params = [], []
 
         for name, param in self.model.named_parameters():
-            # Fix #7: skip frozen parameters entirely — AdamW still allocates
-            # moment tensors for params with requires_grad=False, wasting GPU/CPU
-            # memory proportional to frozen backbone size.
             if not param.requires_grad:
                 continue
             if any(k in name for k in ("head", "fc", "classifier", "last_linear")):
                 head_params.append(param)
             else:
                 backbone_params.append(param)
-        
+
+        # Use self.learning_rate for head, backbone_lr for backbone
+        head_lr = self.learning_rate
+        backbone_lr = self.learning_rate * self.backbone_lr_factor
+
         param_groups = []
         if backbone_params:
-            # Fix #14: 5× discriminative ratio instead of 10× so the backbone
-            # retains enough learning signal when it unfreezes mid-training.
-            param_groups.append({"params": backbone_params, "lr": self.learning_rate * 0.2, "name": "backbone"})
+            param_groups.append({"params": backbone_params, "lr": backbone_lr, "name": "backbone"})
         if head_params:
-            param_groups.append({"params": head_params, "lr": self.learning_rate, "name": "head"})
+            param_groups.append({"params": head_params, "lr": head_lr, "name": "head"})
 
-        # Fallback: if somehow empty, include all params
-        if not param_groups:
-            param_groups = [{"params": list(self.model.parameters()), "lr": self.learning_rate}]
+        optimizer = AdamW(param_groups, weight_decay=self.weight_decay, eps=1e-8)
 
-        optimizer = AdamW(
-            param_groups,
-            weight_decay=self.weight_decay,
-            eps=1e-8,
-        )
+        max_epochs = self.trainer.max_epochs if self.trainer else 50
+        remaining = max(1, max_epochs - self.current_epoch)
 
-        # Build the LR schedule.  On the very first call (epoch 0) we start the
-        # standard warmup → cosine sequence.  On subsequent calls from
-        # _rebuild_optimizers (unfreeze boundaries) warmup is already complete,
-        # so we build a plain CosineAnnealingLR for the *remaining* epochs only.
-        # This prevents the LR from jumping back to the full rate at every
-        # unfreeze phase (issue #18).
-        first_unfreeze = self.unfreeze_schedule[0] if self.unfreeze_schedule else 5
-        warmup_epochs = max(1, min(first_unfreeze - 1, 5))
-        current_epoch = getattr(self, "current_epoch", 0)
-
-        if current_epoch < warmup_epochs:
-            # Warmup not yet finished — full SequentialLR
-            warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
-            cosine = CosineAnnealingLR(
-                optimizer,
-                T_max=max(self.trainer.max_epochs - warmup_epochs, 1),
-                eta_min=1e-6,
-            )
-            scheduler = SequentialLR(
-                optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs]
-            )
+        # On initial setup (epoch 0), use a normal warmup.
+        # On rebuild (progressive unfreezing), use at most 1 epoch warmup
+        # to avoid wasting cycles — the differential LR already protects
+        # newly unfrozen backbone layers.
+        if self.current_epoch == 0:
+            warmup_epochs = min(2, remaining // 4)
         else:
-            # Warmup already done — cosine only for remaining epochs so the
-            # scheduler clock doesn't reset on every optimizer rebuild.
-            remaining = max(self.trainer.max_epochs - current_epoch, 1)
+            warmup_epochs = min(1, remaining // 4)
+        if warmup_epochs > 0:
+            warmup = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+            cosine = CosineAnnealingLR(optimizer, T_max=remaining - warmup_epochs, eta_min=1e-6)
+            scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
+        else:
             scheduler = CosineAnnealingLR(optimizer, T_max=remaining, eta_min=1e-6)
 
         return {
-            "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
+            "optimizer": optimizer, 
+            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}
         }
-
 
 # ---------------------------------------------------------------------------
 # Callbacks
@@ -514,12 +549,11 @@ class MetricsCallback(Callback):
     def _reset(self):
         self.val_preds: List[np.ndarray] = []
         self.val_targets: List[np.ndarray] = []
-        self.val_probs: List[np.ndarray] = []  # each row is shape (num_classes,)
+        self.val_probs: List[np.ndarray] = []
 
     def on_validation_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx, **kwargs
     ):
-        """Collect validation outputs. **kwargs handles PL 2.x dataloader_idx injections."""
         if outputs is None or not isinstance(outputs, dict) or "preds" not in outputs:
             return
         
@@ -529,11 +563,6 @@ class MetricsCallback(Callback):
         self.val_probs.extend(outputs["probs"].detach().cpu().numpy())
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        """Compute and log detailed classification metrics.
-
-        _reset() is called in a finally block so stale predictions never
-        accumulate into the next epoch if an exception occurs mid-reporting.
-        """
         if len(self.val_preds) == 0:
             return
 
@@ -545,8 +574,6 @@ class MetricsCallback(Callback):
             all_labels = list(range(len(target_names)))
 
             if self.multilabel:
-                # For multilabel: preds and targets are (N, C) binary arrays.
-                # Compute per-label classification report using sklearn.
                 from sklearn.metrics import classification_report as _cr
                 report = _cr(
                     targets,
@@ -565,7 +592,6 @@ class MetricsCallback(Callback):
                     zero_division=0,
                 )
 
-            # Log per-class metrics
             for cls_name, metrics in report.items():
                 if isinstance(metrics, dict):
                     for metric_name, value in metrics.items():
@@ -576,16 +602,34 @@ class MetricsCallback(Callback):
             if cm is not None:
                 logger.info(f"\nConfusion Matrix (epoch {trainer.current_epoch}):\n{cm}")
 
-            # Save predictions if requested
+            # Per-class threshold optimization for multilabel
+            if self.multilabel and len(self.val_probs) > 0:
+                from sklearn.metrics import f1_score as _f1
+                probs_arr = np.array(self.val_probs)
+                opt_thresholds = []
+                for c in range(targets.shape[1]):
+                    best_f1, best_th = 0.0, 0.5
+                    for th in np.arange(0.1, 0.9, 0.05):
+                        f1_c = _f1(targets[:, c], (probs_arr[:, c] >= th).astype(int), zero_division=0)
+                        if f1_c > best_f1:
+                            best_f1, best_th = f1_c, th
+                    opt_thresholds.append(best_th)
+                opt_preds = np.column_stack([
+                    (probs_arr[:, c] >= opt_thresholds[c]).astype(int) for c in range(targets.shape[1])
+                ])
+                opt_f1 = _f1(targets, opt_preds, average='macro', zero_division=0)
+                pl_module.log("val_f1_macro_opt", opt_f1, prog_bar=True)
+                logger.info(
+                    "Optimized thresholds: %s -> F1_macro=%.4f",
+                    {n: f"{t:.2f}" for n, t in zip(target_names, opt_thresholds)}, opt_f1,
+                )
+
             if self.save_predictions and self.output_dir:
                 self._save_predictions(trainer.current_epoch)
         finally:
-            # Always reset — even if logging or saving throws an exception —
-            # so stale data never leaks into the next epoch.
             self._reset()
 
     def _save_predictions(self, epoch: int):
-        """Persist predictions to disk."""
         import json
         import os
         from datetime import datetime
@@ -620,13 +664,6 @@ class BestModelExportCallback(Callback):
     Exports the best model weights as a portable ``xclinvision_{model_name}_{run_id}.pth``
     file at the end of training.  The file contains only the model ``state_dict`` plus
     lightweight metadata so it can be loaded for inference without PyTorch Lightning.
-
-    Loading example::
-
-        ckpt = torch.load("models/xclinvision_resnet50_v0c4f.pth", map_location="cpu")
-        model = build_model(ckpt["model_name"], num_classes=ckpt["num_classes"], pretrained=False)
-        model.load_state_dict(ckpt["model_state_dict"])
-        model.eval()
     """
 
     def __init__(
@@ -643,9 +680,6 @@ class BestModelExportCallback(Callback):
         self.class_names = class_names or get_class_names()
         self.CLASS_MAP = get_class_map()
         self.num_classes = num_classes if num_classes is not None else len(self.class_names)
-        # Unique short ID per run: "v" + first 4 hex of sha256(model_name + timestamp).
-        # Using a timestamp ensures different training runs of the same architecture
-        # produce distinct filenames and don't overwrite each other.
         if run_id is None:
             from datetime import datetime as _dt
             seed = f"{model_name}_{_dt.now().isoformat()}"
@@ -655,27 +689,12 @@ class BestModelExportCallback(Callback):
             self.run_id = run_id
 
     def _fit_temperature_scaler(self, pl_module, trainer) -> Optional[float]:
-        """Fit temperature scaling on the validation set.
-
-        The model must already hold the *best-checkpoint* weights when this
-        method is called.  Returns the learned temperature scalar, or None on
-        any failure (missing datamodule, empty loader, optimisation error).
-        """
         from xclinvision.evaluator import TemperatureScaler
-
-        # Temperature scaling uses CrossEntropyLoss (expects integer labels);
-        # skip for multilabel where labels are binary vectors.
         if is_multilabel():
-            logger.info(
-                "BestModelExportCallback: skipping temperature calibration "
-                "(not supported for multilabel mode)."
-            )
+            logger.info("BestModelExportCallback: skipping temperature calibration (multilabel).")
             return None
 
         if trainer.datamodule is None:
-            logger.warning(
-                "BestModelExportCallback: no datamodule — skipping temperature calibration."
-            )
             return None
 
         try:
@@ -700,7 +719,6 @@ class BestModelExportCallback(Callback):
                 )
 
         if not all_logits:
-            logger.warning("BestModelExportCallback: empty val loader — skipping calibration.")
             return None
 
         logits_np = np.concatenate(all_logits, axis=0)
@@ -715,22 +733,18 @@ class BestModelExportCallback(Callback):
 
         return temperature
 
-    def on_train_end(self, trainer, pl_module) -> None:  # type: ignore[override]
-        """Load the best checkpoint and export a clean .pth weights file."""
-        # Locate the ModelCheckpoint callback
+    def on_train_end(self, trainer, pl_module) -> None: 
         ckpt_callback = next(
             (cb for cb in trainer.callbacks if hasattr(cb, "best_model_path")),
             None,
         )
         if ckpt_callback is None:
-            logger.warning("BestModelExportCallback: no ModelCheckpoint found — skipping .pth export.")
+            logger.warning("BestModelExportCallback: no ModelCheckpoint found — skipping export.")
             return
 
         best_path = ckpt_callback.best_model_path
         if not best_path or not os.path.exists(best_path):
-            logger.warning(
-                f"BestModelExportCallback: best_model_path '{best_path}' not found — skipping .pth export."
-            )
+            logger.warning(f"BestModelExportCallback: best_model_path '{best_path}' not found.")
             return
 
         try:
@@ -739,7 +753,6 @@ class BestModelExportCallback(Callback):
             logger.error(f"BestModelExportCallback: failed to load checkpoint '{best_path}': {exc}")
             return
 
-        # Strip the "model." prefix that PL adds to every key in state_dict
         raw_sd = raw.get("state_dict", {})
         model_sd = {
             k[len("model."):]: v
@@ -747,16 +760,12 @@ class BestModelExportCallback(Callback):
             if k.startswith("model.")
         }
         if not model_sd:
-            logger.warning("BestModelExportCallback: no 'model.*' keys found in checkpoint — skipping .pth export.")
+            logger.warning("BestModelExportCallback: no 'model.*' keys found.")
             return
 
-        # Pull best metric / epoch from the checkpoint path name if possible
         best_val_auc = getattr(ckpt_callback, "best_model_score", None)
         best_val_auc = float(best_val_auc) if best_val_auc is not None else None
 
-        # --- Temperature calibration on best-checkpoint weights --------
-        # Temporarily swap in the best-checkpoint weights so calibration
-        # runs on the exported model rather than the end-of-training state.
         temperature = None
         original_sd = None
         try:
@@ -764,10 +773,8 @@ class BestModelExportCallback(Callback):
             load_result = pl_module.model.load_state_dict(model_sd, strict=False)
             if load_result.missing_keys or load_result.unexpected_keys:
                 logger.warning(
-                    "Temperature calibration: checkpoint mismatch "
-                    "(missing=%s, unexpected=%s) — skipping.",
-                    load_result.missing_keys[:3],
-                    load_result.unexpected_keys[:3],
+                    "Temperature calibration: checkpoint mismatch (missing=%s, unexpected=%s).",
+                    load_result.missing_keys[:3], load_result.unexpected_keys[:3]
                 )
             else:
                 temperature = self._fit_temperature_scaler(pl_module, trainer)
@@ -776,7 +783,36 @@ class BestModelExportCallback(Callback):
         finally:
             if original_sd is not None:
                 pl_module.model.load_state_dict(original_sd, strict=False)
-        # ---------------------------------------------------------------
+
+        thresholds = None
+        if is_multilabel() and trainer.datamodule is not None:
+            try:
+                from xclinvision.evaluator import ThresholdOptimizer
+                val_loader = trainer.datamodule.val_dataloader()
+                device = next(pl_module.model.parameters()).device
+                all_probs, all_labels = [], []
+                pl_module.model.eval()
+                with torch.no_grad():
+                    for batch in val_loader:
+                        x, y = batch
+                        x = x.to(device)
+                        logits = pl_module.model(x)
+                        probs = torch.sigmoid(logits).cpu().numpy()
+                        all_probs.append(probs)
+                        all_labels.append(
+                            y.cpu().numpy() if isinstance(y, torch.Tensor) else np.array(y)
+                        )
+                if all_probs:
+                    probs_np = np.concatenate(all_probs, axis=0)
+                    labels_np = np.concatenate(all_labels, axis=0)
+                    thresh_opt = ThresholdOptimizer(class_names=self.class_names)
+                    thresh_opt.fit(labels_np, probs_np)
+                    thresholds = thresh_opt.thresholds
+                    logger.info(f"[BestModelExport] Optimized thresholds: {thresholds}")
+            except ImportError:
+                logger.warning("BestModelExportCallback: ThresholdOptimizer not found in evaluator. Skipping threshold optimization.")
+            except Exception as exc:
+                logger.warning("BestModelExportCallback: threshold optimization failed: %s", exc)
 
         payload = {
             "model_state_dict": model_sd,
@@ -787,6 +823,7 @@ class BestModelExportCallback(Callback):
             "class_names": self.class_names,
             "best_val_auc": best_val_auc,
             "temperature": temperature,
+            "thresholds": thresholds,
             "source_ckpt": best_path,
         }
 
@@ -795,14 +832,13 @@ class BestModelExportCallback(Callback):
         out_path = os.path.join(self.export_dir, out_name)
         torch.save(payload, out_path)
 
-        # Write a companion metadata JSON for quick inspection without loading tensors
         meta = {k: v for k, v in payload.items() if k != "model_state_dict"}
         meta_path = os.path.join(self.export_dir, f"xclinvision_{self.model_name}_{self.run_id}_meta.json")
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
 
-        logger.info(f"[BestModelExport] Saved → {out_path}  (val_auc={best_val_auc})")
-        print(f"\n  Best model exported → {out_path}")
+        logger.info(f"[BestModelExport] Saved -> {out_path}  (val_auc={best_val_auc})")
+        print(f"\n  Best model exported -> {out_path}")
 
 
 class XAIValidationCallback(Callback):
@@ -824,7 +860,6 @@ class XAIValidationCallback(Callback):
         self.image_size = image_size
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        """Run XAI validation periodically."""
         epoch = trainer.current_epoch
 
         if (epoch + 1) % self.every_n_epochs != 0:
@@ -836,7 +871,6 @@ class XAIValidationCallback(Callback):
             output_path = f"{self.output_dir}/epoch_{epoch:03d}"
             xai = ValidationXAI(pl_module.model, self.architecture, output_path, img_size=self.image_size)
 
-            # set up yet — fall back to the datamodule if available.
             val_dataloaders = getattr(trainer, "val_dataloaders", None)
             if val_dataloaders is None and trainer.datamodule is not None:
                 val_dataloaders = trainer.datamodule.val_dataloader()
@@ -863,3 +897,5 @@ class XAIValidationCallback(Callback):
             import traceback
             logger.error(f"XAI validation failed: {e}")
             traceback.print_exc()
+
+
