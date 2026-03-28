@@ -15,10 +15,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
+from xclinvision.agent.audit import AuditTrail
+from xclinvision.agent.guardrails import GuardrailValidator
 from xclinvision.agent.ingest_knowledge import HybridRetriever
 
 logger = logging.getLogger(__name__)
@@ -255,11 +258,15 @@ class ClinicalReasoningAgent:
         call_llm: Optional[Callable[..., str]] = None,
         confidence_threshold: float = 0.30,
         rag_top_k: int = 6,
+        guardrail_validator: Optional[GuardrailValidator] = None,
+        audit_trail: Optional[AuditTrail] = None,
     ) -> None:
         self.retriever = retriever
         self.call_llm = call_llm or _default_call_llm
         self.confidence_threshold = confidence_threshold
         self.rag_top_k = rag_top_k
+        self.guardrail_validator = guardrail_validator or GuardrailValidator()
+        self.audit_trail = audit_trail
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -287,6 +294,8 @@ class ClinicalReasoningAgent:
             Optional dict describing a prior study for longitudinal comparison.
             Keys may include: ``date``, ``findings``, ``impression``.
         """
+        start_time = time.perf_counter()
+
         # ── Step 1: Observation analysis & equivocal check ────────────
         predictions_block, top_confidence, predicted_labels = self._format_predictions(vision_data)
         equivocal = top_confidence < self.confidence_threshold
@@ -323,7 +332,10 @@ class ClinicalReasoningAgent:
         # ── Step 6: Cross-verification ────────────────────────────────
         report = self._cross_verify(report, predictions_block, spatial_block, rag_block)
 
-        # ── Step 7: Final equivocal guard ─────────────────────────────
+        # ── Step 7: Guardrail validation ──────────────────────────────
+        guardrail_result = self.guardrail_validator.validate_and_sanitise(report)
+
+        # ── Step 8: Final equivocal guard ─────────────────────────────
         if equivocal:
             report.requires_human_review = True
             if "low overall confidence" not in report.reasoning_trace.lower():
@@ -332,9 +344,29 @@ class ClinicalReasoningAgent:
                     f"threshold ({self.confidence_threshold}). Human review required."
                 )
 
+        # ── Step 9: Audit trail ───────────────────────────────────────
+        duration_ms = (time.perf_counter() - start_time) * 1000
+        if self.audit_trail is not None:
+            try:
+                self.audit_trail.log_report(
+                    report_dict=report.model_dump(),
+                    vision_data=vision_data,
+                    patient_meta=patient_meta,
+                    guardrail_result={
+                        "passed": guardrail_result.passed,
+                        "term_violations": guardrail_result.term_violations,
+                        "structural_warnings": guardrail_result.structural_warnings,
+                        "rewrites_applied": guardrail_result.rewrites_applied,
+                        "force_human_review": guardrail_result.force_human_review,
+                    },
+                    duration_ms=duration_ms,
+                )
+            except Exception:
+                logger.warning("Audit trail logging failed; continuing.")
+
         logger.info(
-            "Clinical report generated | equivocal=%s | urgency=%s | review=%s",
-            equivocal, report.urgency, report.requires_human_review,
+            "Clinical report generated | equivocal=%s | urgency=%s | review=%s | guardrail_passed=%s | duration_ms=%.1f",
+            equivocal, report.urgency, report.requires_human_review, guardrail_result.passed, duration_ms,
         )
         return report
 
@@ -442,8 +474,7 @@ class ClinicalReasoningAgent:
                 cleaned = cleaned.split("\n", 1)[-1]
             if cleaned.endswith("```"):
                 cleaned = cleaned.rsplit("```", 1)[0]
-            data = json.loads(cleaned)
-            report = ClinicalReport(**data)
+            report = ClinicalReport.model_validate_json(cleaned)
         except Exception:
             logger.warning("Failed to parse LLM response as ClinicalReport; using fallback.")
             report = ClinicalReport(

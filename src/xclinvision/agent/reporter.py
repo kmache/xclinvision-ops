@@ -17,7 +17,7 @@ import base64
 import io
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -31,6 +31,9 @@ import pathlib
 from xclinvision.agent.xclinvisionagent import ClinicalReport
 from xclinvision.config import get_class_names
 
+if TYPE_CHECKING:
+    from xclinvision.agent.guardrails import ThresholdProfile
+
 logger = logging.getLogger(__name__)
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -38,18 +41,18 @@ logger = logging.getLogger(__name__)
 # ════════════════════════════════════════════════════════════════════════════════
 
 
-def calibrate_probability(prob: float) -> str:
+def calibrate_probability(prob: float, threshold: float = 0.50) -> str:
     """Map a raw probability to clinical language.
 
     Thresholds
     ----------
-    > 0.85  → "Highly suggestive of …"
-    0.50–0.85 → "Consistent with …"
-    < 0.50  → "Equivocal; consider clinical correlation."
+    >= threshold + 0.35  → "Highly suggestive of …"
+    >= threshold         → "Consistent with …"
+    < threshold          → "Equivocal; consider clinical correlation."
     """
-    if prob > 0.85:
+    if prob >= threshold + 0.35:
         return "Highly suggestive"
-    if prob >= 0.50:
+    if prob >= threshold:
         return "Consistent with"
     return "Equivocal; consider clinical correlation"
 
@@ -57,6 +60,7 @@ def calibrate_probability(prob: float) -> str:
 def calibrate_predictions(
     class_names: List[str],
     probabilities: List[float],
+    threshold_profile: Optional[ThresholdProfile] = None,
 ) -> List[Dict[str, Any]]:
     """Return a list of ``{class_name, probability, clinical_term}`` dicts,
     sorted by descending probability."""
@@ -73,7 +77,10 @@ def calibrate_predictions(
             "class_name": name,
             "probability": prob,
             "pct": f"{prob:.1%}",
-            "clinical_term": calibrate_probability(prob),
+            "clinical_term": calibrate_probability(
+                prob,
+                threshold_profile.get_threshold(name) if threshold_profile else 0.50,
+            ),
         }
         for name, prob in pairs
     ]
@@ -135,7 +142,10 @@ def generate_radar_chart(
     ax.set_title(title, size=12, weight="bold", pad=20)
     ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.10), fontsize=8)
 
-    return _fig_to_base64(fig)
+    b64 = _fig_to_base64(fig)
+    fig.clf()
+    fig.clear()
+    return b64
 
 
 def generate_gradcam_overlay(
@@ -208,10 +218,12 @@ class ClinicalReporter:
         class_names: Optional[List[str]] = None,
         gradcam_alpha: float = 0.50,
         radar_baseline: float = 0.10,
+        threshold_profile: Optional[ThresholdProfile] = None,
     ) -> None:
         self.class_names = class_names or get_class_names()
         self.gradcam_alpha = gradcam_alpha
         self.radar_baseline = radar_baseline
+        self.threshold_profile = threshold_profile
         template_dir = pathlib.Path(__file__).parent / "templates"
         self._env = Environment(loader=FileSystemLoader(str(template_dir)), autoescape=True)
         self._template = self._env.get_template("clinical_report.html")
@@ -245,7 +257,7 @@ class ClinicalReporter:
         probabilities: List[float] = vision_data.get("probabilities", [])
 
         # 1. Calibrated findings table
-        calibrated = calibrate_predictions(class_names, probabilities)
+        calibrated = calibrate_predictions(class_names, probabilities, self.threshold_profile)
 
         # 2. Grad-CAM overlay
         explanation = vision_data.get("explanation")
