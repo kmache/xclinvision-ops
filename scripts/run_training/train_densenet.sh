@@ -1,6 +1,6 @@
 #!/bin/bash
 # Train DenseNet-121
-# CNN — 8M params | img_size 384 | batch_size 32
+# CNN — 8M params | img_size 384 | batch_size 24
 
 set -e
 
@@ -18,12 +18,13 @@ python3 scripts/train.py \
   --config  configs/densenet.yaml \
   --model   densenet \
   --epochs  50 \
-  --batch-size 32 \
+  --batch-size 24 \
   --image-size  384 \
-  --lr      1e-4 \
-  --loss    focal \
+  --process-size 1024 \
+  --lr      5e-4 \
+  --loss    ce \
   --weight-decay 1e-4 \
-  --label-smoothing 0.15 \
+  --accumulate-grad-batches 3 \
   --output-dir models \
   --num-workers 4 \
   --seed    42 \

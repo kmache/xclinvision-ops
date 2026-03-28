@@ -5,15 +5,15 @@ architecture:
   backbone: vit_small
   pretrained: true
   # num_classes: NOT set here — derived at runtime from system.yaml model.class_names
-  dropout_rate: 0.4
+  dropout_rate: 0.3
   # head: managed by timm — no custom head definition needed
 
 transfer_learning:
   freeze_backbone: false
   differential_lr:
     enabled: true
-    backbone_lr: 1.0e-5
-    head_lr: 1.0e-4
+    backbone_lr: 5.0e-5
+    head_lr: 5.0e-4
 
 input:
   size: [384, 384]

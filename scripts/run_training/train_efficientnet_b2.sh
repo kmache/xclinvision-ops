@@ -20,6 +20,7 @@ python3 scripts/train.py \
   --epochs  50 \
   --batch-size 24 \
   --image-size  384 \
+  --process-size 1024 \
   --lr      5e-4 \
   --loss    ce \
   --weight-decay 1e-4 \

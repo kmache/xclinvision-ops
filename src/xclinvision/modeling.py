@@ -9,29 +9,59 @@ from xml.parsers.expat import model
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import timm
 from timm.data import resolve_data_config
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Generalized Mean (GeM) Pooling
+# ---------------------------------------------------------------------------
+class GeM(nn.Module):
+    """Generalized Mean Pooling (Radenovic et al., 2018).
+
+    Acts as a learnable slider between Average Pooling (p=1) and
+    Max Pooling (p→∞).  Higher *p* amplifies strong local activations,
+    which is critical for detecting small pathologies (fibrosis,
+    pleural thickening) that occupy <5 % of the feature map.
+    """
+
+    def __init__(self, p: float = 3.0, eps: float = 1e-6):
+        super().__init__()
+        self.p = nn.Parameter(torch.ones(1) * p)
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, H, W)  →  (B, C, 1, 1)
+        return F.adaptive_avg_pool2d(
+            x.clamp(min=self.eps).pow(self.p),
+            output_size=1,
+        ).pow(1.0 / self.p)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(p={self.p.data.item():.2f})"
+
+
 # Model registry with architecture-specific metadata
 MODEL_REGISTRY = {
     "densenet": {
-        "timm_name": "densenet121",
+        "timm_name": "densenet121.ra_in1k",
         "default_img_size": 224,
         "head_type": "linear",
         "progressive": True,
         "gradcam_target": "features",
     },
     "resnet50": {
-        "timm_name": "resnet50",
+        "timm_name": "resnet50.a1_in1k",
         "default_img_size": 224,
         "head_type": "linear",
         "progressive": True,
         "gradcam_target": "layer4",
     },
     "efficientnet_b0": {
-        "timm_name": "efficientnet_b0",
+        "timm_name": "efficientnet_b0.ra_in1k",
         "default_img_size": 224,
         "head_type": "linear",
         "progressive": True,
@@ -45,21 +75,21 @@ MODEL_REGISTRY = {
         "gradcam_target": "blocks",
     },
     "efficientnet_b3": {
-        "timm_name": "efficientnet_b3",
+        "timm_name": "efficientnet_b3.ra2_in1k",
         "default_img_size": 300,
         "head_type": "linear",
         "progressive": True,
         "gradcam_target": "blocks",
     },
     "efficientnet_b4": {
-        "timm_name": "efficientnet_b4",
+        "timm_name": "efficientnet_b4.ra2_in1k",
         "default_img_size": 380,
         "head_type": "linear",
         "progressive": True,
         "gradcam_target": "blocks",
     },
     "convnext_tiny": {
-        "timm_name": "convnext_tiny",
+        "timm_name": "convnext_tiny.fb_in22k_ft_in1k",
         "default_img_size": 224,
         "head_type": "linear",
         "progressive": True,
@@ -73,43 +103,43 @@ MODEL_REGISTRY = {
         "gradcam_target": "stages[-1].blocks[-1]",
     },
     "vit_tiny": {
-        "timm_name": "vit_tiny_patch16_224",
-        "default_img_size": 224,
+        "timm_name": "vit_tiny_patch16_384.augreg_in21k_ft_in1k",
+        "default_img_size": 384,
         "head_type": "linear",
         "progressive": True,
         "gradcam_target": "blocks[-1].attn.qkv",
     },
     "vit_small": {
-        "timm_name": "vit_small_patch16_224",
-        "default_img_size": 224,
+        "timm_name": "vit_small_patch16_384.augreg_in21k_ft_in1k",
+        "default_img_size": 384,
         "head_type": "linear",
         "progressive": True,
         "gradcam_target": "blocks[-1].attn.qkv",
     },
     "vit_base": {
-        "timm_name": "vit_base_patch16_224",
-        "default_img_size": 224,
+        "timm_name": "vit_base_patch16_384.augreg_in21k_ft_in1k",
+        "default_img_size": 384,
         "head_type": "linear",
         "progressive": True,
         "gradcam_target": "blocks[-1].attn.qkv",
     },
     "swin_t": {
-        "timm_name": "swin_tiny_patch4_window7_224",
+        "timm_name": "swin_tiny_patch4_window7_224.ms_in22k_ft_in1k",
         "default_img_size": 224,
         "head_type": "linear",
         "progressive": True,
         "gradcam_target": "layers[-1].blocks[-1].attn.qkv",
     },
     "swin_s": {
-        "timm_name": "swin_small_patch4_window7_224",
+        "timm_name": "swin_small_patch4_window7_224.ms_in22k_ft_in1k",
         "default_img_size": 224,
         "head_type": "linear",
         "progressive": True,
         "gradcam_target": "layers[-1].blocks[-1].attn.qkv",
     },
     "swin_b": {
-        "timm_name": "swin_base_patch4_window7_224",
-        "default_img_size": 224,
+        "timm_name": "swin_base_patch4_window12_384.ms_in22k_ft_in1k",
+        "default_img_size": 384,
         "head_type": "linear",
         "progressive": True,
         "gradcam_target": "layers[-1].blocks[-1].attn.qkv",
@@ -120,7 +150,6 @@ MODEL_REGISTRY = {
 CUSTOM_NORMS = {
     "cxr_custom": {"mean": (0.505,), "std": (0.252,)}  # Example for 1-channel CXR
 }
-
 
 class EnsembleClassifier(nn.Module):
     """
@@ -175,6 +204,7 @@ def build_model(
     drop_path_rate: Optional[float] = None,
     img_size: Optional[int] = None,
     classification_mode: str = "multilabel",
+    pooling: str = "gem",
 ) -> nn.Module:
     """Factory function to build state-of-the-art architectures.
     
@@ -237,6 +267,11 @@ def build_model(
         )
         _replace_classifier(model, custom_fc)
 
+        # Replace Global Average Pooling with GeM if requested
+        if pooling == "gem":
+            _replace_global_pool(model)
+            logger.info(f"Replaced GAP with GeM pooling for {model_name}")
+
         # Resolve what TIMM expects vs what we asked for (Crucial for CNNs that don't take img_size on init)
         try:
             data_cfg = resolve_data_config(model.default_cfg, model=model)
@@ -295,6 +330,32 @@ def _replace_classifier(model: nn.Module, new_classifier: nn.Module) -> None:
         f"Could not locate classifier layer in {type(model).__name__}. "
         "Manual integration required."
     )
+
+
+def _replace_global_pool(model: nn.Module) -> None:
+    """Replace the global average pool in a timm model's head with GeM.
+
+    Works with:
+      - NormMlpClassifierHead (ConvNeXt, Swin) → ``head.global_pool``
+      - ClassifierHead (EfficientNet) → ``head.global_pool``
+      - ResNet → ``global_pool``
+      - DenseNet → ``global_pool``
+    """
+    gem = GeM(p=3.0)
+
+    # Timm head-based models (ConvNeXt, Swin, EfficientNet)
+    if hasattr(model, 'head') and hasattr(model.head, 'global_pool'):
+        model.head.global_pool = gem
+        logger.info("Replaced head.global_pool with GeM")
+        return
+
+    # ResNet / DenseNet style
+    if hasattr(model, 'global_pool'):
+        model.global_pool = gem
+        logger.info("Replaced model.global_pool with GeM")
+        return
+
+    logger.warning("Could not find global_pool to replace with GeM — using default pooling.")
 
 
 def _init_classifier_bias(model: nn.Module, bias_value: float = -2.0) -> None:
@@ -358,7 +419,10 @@ def get_model_normalization(model: nn.Module, model_name: Optional[str] = None) 
             "mean": model.default_cfg.get('mean', (0.485, 0.456, 0.406)),
             "std":  model.default_cfg.get('std', (0.229, 0.224, 0.225))
         }
-    return {"mean": (0.485, 0.456, 0.406), "std": (0.229, 0.224, 0.225)}
+    return {
+        "mean": (0.485, 0.456, 0.406), 
+        "std": (0.229, 0.224, 0.225)
+        }
 
 
 def freeze_backbone(model: nn.Module, unfreeze_head: bool = True) -> None:
@@ -619,4 +683,5 @@ if __name__ == "__main__":
             if status == "✗":
                 print(f"   Reason: {result['error']}")
     
-    print(f"\n{'='*70}")
+    print(f"\n{'='*70}\n")
+

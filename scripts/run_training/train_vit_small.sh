@@ -1,6 +1,6 @@
 #!/bin/bash
-# Train ViT-Small (patch16_224)
-# Transformer — 22M params | img_size 224 | batch_size 24
+# Train ViT-Small (patch16_384, IN-21k)
+# Transformer — 22M params | img_size 384 | batch_size 16
 
 set -e
 
@@ -18,12 +18,13 @@ python3 scripts/train.py \
   --config  configs/vit_small.yaml \
   --model   vit_small \
   --epochs  50 \
-  --batch-size 32 \
+  --batch-size 16 \
   --image-size  384 \
-  --lr      1e-4 \
-  --loss    focal \
+  --process-size 1024 \
+  --lr      5e-4 \
+  --loss    ce \
   --weight-decay 1e-4 \
-  --label-smoothing 0.15 \
+  --accumulate-grad-batches 4 \
   --output-dir models \
   --num-workers 4 \
   --seed    42 \

@@ -217,7 +217,9 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--image-size", type=int, default=None, help="Override config image size")
-    parser.add_argument("--loss", type=str, choices=["focal", "ce"], default="ce")
+    parser.add_argument("--process-size", type=int, default=1024, help="Resolution for storing processed images on disk")
+    parser.add_argument("--loss", type=str, choices=["focal", "ce", "asl"], default="ce")
+    parser.add_argument("--pooling", type=str, choices=["avg", "gem"], default="gem", help="Global pooling type")
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--label-smoothing", type=float, default=None)
     parser.add_argument("--output-dir", type=str, default="models")
@@ -232,6 +234,9 @@ def parse_args():
     parser.add_argument("--force-reprocess", action="store_true")
     
     parser.add_argument("--accumulate-grad-batches", type=int, default=2)
+    parser.add_argument("--monitor", type=str, choices=["val_f1_macro", "val_auc"], default="val_f1_macro",
+                        help="Metric to monitor for checkpointing and early stopping")
+    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs)")
     parser.add_argument("--devices", type=str, default="auto", help="Number of GPUs or 'auto'")
     parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint to resume training")
     
@@ -256,6 +261,8 @@ def main():
     else:
         raw_size = config.get("input", {}).get("size", [384, 384])
         image_size = raw_size[0] if isinstance(raw_size, list) else int(raw_size)
+
+    process_size = args.process_size
         
     class_names = get_class_names()
     num_classes = len(class_names)
@@ -281,7 +288,7 @@ def main():
     quarantine_dir = paths_cfg.get("quarantine_dir", "data/quarantine")
     
     processed_dir = ensure_processed_data_exists(
-        image_size=image_size,
+        image_size=process_size,
         raw_dir=raw_dir,
         processed_base_dir=processed_base_dir,
         quarantine_dir=quarantine_dir,
@@ -303,6 +310,7 @@ def main():
         pretrained=not args.no_pretrained,
         img_size=image_size,
         dropout=dropout_rate,
+        pooling=args.pooling,
     )
     norm_stats = get_model_normalization(base_model, args.model)
 
@@ -365,15 +373,15 @@ def main():
         LearningRateMonitor(logging_interval="step"),
         RichProgressBar(),
         EarlyStopping(
-            monitor="val_f1_macro",
+            monitor=args.monitor,
             mode="max",
-            patience=10,
+            patience=args.patience,
             min_delta=0.0001,
         ),
         ModelCheckpoint(
             dirpath=str(output_path),
-            filename=f"{args.model}-{{epoch:02d}}-{{val_f1_macro:.4f}}",
-            monitor="val_f1_macro",
+            filename=f"{args.model}-{{epoch:02d}}-{{{args.monitor}:.4f}}",
+            monitor=args.monitor,
             mode="max",
             save_top_k=1,
             save_last=True,
@@ -458,6 +466,7 @@ def main():
         "epochs": args.epochs,
         "lr": pl_module.learning_rate,
         "loss": args.loss,
+        "pooling": args.pooling,
         "seed": args.seed,
         "pretrained": not args.no_pretrained,
         "computed_class_weights": str(class_weights),

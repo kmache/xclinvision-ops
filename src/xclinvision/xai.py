@@ -804,7 +804,7 @@ def generate_explanation(
     class_names: List[str] = DEFAULT_CLASS_NAMES,
     architecture: str = "unknown",
     device: str = "cpu",
-    img_size: int = 384,
+    img_size: int = 1024,
     dataset_mean: Optional[Union[np.ndarray, List[float]]] = None,
     dataset_std: Optional[Union[np.ndarray, List[float]]] = None,
 ) -> Dict[str, Any]:

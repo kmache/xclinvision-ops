@@ -1,6 +1,6 @@
 #!/bin/bash
-# Train Swin-Small (patch4_window7_224)
-# Transformer — 50M params | img_size 224 | batch_size 24
+# Train Swin-Small (patch4_window7_224, IN-22k)
+# Transformer — 50M params | img_size 224 | batch_size 16
 
 set -e
 
@@ -18,12 +18,13 @@ python3 scripts/train.py \
   --config  configs/swin_s.yaml \
   --model   swin_s \
   --epochs  50 \
-  --batch-size 32 \
-  --image-size  384 \
-  --lr      1e-4 \
-  --loss    focal \
+  --batch-size 16 \
+  --image-size  224 \
+  --process-size 1024 \
+  --lr      5e-4 \
+  --loss    ce \
   --weight-decay 1e-4 \
-  --label-smoothing 0.15 \
+  --accumulate-grad-batches 4 \
   --output-dir models \
   --num-workers 4 \
   --seed    42 \

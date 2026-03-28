@@ -1,6 +1,6 @@
 #!/bin/bash
 # Train EfficientNet-B4
-# CNN — 19M params | img_size 384 | batch_size 16
+# CNN — 19M params | img_size 384 | batch_size 12
 
 set -e
 
@@ -18,12 +18,13 @@ python3 scripts/train.py \
   --config  configs/efficientnet_b4.yaml \
   --model   efficientnet_b4 \
   --epochs  50 \
-  --batch-size 32 \
+  --batch-size 12 \
   --image-size  384 \
-  --lr      1e-4 \
-  --loss    focal \
+  --process-size 1024 \
+  --lr      5e-4 \
+  --loss    ce \
   --weight-decay 1e-4 \
-  --label-smoothing 0.15 \
+  --accumulate-grad-batches 6 \
   --output-dir models \
   --num-workers 4 \
   --seed    42 \

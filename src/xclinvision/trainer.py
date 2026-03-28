@@ -139,6 +139,75 @@ class MultilabelFocalLoss(nn.Module):
         return focal.mean()
 
 
+class AsymmetricLoss(nn.Module):
+    """Asymmetric Loss (ASL) for multi-label classification.
+
+    Ridnik et al., 2021 — "Asymmetric Loss For Multi-Label Classification".
+
+    Key idea: use different focusing parameters for positive (gamma_pos)
+    and negative (gamma_neg) samples.  Hard-threshold probability shifting
+    on negatives further suppresses easy-negative gradients.
+
+    This implementation is numerically stable under AMP fp16 by:
+      - Using F.logsigmoid (log-sum-exp trick) instead of log(sigmoid(x))
+      - Casting to fp32 for the loss body to avoid fp16 underflow
+    """
+
+    def __init__(
+        self,
+        gamma_neg: float = 4.0,
+        gamma_pos: float = 1.0,
+        clip: float = 0.05,
+        pos_weight: Optional[torch.Tensor] = None,
+    ):
+        super().__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
+        self.register_buffer("pos_weight", pos_weight)
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Cast to fp32 for numerical stability under AMP
+        orig_dtype = inputs.dtype
+        inputs = inputs.float()
+        targets = targets.float()
+
+        # Numerically stable log-probabilities via logsigmoid
+        # log(sigmoid(x)) = logsigmoid(x), log(1-sigmoid(x)) = logsigmoid(-x)
+        log_pos = F.logsigmoid(inputs)       # log(p)
+        log_neg = F.logsigmoid(-inputs)      # log(1-p)
+
+        # Probabilities (from stable logsigmoid)
+        probs = torch.sigmoid(inputs)
+
+        # Probability shifting for negatives (hard thresholding)
+        if self.clip > 0:
+            probs_neg = (probs + self.clip).clamp(max=1.0)
+            # Recompute shifted log(1 - p_neg) stably
+            log_neg = torch.log1p(-probs_neg + 1e-8)
+        else:
+            probs_neg = probs
+
+        # Basic BCE components
+        loss_pos = -targets * log_pos
+        loss_neg = -(1.0 - targets) * log_neg
+
+        # Asymmetric focusing
+        if self.gamma_pos > 0:
+            loss_pos = loss_pos * ((1.0 - probs) ** self.gamma_pos)
+        if self.gamma_neg > 0:
+            loss_neg = loss_neg * (probs_neg ** self.gamma_neg)
+
+        loss = loss_pos + loss_neg
+
+        # Apply pos_weight to upscale rare-class positives
+        if self.pos_weight is not None:
+            pw = targets * self.pos_weight + (1.0 - targets)
+            loss = loss * pw
+
+        return loss.mean().to(orig_dtype)
+
+
 # ---------------------------------------------------------------------------
 # Lightning Module
 # ---------------------------------------------------------------------------
@@ -202,7 +271,7 @@ class XClinVisionModel(pl.LightningModule):
         self.criterion = self._setup_loss(loss_type, weight_tensor, label_smoothing, self.multilabel)
 
         # Classifier bias depends on the loss function:
-        #  - BCE: bias=-2.0 so sigmoid starts ~0.12 (standard for sparse multilabel)
+        #  - BCE / ASL: bias=-2.0 so sigmoid starts ~0.12 (standard for sparse multilabel)
         #  - Focal: bias=0.0 so sigmoid starts at 0.5 — with bias=-2.0 the focal
         #    term (1-pt)^gamma suppresses 96% of the negative gradient, creating a
         #    1000:1 gradient imbalance that prevents discrimination.
@@ -212,7 +281,7 @@ class XClinVisionModel(pl.LightningModule):
                 logger.info("Focal loss: classifier bias = 0.0 (balanced focal weighting)")
             else:
                 _init_classifier_bias(self.model, bias_value=-2.0)
-                logger.info("BCE loss: classifier bias = -2.0 (low initial sigmoid)")
+                logger.info(f"{loss_type.upper()} loss: classifier bias = -2.0 (low initial sigmoid)")
 
         if self.multilabel:
             metrics = MetricCollection({
@@ -252,6 +321,12 @@ class XClinVisionModel(pl.LightningModule):
     ) -> nn.Module:
         """Setup loss function with optional class weighting."""
         if multilabel:
+            if loss_type == "asl":
+                # ASL handles class imbalance via asymmetric gammas —
+                # do NOT pass pos_weight (double-weighting destabilizes training)
+                return AsymmetricLoss(
+                    gamma_neg=4.0, gamma_pos=1.0, clip=0.05,
+                )
             if loss_type == "focal":
                 return MultilabelFocalLoss(pos_weight=weight)
             return nn.BCEWithLogitsLoss(pos_weight=weight)

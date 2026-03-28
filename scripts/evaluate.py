@@ -123,6 +123,10 @@ def parse_args() -> argparse.Namespace:
         "--tta", action="store_true",
         help="Enable test-time augmentation (horizontal flip + multi-scale averaging)."
     )
+    parser.add_argument(
+        "--pooling", type=str, choices=["avg", "gem"], default="avg",
+        help="Pooling type used during training. Default: avg."
+    )
     return parser.parse_args()
 
 
@@ -233,6 +237,7 @@ def main() -> None:
         num_classes=get_num_classes(),
         pretrained=False,
         img_size=args.image_size,
+        pooling=args.pooling,
     )
 
     norm_stats = get_model_normalization(base_model, args.model_name)

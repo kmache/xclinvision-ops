@@ -46,9 +46,11 @@ ENV/
 # Data files
 data/raw/*
 data/processed/*
+output/
 data/vector_db/*   
 data/NIH-ChestX-ray3
 data/processed_* 
+data/ambiguous_img/ 
 data/vinbigdata-chest-xray-abnormalities-detection/
 NIH_ChestX-ray14/
 data/duplicate/

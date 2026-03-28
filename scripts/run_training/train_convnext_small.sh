@@ -1,6 +1,6 @@
 #!/bin/bash
 # Train ConvNeXt-Small
-# CNN — 50M params | img_size 384 | batch_size 24
+# CNN — 50M params | img_size 384 | batch_size 12
 
 set -e
 
@@ -18,12 +18,13 @@ python3 scripts/train.py \
   --config  configs/convnext_small.yaml \
   --model   convnext_small \
   --epochs  50 \
-  --batch-size 32 \
+  --batch-size 12 \
   --image-size  384 \
+  --process-size 1024 \
   --lr      5e-4 \
-  --loss    focal \
+  --loss    ce \
   --weight-decay 1e-4 \
-  --label-smoothing 0.15 \
+  --accumulate-grad-batches 6 \
   --output-dir models \
   --num-workers 4 \
   --seed    42 \

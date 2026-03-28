@@ -24,22 +24,14 @@ Two source formats are supported via ``--source-format``:
 
 Configuration
 -------------
-Class names, alpha (normal-class sampling ratio), and classification mode
-are read from ``configs/system.yaml``::
+Class names and classification mode are read from ``configs/system.yaml``::
 
     model:
       class_names: [Normal, Cardiomegaly, Aortic enlargement, ...]
-      alpha: 1.2
       classification_mode: multilabel
 
-Sampling (``--source-format csv`` only)
----------------------------------------
-All disease-positive samples are kept.  The normal class ("No finding" /
-"Normal") is subsampled to::
-
-    N_normal_selected = min(N_normal, alpha * N_max_disease)
-
-where ``alpha`` comes from ``system.yaml`` (overridable via ``--alpha``).
+All samples (disease and normal) are kept at their natural proportions.
+Class imbalance is handled downstream via weighted loss (pos_weight).
 
 Usage
 -----
@@ -51,10 +43,6 @@ Usage
   # Legacy folder source
   python scripts/organize_data.py \\
       --source /path/to/my_data --source-format folder
-
-  # Override alpha
-  python scripts/organize_data.py \\
-      --source /path/to/vinbigdata --alpha 1.5 --mode replace
 """
 
 from __future__ import annotations
@@ -120,7 +108,7 @@ def _load_system_config() -> dict:
     if not SYSTEM_CONFIG.exists():
         raise FileNotFoundError(
             f"System config not found: {SYSTEM_CONFIG}. "
-            "Create configs/system.yaml with model.class_names and model.alpha."
+            "Create configs/system.yaml with model.class_names."
         )
     with open(SYSTEM_CONFIG, "r") as fh:
         cfg = yaml.safe_load(fh) or {}
@@ -136,15 +124,6 @@ def _get_class_names_from_config(config: PipelineConfig) -> List[str]:
             f"Got: {names}"
         )
     return names
-
-
-def _get_alpha(cfg: dict) -> float:
-    """Extract alpha (normal-class sampling ratio) from config."""
-    alpha = cfg.get("model", {}).get("alpha")
-    if alpha is None:
-        logger.warning("model.alpha not found in system.yaml -- defaulting to 1.5")
-        return 1.5
-    return float(alpha)
 
 
 def _identify_normal_class(class_names: List[str]) -> Optional[str]:
@@ -184,7 +163,7 @@ def _build_multilabel_dataframe(
     normal_class: Optional[str],
     image_index: Dict[str, Path],
     min_rads: int = 2,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, List[str]]:
     """Read source annotation CSV and return a multi-hot-encoded DataFrame.
 
     Source CSV format (VinBigData-style)::
@@ -193,10 +172,23 @@ def _build_multilabel_dataframe(
 
     Each row is one annotation; an image may appear in multiple rows.
 
+    When ``min_rads > 1``, images are categorised as:
+
+    * **consensus disease** – at least one of the configured diseases has
+      ≥ *min_rads* radiologists annotating it.  Kept with disease labels.
+    * **truly normal** – NO radiologist annotated any configured disease.
+      Kept as all-zero (normal).
+    * **ambiguous** – at least one radiologist annotated a configured
+      disease, but none reached the *min_rads* threshold.  **Dropped**
+      and returned in the second element of the tuple so the caller can
+      save them to an ``ambiguous_img/`` directory.
+
     Returns
     -------
-    DataFrame with columns ``[filename, image_id, <class_name_1>, ...]``
-    where each class column is 0 or 1.
+    (DataFrame, ambiguous_image_ids)
+        DataFrame with columns ``[filename, image_id, <class_name_1>, ...]``
+        where each class column is 0 or 1.
+        ambiguous_image_ids is a list of image_id strings that were dropped.
     """
     df_raw = pd.read_csv(label_csv_path)
 
@@ -232,6 +224,8 @@ def _build_multilabel_dataframe(
             n_dropped, sorted(set(dropped)),
         )
 
+    ambiguous_ids: List[str] = []
+
     # ---- Aggregate per-radiologist annotations into multi-hot labels ----
     # When min_rads > 1, require at least that many radiologists to agree
     # for a positive label (majority vote). This reduces label noise from
@@ -242,27 +236,58 @@ def _build_multilabel_dataframe(
             min_rads,
         )
         disease_names_set = {n for n in class_names if n.lower() not in NORMAL_ALIASES}
+
+        # Disease annotations only (exclude "No finding")
+        disease_annotations = df_filtered[
+            df_filtered["class_mapped"].isin(disease_names_set)
+        ]
+
         # For each (image_id, class_mapped), count distinct radiologists
         votes = (
-            df_filtered[df_filtered["class_mapped"].isin(disease_names_set)]
+            disease_annotations
             .groupby(["image_id", "class_mapped"])["rad_id"]
             .nunique()
             .reset_index(name="n_rads")
         )
-        # Keep only labels with >= min_rads agreement
-        votes = votes[votes["n_rads"] >= min_rads]
+
+        # Images with ANY disease annotation (even from 1 rad)
+        images_with_any_disease = set(disease_annotations["image_id"].unique())
+
+        # Keep only labels with >= min_rads agreement → consensus disease
+        consensus_votes = votes[votes["n_rads"] >= min_rads]
+
         # Pivot to multi-hot
-        votes["value"] = 1
-        df_multi = votes.pivot_table(
-            index="image_id", columns="class_mapped", values="value",
-            fill_value=0, aggfunc="max",
-        ).reset_index()
-        # Also include images that are in the CSV but have no surviving labels
-        all_image_ids = df_filtered["image_id"].unique()
-        missing_ids = set(all_image_ids) - set(df_multi["image_id"])
-        if missing_ids:
-            df_missing = pd.DataFrame({"image_id": list(missing_ids)})
-            df_multi = pd.concat([df_multi, df_missing], ignore_index=True)
+        if len(consensus_votes) > 0:
+            consensus_votes = consensus_votes.copy()
+            consensus_votes["value"] = 1
+            df_multi = consensus_votes.pivot_table(
+                index="image_id", columns="class_mapped", values="value",
+                fill_value=0, aggfunc="max",
+            ).reset_index()
+        else:
+            df_multi = pd.DataFrame(columns=["image_id"])
+
+        consensus_ids = set(df_multi["image_id"]) if len(df_multi) > 0 else set()
+
+        # Ambiguous = has disease annotation(s) but NONE reached consensus.
+        # These images are unreliable — drop them.
+        ambiguous_set = images_with_any_disease - consensus_ids
+        ambiguous_ids = sorted(ambiguous_set)
+
+        # Truly normal = in the CSV but has NO disease annotation at all
+        all_image_ids = set(df_filtered["image_id"].unique())
+        truly_normal_ids = all_image_ids - images_with_any_disease
+
+        # Add truly normal images with all-zero disease columns
+        if truly_normal_ids:
+            df_normal = pd.DataFrame({"image_id": list(truly_normal_ids)})
+            df_multi = pd.concat([df_multi, df_normal], ignore_index=True)
+
+        logger.info(
+            "Majority-vote result: %d consensus disease, %d truly normal, "
+            "%d AMBIGUOUS (dropped).",
+            len(consensus_ids), len(truly_normal_ids), len(ambiguous_ids),
+        )
     else:
         if min_rads > 1:
             logger.warning(
@@ -318,61 +343,7 @@ def _build_multilabel_dataframe(
         len(df_multi), len(class_names),
         df_multi[class_names].sum().to_string(),
     )
-    return df_multi
-
-
-def _subsample_normal(
-    df: pd.DataFrame,
-    class_names: List[str],
-    normal_class: str,
-    alpha: float,
-    seed: int,
-) -> pd.DataFrame:
-    """Subsample normal-class images while keeping ALL disease samples.
-
-    Rule::
-
-        N_normal_selected = min(N_normal, alpha * N_max_disease)
-
-    A sample is considered "normal" iff its ``normal_class`` column is 1
-    **and** all disease columns are 0 (a multi-label disease image that
-    happens to also be tagged normal is kept as a disease sample).
-    """
-    disease_cols = [c for c in class_names if c != normal_class]
-
-    is_normal = (df[normal_class] == 1) & (df[disease_cols].sum(axis=1) == 0)
-    is_disease = ~is_normal
-
-    n_normal = int(is_normal.sum())
-    n_max_disease = (
-        int(df.loc[is_disease, disease_cols].sum().max()) if is_disease.any() else 0
-    )
-
-    target = int(min(n_normal, alpha * n_max_disease))
-    target = max(target, 1)
-
-    if target >= n_normal:
-        logger.info(
-            "Normal sampling: keeping all %d normal images "
-            "(alpha=%.2f, N_max_disease=%d, target=%d).",
-            n_normal, alpha, n_max_disease, target,
-        )
-        return df
-
-    logger.info(
-        "Normal sampling: %d -> %d "
-        "(alpha=%.2f * N_max_disease=%d = %d, capped at %d).",
-        n_normal, target, alpha, n_max_disease,
-        int(alpha * n_max_disease), target,
-    )
-
-    rng = np.random.RandomState(seed)
-    normal_indices = df.index[is_normal].tolist()
-    sampled = rng.choice(normal_indices, size=target, replace=False)
-
-    df_out = pd.concat([df.loc[is_disease], df.loc[sampled]]).sort_index()
-    return df_out.reset_index(drop=True)
-
+    return df_multi, ambiguous_ids
 
 # ---------------------------------------------------------------------------
 # Multi-label stratified split
@@ -773,10 +744,6 @@ def _parse_args() -> argparse.Namespace:
         help="Image subdirectory inside --source (default: train).",
     )
     csv_grp.add_argument(
-        "--alpha", type=float, default=None, metavar="A",
-        help="Override normal-class sampling alpha from system.yaml.",
-    )
-    csv_grp.add_argument(
         "--min-rads", type=int, default=1, metavar="N",
         help="Minimum radiologists that must agree for a positive label "
              "(default: 1 = OR/any; 2 = majority vote for 3-rater datasets).",
@@ -821,12 +788,14 @@ def main() -> None:
         cfg = _load_system_config()
         class_names_raw = cfg.get("model", {}).get("class_names", [])
         
-        class_names = _get_class_names_from_config(pipeline_config)
-        alpha = args.alpha if args.alpha is not None else _get_alpha(cfg)
+        # Use the RAW class names from system.yaml (including "No finding")
+        # rather than PipelineConfig which filters "No finding" for multilabel.
+        # organize_data.py needs "No finding" for normal-class subsampling and
+        # split outputs.
+        class_names = class_names_raw if class_names_raw else _get_class_names_from_config(pipeline_config)
         normal_class = _identify_normal_class(class_names_raw)
 
         logger.info("Class names (from config): %s", class_names)
-        logger.info("Alpha (normal sampling):   %.2f", alpha)
         logger.info("Normal class:              %s", normal_class)
 
         # Build image index
@@ -835,15 +804,32 @@ def main() -> None:
 
         # Build multi-label dataframe from source CSV
         label_csv_path = args.source / args.label_csv
-        df = _build_multilabel_dataframe(
+        df, ambiguous_ids = _build_multilabel_dataframe(
             label_csv_path, class_names, normal_class, image_index,
             min_rads=args.min_rads,
         )
 
-        # Subsample normal class
-        if normal_class:
-            df = _subsample_normal(df, class_names, normal_class, alpha, args.seed)
-            logger.info("After sampling: %d images", len(df))
+        # Save ambiguous images to a separate directory for review
+        if ambiguous_ids:
+            ambiguous_dir = args.dest.parent / "ambiguous_img"
+            ambiguous_dir.mkdir(parents=True, exist_ok=True)
+            n_copied = 0
+            for img_id in ambiguous_ids:
+                src = image_index.get(img_id)
+                if src is not None:
+                    dest_file = ambiguous_dir / src.name
+                    if not dest_file.exists():
+                        try:
+                            shutil.copy2(src, dest_file) if args.copy else os.symlink(src.resolve(), dest_file)
+                            n_copied += 1
+                        except Exception as exc:
+                            logger.warning("Failed to save ambiguous image %s: %s", src.name, exc)
+            logger.info(
+                "Saved %d ambiguous images (out of %d) to %s",
+                n_copied, len(ambiguous_ids), ambiguous_dir,
+            )
+
+        logger.info("Total images (no downsampling): %d", len(df))
 
         # Guard against duplicate filenames
         dups = df["filename"].duplicated()

@@ -18,8 +18,8 @@ transfer_learning:
   freeze_backbone: false
   differential_lr:
     enabled: true
-    backbone_lr: 1.0e-5
-    head_lr: 1.0e-4
+    backbone_lr: 5.0e-5
+    head_lr: 5.0e-4
 
 input:
   size: [384, 384]

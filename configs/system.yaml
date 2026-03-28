@@ -14,7 +14,6 @@ augmentation:
 # data directories / manifest match.  num_classes is derived automatically.
 model:
   class_names: ['No finding', 'Cardiomegaly', 'Aortic enlargement', 'Pleural thickening',  'Pulmonary fibrosis']
-  alpha: 1.2
   classification_mode: "multilabel" # "multilabel" or "multiclass"
 
 clinical_rules:
