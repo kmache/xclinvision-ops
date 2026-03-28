@@ -5,8 +5,6 @@ ensemble logic, and advanced progressive unfreezing utilities.
 
 import logging
 from typing import Dict, List, Optional, Union, Any
-from xml.parsers.expat import model
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
