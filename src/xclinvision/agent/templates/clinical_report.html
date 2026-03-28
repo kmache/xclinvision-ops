@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XClinVision Clinical Report</title>
+<style>
+  /* ── Reset & Base ────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px; line-height: 1.6; color: #1a1a1a;
+    background: #f5f6f8; padding: 20px;
+  }
+  .report {
+    max-width: 900px; margin: 0 auto; background: #fff;
+    border: 1px solid #d0d5dd; border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  }
+
+  /* ── Header ──────────────────────────────────────────── */
+  .header {
+    background: linear-gradient(135deg, #1b3a5c 0%, #27548a 100%);
+    color: #fff; padding: 28px 32px; border-radius: 6px 6px 0 0;
+  }
+  .header h1 { font-size: 22px; font-weight: 700; letter-spacing: 0.3px; }
+  .header .subtitle { font-size: 13px; opacity: 0.85; margin-top: 4px; }
+
+  /* ── Disclaimer / Warning ────────────────────────────── */
+  .disclaimer {
+    background: #eef3f8; border-left: 4px solid #27548a;
+    padding: 14px 20px; margin: 0 24px 0 24px; margin-top: 20px;
+    font-size: 12.5px; color: #3d5a80; border-radius: 3px;
+  }
+  .warning-box {
+    background: #fef2f2; border: 2px solid #ef4444;
+    padding: 16px 20px; margin: 20px 24px 0 24px;
+    border-radius: 6px; color: #991b1b; font-weight: 600;
+    font-size: 14px;
+  }
+  .warning-box .icon { font-size: 18px; margin-right: 6px; }
+
+  /* ── Section ────────────────────────────────────────── */
+  .section { padding: 20px 32px; border-top: 1px solid #e5e7eb; }
+  .section h2 {
+    font-size: 15px; font-weight: 700; color: #1b3a5c;
+    text-transform: uppercase; letter-spacing: 0.6px;
+    margin-bottom: 12px; padding-bottom: 6px;
+    border-bottom: 2px solid #e5e7eb;
+  }
+
+  /* ── Patient Meta ───────────────────────────────────── */
+  .meta-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 10px;
+  }
+  .meta-item { font-size: 13px; }
+  .meta-item .label { font-weight: 600; color: #555; }
+
+  /* ── Findings table ────────────────────────────────── */
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+  th { background: #f3f4f6; text-align: left; padding: 8px 12px; font-weight: 600; color: #374151; }
+  td { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; }
+  tr:hover td { background: #f9fafb; }
+  .prob-bar {
+    display: inline-block; height: 8px; border-radius: 4px;
+    background: #3b82f6; vertical-align: middle; margin-left: 6px;
+  }
+
+  /* ── Lists ─────────────────────────────────────────── */
+  .finding-list, .step-list, .cite-list { padding-left: 20px; margin-top: 6px; }
+  .finding-list li, .step-list li, .cite-list li { margin-bottom: 4px; }
+
+  /* ── Spatial evidence ──────────────────────────────── */
+  .spatial-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 6px 20px;
+    font-size: 13px; margin-top: 8px;
+  }
+  .spatial-item .region { font-weight: 600; color: #1b3a5c; }
+
+  /* ── Urgency badge ─────────────────────────────────── */
+  .badge {
+    display: inline-block; padding: 3px 12px; border-radius: 12px;
+    font-size: 12px; font-weight: 700; text-transform: uppercase;
+  }
+  .badge-low  { background: #d1fae5; color: #065f46; }
+  .badge-med  { background: #fef3c7; color: #92400e; }
+  .badge-high { background: #fee2e2; color: #991b1b; }
+
+  /* ── Reasoning trace ───────────────────────────────── */
+  .trace {
+    background: #f9fafb; border: 1px solid #e5e7eb;
+    padding: 14px 18px; border-radius: 4px;
+    font-size: 13px; white-space: pre-wrap;
+    max-height: 400px; overflow-y: auto;
+  }
+
+  /* ── Visuals ───────────────────────────────────────── */
+  .visuals { display: flex; flex-wrap: wrap; gap: 20px; justify-content: center; }
+  .visuals img { max-width: 420px; width: 100%; border-radius: 4px; border: 1px solid #e5e7eb; }
+
+  /* ── Footer ────────────────────────────────────────── */
+  .footer {
+    text-align: center; font-size: 11px; color: #9ca3af;
+    padding: 14px 32px; border-top: 1px solid #e5e7eb;
+  }
+
+  /* ── Print / PDF Specifics ────────────────────────────── */
+  @media print {
+    body { background: #fff; padding: 0; }
+    .report { border: none; box-shadow: none; max-width: 100%; }
+
+    /* Force rendering of background colors (Header, Badges, Bars) */
+    * {
+      -webkit-print-color-adjust: exact !important;
+      print-color-adjust: exact !important;
+    }
+
+    /* Prevent awkward page breaks */
+    .section { page-break-inside: avoid; break-inside: avoid; }
+    .visuals { page-break-inside: avoid; break-inside: avoid; }
+    tr { page-break-inside: avoid; break-inside: avoid; }
+
+    /* Ensure the trace doesn't get an internal scrollbar on PDFs */
+    .trace { max-height: none; overflow-y: visible; }
+  }
+</style>
+</head>
+<body>
+<div class="report">
+
+  <!-- Header -->
+  <div class="header">
+    <h1>XClinVision &mdash; AI-Assisted Chest X-Ray Report</h1>
+    <div class="subtitle">Generated {{ generated_at }} &nbsp;|&nbsp; Report&nbsp;ID:&nbsp;{{ report_id }}</div>
+  </div>
+
+  <!-- AI Disclaimer -->
+  <div class="disclaimer">
+    &#9432;&ensp;<strong>AI Decision-Support Disclaimer:</strong>
+    This report was generated by an artificial-intelligence system and is intended
+    solely as a <em>clinical decision-support tool</em>.  It does <strong>not</strong>
+    constitute a definitive radiological interpretation.  All findings must be
+    verified by a qualified radiologist before any clinical action is taken.
+  </div>
+
+  <!-- Human-review warning -->
+  {% if report.requires_human_review %}
+  <div class="warning-box">
+    <span class="icon">&#9888;</span>
+    Low confidence or conflicting evidence detected &mdash; <u>radiologist review is required</u>
+    before acting on these findings.
+  </div>
+  {% endif %}
+
+  <!-- Patient Information -->
+  <div class="section">
+    <h2>Patient Information</h2>
+    <div class="meta-grid">
+      {% for key, val in patient_meta.items() %}
+      <div class="meta-item"><span class="label">{{ key | replace("_"," ") | title }}:</span> {{ val }}</div>
+      {% endfor %}
+      {% if not patient_meta %}
+      <div class="meta-item" style="color:#999;">No patient metadata provided.</div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- AI Findings with Calibrated Confidence -->
+  <div class="section">
+    <h2>AI Findings &amp; Confidence</h2>
+    <table>
+      <thead><tr><th>Condition</th><th>Probability</th><th>Interpretation</th></tr></thead>
+      <tbody>
+      {% for p in calibrated %}
+      <tr>
+        <td>{{ p.class_name }}</td>
+        <td>{{ p.pct }} <span class="prob-bar" style="width:{{ (p.probability * 120) | int }}px"></span></td>
+        <td>{{ p.clinical_term }}</td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="3" style="text-align:center; color:#666; font-style:italic;">No significant findings detected.</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Spatial Evidence -->
+  {% if report.spatial_evidence %}
+  <div class="section">
+    <h2>Spatial Evidence (XAI)</h2>
+    <div class="spatial-grid">
+      {% for region, desc in report.spatial_evidence.items() %}
+      <div class="spatial-item"><span class="region">{{ region }}:</span> {{ desc }}</div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Visual Dashboard -->
+  {% if gradcam_b64 or radar_b64 %}
+  <div class="section">
+    <h2>Visual Dashboard</h2>
+    <div class="visuals">
+      {% if gradcam_b64 %}
+      <div><img src="data:image/png;base64,{{ gradcam_b64 }}" alt="Grad-CAM++ Overlay"><p style="text-align:center;font-size:12px;color:#666;margin-top:4px;">Grad-CAM++ Activation Overlay</p></div>
+      {% endif %}
+      {% if radar_b64 %}
+      <div><img src="data:image/png;base64,{{ radar_b64 }}" alt="Prediction Radar Chart"><p style="text-align:center;font-size:12px;color:#666;margin-top:4px;">Prediction Profile</p></div>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Reasoning Trace -->
+  <div class="section">
+    <h2>Reasoning Trace</h2>
+    <div class="trace">{{ report.reasoning_trace }}</div>
+  </div>
+
+  <!-- Differential Diagnosis -->
+  {% if report.differential_diagnosis %}
+  <div class="section">
+    <h2>Differential Diagnosis</h2>
+    <ol class="finding-list">
+      {% for dx in report.differential_diagnosis %}
+      <li>{{ dx }}</li>
+      {% endfor %}
+    </ol>
+  </div>
+  {% endif %}
+
+  <!-- Impression & Urgency -->
+  <div class="section">
+    <h2>Impression</h2>
+    <p>{{ report.impression }}</p>
+    <p style="margin-top:10px;">
+      <strong>Urgency:</strong>
+      {% set urg = (report.urgency | default('unknown')) | string | lower | trim %}
+      {% if urg == "low" %}
+        <span class="badge badge-low">Low</span>
+      {% elif urg == "medium" %}
+        <span class="badge badge-med">Medium</span>
+      {% elif urg in ["high", "critical", "urgent"] %}
+        <span class="badge badge-high">High</span>
+      {% else %}
+        <span class="badge" style="background:#e5e7eb; color:#4b5563;">{{ report.urgency | default('Unspecified', true) | title }}</span>
+      {% endif %}
+    </p>
+  </div>
+
+  <!-- Temporal Changes -->
+  {% if report.temporal_changes %}
+  <div class="section">
+    <h2>Temporal / Longitudinal Changes</h2>
+    <p>{{ report.temporal_changes }}</p>
+  </div>
+  {% endif %}
+
+  <!-- Recommendations / Next Steps -->
+  {% if report.next_steps %}
+  <div class="section">
+    <h2>Recommendations</h2>
+    <ul class="step-list">
+      {% for step in report.next_steps %}
+      <li>{{ step }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  <!-- Citations -->
+  {% if report.citations %}
+  <div class="section">
+    <h2>Citations &amp; Sources</h2>
+    <ol class="cite-list">
+      {% for cite in report.citations %}
+      <li>{{ cite }}</li>
+      {% endfor %}
+    </ol>
+  </div>
+  {% endif %}
+
+  <!-- Footer -->
+  <div class="footer">
+    XClinVision v0.1 &bull; AI Decision-Support System &bull; Not a substitute for professional medical judgement.
+  </div>
+</div>
+</body>
+</html>
