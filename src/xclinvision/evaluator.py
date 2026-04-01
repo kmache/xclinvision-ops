@@ -602,32 +602,32 @@ class ThresholdOptimizer:
         self,
         y_true: np.ndarray,
         y_probs: np.ndarray,
-        search_range: Tuple[float, float] = (0.1, 0.9),
-        num_steps: int = 81,
     ) -> Dict[str, float]:
-        """Search for optimal per-class thresholds that maximise F1.
+        """Find optimal per-class thresholds that maximise F1.
+
+        Uses sklearn's ``precision_recall_curve`` to compute the exact
+        threshold that maximises the F1 score for each class — faster and
+        more precise than a brute-force grid search.
 
         Args:
             y_true: Binary ground-truth matrix, shape (N, num_classes).
             y_probs: Predicted probabilities, shape (N, num_classes).
-            search_range: Min/max threshold to search.
-            num_steps: Number of threshold candidates per class.
 
         Returns:
             Dict mapping class name → optimal threshold.
         """
-        from sklearn.metrics import f1_score as _f1
+        from sklearn.metrics import precision_recall_curve
 
-        candidates = np.linspace(search_range[0], search_range[1], num_steps)
         best: Dict[str, float] = {}
 
         for i, name in enumerate(self.class_names):
-            best_f1, best_t = -1.0, 0.5
-            for t in candidates:
-                preds = (y_probs[:, i] >= t).astype(int)
-                f1 = float(_f1(y_true[:, i], preds, zero_division=0))
-                if f1 > best_f1:
-                    best_f1, best_t = f1, float(t)
+            precisions, recalls, thresholds = precision_recall_curve(
+                y_true[:, i], y_probs[:, i],
+            )
+            f1_scores = (2 * precisions * recalls) / (precisions + recalls + 1e-8)
+            best_idx = int(np.argmax(f1_scores))
+            best_t = float(thresholds[best_idx]) if best_idx < len(thresholds) else 0.5
+            best_f1 = float(f1_scores[best_idx])
             best[name] = round(best_t, 4)
             logger.info(f"  {name}: threshold={best_t:.4f}  F1={best_f1:.4f}")
 

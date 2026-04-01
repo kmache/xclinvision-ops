@@ -1,0 +1,11 @@
+                    precision    recall  f1-score   support
+
+      Cardiomegaly       0.31      0.94      0.47       272
+Aortic enlargement       0.39      0.93      0.55       352
+Pleural thickening       0.12      0.89      0.22       132
+Pulmonary fibrosis       0.14      0.91      0.24       152
+
+         micro avg       0.23      0.93      0.37       908
+         macro avg       0.24      0.92      0.37       908
+      weighted avg       0.29      0.93      0.43       908
+       samples avg       0.11      0.24      0.15       908

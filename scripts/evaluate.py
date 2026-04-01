@@ -38,6 +38,7 @@ from xclinvision.evaluator import (
     CalibrationAnalyzer,
     MetricsComputer,
     TemperatureScaler,
+    ThresholdOptimizer,
 )
 from xclinvision.modeling import build_model, get_model_normalization
 from xclinvision.processing import get_processed_dir_for_size
@@ -126,6 +127,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pooling", type=str, choices=["avg", "gem"], default="avg",
         help="Pooling type used during training. Default: avg."
+    )
+    parser.add_argument(
+        "--optimize-thresholds", action="store_true",
+        help="Tune per-class decision thresholds on the validation set to maximise F1 (multilabel only)."
     )
     return parser.parse_args()
 
@@ -290,6 +295,36 @@ def main() -> None:
         y_pred = (y_probs > 0.5).astype(int)
     else:
         y_pred = np.argmax(y_probs, axis=1)
+
+    # ------------------------------------------------------------------
+    # 3b. Optional: Per-class threshold optimization (multilabel)
+    # ------------------------------------------------------------------
+    threshold_optimizer: ThresholdOptimizer | None = None
+
+    if args.optimize_thresholds:
+        if not _multilabel:
+            logger.warning("--optimize-thresholds is only supported for multilabel. Skipping.")
+        else:
+            logger.info("Tuning per-class thresholds on validation set …")
+            data_module.setup(stage="fit")
+            val_loader = data_module.val_dataloader()
+
+            y_val, _, y_val_probs = collect_predictions(
+                model, val_loader, device, desc="Threshold tuning (val)",
+                norm_mean=norm_stats["mean"], norm_std=norm_stats["std"],
+            )
+
+            threshold_optimizer = ThresholdOptimizer(class_names=get_class_names())
+            optimal_thresholds = threshold_optimizer.fit(y_val, y_val_probs)
+            logger.info(f"Optimal thresholds: {optimal_thresholds}")
+
+            # Re-apply optimised thresholds to test predictions
+            y_pred_default = y_pred.copy()
+            y_pred = threshold_optimizer.apply(y_probs)
+
+            # Save thresholds
+            thresh_path = output_dir / f"{args.model_name}_thresholds.json"
+            threshold_optimizer.save(str(thresh_path))
 
     # ------------------------------------------------------------------
     # 4. Optional: Temperature Scaling (calibration)
@@ -465,6 +500,35 @@ def main() -> None:
     report_path = output_dir / f"{args.model_name}_{args.split}_evaluation_report.json"
     metrics_computer.save_results(metrics, str(report_path))
     logger.info(f"Full report saved to {report_path}")
+
+    # ------------------------------------------------------------------
+    # 10b. Compare default vs optimised thresholds (if applicable)
+    # ------------------------------------------------------------------
+    if threshold_optimizer is not None:
+        logger.info("\n" + "=" * 60)
+        logger.info("THRESHOLD OPTIMIZATION COMPARISON")
+        logger.info("=" * 60)
+
+        default_metrics = MetricsComputer(class_names=class_names).compute_all_metrics(
+            y_true, y_pred_default, y_probs,
+        )
+        logger.info(f"  {'Metric':<22} {'Default (0.5)':>14} {'Optimised':>14} {'Delta':>10}")
+        logger.info(f"  {'-'*22} {'-'*14} {'-'*14} {'-'*10}")
+        for key in ["macro_precision", "macro_recall", "macro_f1", "weighted_f1"]:
+            d = default_metrics.get(key, 0)
+            o = metrics.get(key, 0)
+            logger.info(f"  {key:<22} {d:>14.4f} {o:>14.4f} {o - d:>+10.4f}")
+
+        for name in class_names:
+            dk = f"{name}_precision"
+            d = default_metrics.get(dk, 0)
+            o = metrics.get(dk, 0)
+            t = threshold_optimizer.thresholds[name]
+            logger.info(
+                f"  {name + '_prec':<22} {d:>14.4f} {o:>14.4f} {o - d:>+10.4f}  (t={t:.3f})"
+            )
+
+        logger.info("=" * 60)
 
     # Final summary line
     acc_key = 'subset_accuracy' if _multilabel else 'accuracy'

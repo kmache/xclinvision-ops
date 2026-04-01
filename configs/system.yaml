@@ -8,10 +8,6 @@ paths:
 augmentation:
   horizontal_flip: true   # set false for laterality-sensitive classes (e.g. pneumothorax, effusion)
 
-# Model Configuration
-# class_names is the single source of truth for disease classes.
-# To change the set of diseases, update class_names below and ensure your
-# data directories / manifest match.  num_classes is derived automatically.
 model:
   class_names: ['No finding', 'Cardiomegaly', 'Aortic enlargement', 'Pleural thickening',  'Pulmonary fibrosis']
   classification_mode: "multilabel" # "multilabel" or "multiclass"

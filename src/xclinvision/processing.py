@@ -420,8 +420,14 @@ def load_dataset_metadata(
     return df
 
 def _process_image_worker(args):
-    """Exception-safe top-level worker for multiprocessing."""
-    row_dict, target_size, min_area_ratio, output_format, processed_dir, quarantine_dir = args
+    """Exception-safe top-level worker for multiprocessing.
+
+    Performs ALL disk I/O inside the worker so only lightweight metadata
+    crosses the IPC boundary (no numpy arrays serialised via pickle).
+    """
+    cv2.setNumThreads(0)  # prevent OpenCV threading deadlocks under fork()
+
+    row_dict, target_size, min_area_ratio, output_format, processed_dir, quarantine_dir, is_multilabel = args
 
     try:
         result = process_and_filter_xray(row_dict["filepath"], target_size, min_area_ratio)
@@ -429,31 +435,55 @@ def _process_image_worker(args):
         logger.debug("Worker exception on %s: %s", row_dict["filepath"], exc)
         result = XrayProcessResult(None, ProcessCategory.ERROR, f"Worker exception: {exc}")
 
-    return {
-        "result": result,
-        "row": row_dict,
-        "output_format": output_format,
-        "processed_dir": processed_dir,
-        "quarantine_dir": quarantine_dir,
-    }
+    saved_path: Optional[str] = None
 
+    if result.category == ProcessCategory.SUCCESS and result.image is not None:
+        out_name = f"{Path(row_dict['filename']).stem}.{output_format}"
+        if is_multilabel:
+            dest = Path(processed_dir) / "images" / out_name
+        else:
+            dest = Path(processed_dir) / row_dict["split"] / row_dict["class"] / out_name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(dest), result.image)
+        saved_path = str(dest)
+    else:
+        q_folder = "corrupted" if result.category == ProcessCategory.ERROR else "flagged"
+        if is_multilabel:
+            dest = Path(quarantine_dir) / q_folder / row_dict["filename"]
+        else:
+            dest = Path(quarantine_dir) / q_folder / row_dict["split"] / row_dict["class"] / row_dict["filename"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(row_dict["filepath"], dest)
+        saved_path = str(dest)
+
+    return {
+        "status": result.category.name,
+        "reason": result.reason,
+        "row": row_dict,
+        "saved_path": saved_path,
+    }
 
 def _merge_multilabels_into_manifest(manifest_df: pd.DataFrame, labels_path: Path) -> pd.DataFrame:
     labels_df = pd.read_csv(labels_path)
-    labels_df["_stem"] = labels_df["filename"].apply(lambda x: Path(x).stem)
     manifest_df = manifest_df.copy()
-    manifest_df["_stem"] = manifest_df["filepath_processed"].apply(lambda x: Path(x).stem)
+    # 1. Merge safely using the exact original filename (prevents .jpg vs .dcm mixups)
+    manifest_df["_original_filename"] = manifest_df["filepath_original"].apply(lambda x: Path(x).name)
+    merged = manifest_df.merge(labels_df, left_on="_original_filename", right_on="filename",  how="left")
 
-    label_cols = [c for c in labels_df.columns if c not in ("filename", "_stem")]
-    merged = manifest_df.merge(labels_df[["_stem"] + label_cols], on="_stem", how="left")
-    merged.drop(columns=["_stem"], inplace=True)
-
+    # 2. Validate that no labels were lost during the merge
+    label_cols = [c for c in labels_df.columns if c != "filename"]
     for col in label_cols:
         if merged[col].isna().any():
-            raise ValueError(f"NaN in label column '{col}' after merge")
+            missing = merged[merged[col].isna()]["_original_filename"].tolist()[:5]
+            raise ValueError(f"NaN in label column '{col}' after merge. Unmatched files: {missing}")
         merged[col] = merged[col].astype(int)
 
-    drop_cols = [c for c in ("class", "source_dataset", "filepath_original") if c in merged.columns] + ["No finding"]
+    # 3. Clean up columns
+    drop_cols = [
+        c for c in ("class", "source_dataset", "filepath_original", "_original_filename", "filename") 
+        if c in merged.columns
+    ]
+    
     merged.drop(columns=drop_cols, inplace=True)
     return merged
 
@@ -472,8 +502,7 @@ def run_processing_pipeline(
     config: Optional[PipelineConfig] = None,
 ) -> PipelineReport:
     
-    raw_dir, processed_dir, quarantine_dir = Path(raw_dir), Path(processed_dir), Path(quarantine_dir)
-    duplicate_dir = Path(duplicate_dir) if duplicate_dir else processed_dir.parent / "duplicate"
+    raw_dir, quarantine_dir = Path(raw_dir), Path(quarantine_dir)
     report = PipelineReport()
     
     if config is not None:
@@ -486,6 +515,10 @@ def run_processing_pipeline(
     logger.info("Scanning raw dataset at %s (mode=%s) …", raw_dir, mode)
     df = load_dataset_metadata(raw_dir, mode=mode)
     report.total_images = len(df) 
+
+    unique_classes = df['class'].unique().tolist() if not df.empty else None
+    processed_dir = get_processed_dir_for_size(str(processed_dir), target_size, unique_classes)
+    duplicate_dir = Path(duplicate_dir) if duplicate_dir else processed_dir.parent / "duplicate"
 
     source_meta_path = raw_dir / "source_metadata.csv"
     if source_meta_path.exists():
@@ -580,7 +613,8 @@ def run_processing_pipeline(
     logger.info("Processing %d unique images…", len(df_keepers))
 
     worker_args = [
-        (row.to_dict(), target_size, min_area_ratio, output_format, str(processed_dir), str(quarantine_dir))
+        (row.to_dict(), target_size, min_area_ratio, output_format,
+         str(processed_dir), str(quarantine_dir), is_multilabel)
         for _, row in df_keepers.iterrows()
     ]
 
@@ -589,55 +623,36 @@ def run_processing_pipeline(
     logger.info("Launching pool with %d workers…", n_workers)
 
     with Pool(processes=n_workers) as pool:
-        results = list(tqdm(pool.imap(_process_image_worker, worker_args), total=len(worker_args), desc="Processing X-rays"))
+        for res in tqdm(pool.imap_unordered(_process_image_worker, worker_args),
+                        total=len(worker_args), desc="Processing X-rays"):
+            row = res["row"]
+            filepath = row["filepath"]
+            status = res["status"]
+            saved_path = res["saved_path"]
 
-    for res in results:
-        row = res["row"]
-        result: XrayProcessResult = res["result"]
-        filepath = row["filepath"]
+            if status == ProcessCategory.SUCCESS.name:
+                processed_records.append({
+                    "filepath_original": filepath,
+                    "filepath_processed": saved_path,
+                    "split": row["split"],
+                    "class": row["class"],
+                    "source_dataset": row.get("source_dataset", "unknown"),
+                })
+                report.processed += 1
 
-        if result.category == ProcessCategory.SUCCESS and result.image is not None:
-            out_name = f"{Path(row['filename']).stem}.{output_format}"
-            if is_multilabel:
-                dest = processed_dir / "images" / out_name
             else:
-                dest = processed_dir / row["split"] / row["class"] / out_name
-                
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(dest), result.image)
+                if status == ProcessCategory.ERROR.name:
+                    report.quarantined_corrupted += 1
+                else:
+                    report.quarantined_flagged += 1
 
-            processed_records.append({
-                "filepath_original": filepath,
-                "filepath_processed": str(dest),
-                "split": row["split"],
-                "class": row["class"],
-                "source_dataset": row.get("source_dataset", "unknown"),
-            })
-            report.processed += 1
-
-        else:
-            q_folder = "corrupted" if result.category == ProcessCategory.ERROR else "flagged"
-
-            if result.category == ProcessCategory.ERROR:
-                report.quarantined_corrupted += 1
-            else:
-                report.quarantined_flagged += 1
-
-            if is_multilabel:
-                dest = quarantine_dir / q_folder / row["filename"]
-            else:
-                dest = quarantine_dir / q_folder / row["split"] / row["class"] / row["filename"]
-                
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(filepath, dest)
-
-            quarantine_records.append({
-                "filepath_original": filepath,
-                "filepath_quarantine": str(dest),
-                "split": row["split"],
-                "class": row["class"],
-                "reason": result.reason,
-            })
+                quarantine_records.append({
+                    "filepath_original": filepath,
+                    "filepath_quarantine": saved_path,
+                    "split": row["split"],
+                    "class": row["class"],
+                    "reason": res["reason"],
+                })
 
     # Save manifests
     if processed_records:

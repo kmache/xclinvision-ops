@@ -1,0 +1,8 @@
+{
+  "thresholds": {
+    "Cardiomegaly": 0.7903,
+    "Aortic enlargement": 0.7136,
+    "Pleural thickening": 0.6176,
+    "Pulmonary fibrosis": 0.5007
+  }
+}

@@ -72,10 +72,6 @@ def get_train_transforms(
             fill=0,
             p=min(1.0, 0.2 * aug_strength)
         ),
-        # NOTE: Do NOT use A.ToFloat before A.Normalize.
-        # A.Normalize already divides by max_pixel_value=255 internally.
-        # Adding ToFloat first collapses the entire [0,255] range to ~0.02
-        # around -2.1, making all pixels nearly identical.
         A.Normalize(mean=mean, std=std),
         ToTensorV2()
     ])
@@ -117,8 +113,6 @@ class ChestXrayDataset(Dataset):
         _class_map = config.class_map
 
         if self.multilabel:
-            # 'No finding' is represented by an all-zero label vector in
-            # multilabel mode — exclude it from the label columns.
             filtered = [n for n in self._class_names if n.lower() != 'no finding']
             if len(filtered) < len(self._class_names):
                 logger.warning(
@@ -149,8 +143,7 @@ class ChestXrayDataset(Dataset):
             
     def _load_image_impl(self, image_path: str) -> np.ndarray:
         image = read_image_grayscale(image_path)
-        if image is None: 
-            # Throw explicit error instead of silent zeros
+        if image is None:  
             raise IOError(f"Failed to load processed image: {image_path}")
         return cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
 
@@ -384,22 +377,32 @@ class ChestXrayDataModule(pl.LightningDataModule):
             self.setup()
 
         if self.config.multilabel:
-            stats = {
+            # 1. Dist for explicit diseases (using the filtered _class_names to avoid IndexError)
+            dist = {
+                name: {
+                    'train': int(self.train_dataset.labels[:, i].sum()),
+                    'val': int(self.val_dataset.labels[:, i].sum()),
+                    'test': int(self.test_dataset.labels[:, i].sum()),
+                }
+                for i, name in enumerate(self.train_dataset._class_names)
+            }
+            
+            # 2. Add 'No finding' back into the stats by counting the all-zero rows
+            dist['no finding'] = {
+                'train': int((self.train_dataset.labels.sum(axis=1) == 0).sum()),
+                'val': int((self.val_dataset.labels.sum(axis=1) == 0).sum()),
+                'test': int((self.test_dataset.labels.sum(axis=1) == 0).sum()),
+            }
+
+            return {
                 'train_samples': len(self.train_dataset),
                 'val_samples': len(self.val_dataset),
                 'test_samples': len(self.test_dataset),
-                'class_distribution': {
-                    name: {
-                        'train': int(self.train_dataset.labels[:, i].sum()),
-                        'val': int(self.val_dataset.labels[:, i].sum()),
-                        'test': int(self.test_dataset.labels[:, i].sum()),
-                    }
-                    for i, name in enumerate(self.config.class_names)
-                },
+                'class_distribution': dist,
                 'class_weights': self.get_class_weights().tolist(),
             }
-            return stats
 
+        # --- Multiclass Logic ---
         train_counts = self.train_dataset.df['class'].str.lower().value_counts().to_dict()
         val_counts = self.val_dataset.df['class'].str.lower().value_counts().to_dict()
         test_counts = self.test_dataset.df['class'].str.lower().value_counts().to_dict()

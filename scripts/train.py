@@ -218,6 +218,8 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--image-size", type=int, default=None, help="Override config image size")
     parser.add_argument("--process-size", type=int, default=1024, help="Resolution for storing processed images on disk")
+    parser.add_argument("--manifest", type=str, default=None,
+                        help="Path to pre-processed manifest CSV (skips auto-processing)")
     parser.add_argument("--loss", type=str, choices=["focal", "ce", "asl"], default="ce")
     parser.add_argument("--pooling", type=str, choices=["avg", "gem"], default="gem", help="Global pooling type")
     parser.add_argument("--weight-decay", type=float, default=None)
@@ -283,19 +285,25 @@ def main():
     devices_parsed = "auto" if args.devices.lower() == "auto" else int(args.devices)
     use_weighted_sampler = not args.no_weighted_sampler
 
-    raw_dir = paths_cfg.get("raw_data_dir", "data/raw")
-    processed_base_dir = paths_cfg.get("processed_data_dir", "data/processed")
-    quarantine_dir = paths_cfg.get("quarantine_dir", "data/quarantine")
-    
-    processed_dir = ensure_processed_data_exists(
-        image_size=process_size,
-        raw_dir=raw_dir,
-        processed_base_dir=processed_base_dir,
-        quarantine_dir=quarantine_dir,
-        force_reprocess=args.force_reprocess,
-        class_names=class_names,
-    )
-    manifest_path = str(processed_dir / "manifest.csv")
+    if args.manifest:
+        manifest_path = args.manifest
+        if not Path(manifest_path).exists():
+            raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+        print(f"[Info] Using provided manifest: {manifest_path}")
+    else:
+        raw_dir = paths_cfg.get("raw_data_dir", "data/raw")
+        processed_base_dir = paths_cfg.get("processed_data_dir", "data/processed")
+        quarantine_dir = paths_cfg.get("quarantine_dir", "data/quarantine")
+        
+        processed_dir = ensure_processed_data_exists(
+            image_size=process_size,
+            raw_dir=raw_dir,
+            processed_base_dir=processed_base_dir,
+            quarantine_dir=quarantine_dir,
+            force_reprocess=args.force_reprocess,
+            class_names=class_names,
+        )
+        manifest_path = str(processed_dir / "manifest.csv")
 
     pl.seed_everything(args.seed, workers=True)
     if args.deterministic:
@@ -314,9 +322,6 @@ def main():
     )
     norm_stats = get_model_normalization(base_model, args.model)
 
-    # Build disease-only config: in multilabel mode 'No finding' is
-    # implicit (all-zero label vector), so the dataset/model only see
-    # the 4 pathology columns.
     full_config = PipelineConfig.from_yaml()
     disease_config = PipelineConfig(
         class_names=class_names,
@@ -348,8 +353,6 @@ def main():
     print(f"Computed class weights: {class_weights}")
     class_weights_for_loss = class_weights
     
-    # Do NOT scale LR by accumulate_grad_batches — PL handles grad
-    # accumulation internally; manual scaling doubles the effective LR.
     effective_lr = args.lr
 
     pl_module = XClinVisionModel(

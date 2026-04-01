@@ -1,10 +1,10 @@
 """Explainability (XAI) module for generating clinical-grade heatmaps.
 
-Provides Grad-CAM++ visualizations, anatomical region scoring, and a
-``ValidationXAI`` harness consumed by training callbacks.
+Provides Grad-CAM++ and Score-CAM visualizations, anatomical region scoring,
+and a ``ValidationXAI`` harness consumed by training callbacks.
 
-No external ``pytorch-grad-cam`` dependency — the Grad-CAM++ algorithm is
-implemented from scratch so the package stays lightweight in production.
+No external ``pytorch-grad-cam`` dependency — both Grad-CAM++ and Score-CAM
+are implemented from scratch so the package stays lightweight in production.
 """
 
 from __future__ import annotations
@@ -185,6 +185,139 @@ class GradCAMPlusPlus:
         cam = F.interpolate(
             cam.unsqueeze(0).unsqueeze(0),
             size=input_tensor.shape[2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        return cam.squeeze().cpu().numpy(), target_class
+
+
+# =========================================================================
+# Score-CAM (gradient-free implementation)
+# =========================================================================
+
+class ScoreCAM:
+    """Score-CAM: gradient-free class activation mapping.
+
+    Uses forward-pass-only perturbation scoring instead of backpropagation,
+    making it architecture-agnostic and free of gradient noise.  A top-k
+    channel selection and batched forward pass keep it production-viable.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        target_layer: nn.Module,
+        top_k: int = 32,
+    ) -> None:
+        self.model = model
+        self.target_layer = target_layer
+        self.top_k = top_k
+        self.activations: Optional[torch.Tensor] = None
+        self._fwd_handle: Optional[torch.utils.hooks.RemovableHandle] = None
+        self._register_hooks()
+
+    def _register_hooks(self) -> None:
+        def _fwd(module: nn.Module, inp: Any, output: torch.Tensor) -> None:
+            self.activations = output.detach()
+
+        self._fwd_handle = self.target_layer.register_forward_hook(_fwd)
+
+    def remove_hooks(self) -> None:
+        if self._fwd_handle is not None:
+            self._fwd_handle.remove()
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_tensor: torch.Tensor,
+        target_class: Optional[int] = None,
+    ) -> Tuple[np.ndarray, int]:
+        self.model.eval()
+
+        # 1. Forward pass to capture activations and baseline output
+        output = self.model(input_tensor)
+
+        if target_class is None:
+            target_class = output.argmax(dim=1).item()
+
+        if self.activations is None:
+            raise RuntimeError(
+                "Score-CAM hook did not fire. Verify that target_layer is part "
+                "of the computation graph for the given input."
+            )
+
+        acts = self.activations[0]  # (C, h, w) or (num_patches, C)
+
+        # Handle transformer-style (num_patches, C) activations
+        if acts.ndim == 2:
+            num_patches, C = acts.shape
+            if int((num_patches - 1) ** 0.5) ** 2 == (num_patches - 1):
+                acts = acts[1:, :]
+                num_patches -= 1
+            H_sq = int(num_patches ** 0.5)
+            if H_sq * H_sq == num_patches:
+                H = W = H_sq
+            else:
+                H, W = 1, num_patches
+                for f in range(H_sq, 0, -1):
+                    if num_patches % f == 0:
+                        H, W = f, num_patches // f
+                        break
+            if H * W != num_patches:
+                raise RuntimeError(
+                    f"Cannot reshape transformer activations {acts.shape} into any "
+                    f"rectangular spatial grid. num_patches={num_patches}."
+                )
+            acts = acts.permute(1, 0).reshape(C, H, W)
+        elif acts.ndim != 3:
+            raise RuntimeError(
+                f"Expected (C, H, W) feature map, got {acts.shape}."
+            )
+
+        C, h_act, w_act = acts.shape
+        input_h, input_w = input_tensor.shape[2:]
+
+        # 2. Select top-k channels by mean activation
+        k = min(self.top_k, C)
+        mean_per_channel = acts.mean(dim=(1, 2))  # (C,)
+        topk_indices = mean_per_channel.topk(k).indices  # (k,)
+        selected_acts = acts[topk_indices]  # (k, h_act, w_act)
+
+        # 3. Upsample each activation map to input size and normalize to [0, 1]
+        upsampled = F.interpolate(
+            selected_acts.unsqueeze(1),  # (k, 1, h_act, w_act)
+            size=(input_h, input_w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1)  # (k, input_h, input_w)
+
+        # Per-map min-max normalization
+        mins = upsampled.flatten(1).min(dim=1).values.view(k, 1, 1)
+        maxs = upsampled.flatten(1).max(dim=1).values.view(k, 1, 1)
+        upsampled = (upsampled - mins) / (maxs - mins + 1e-8)
+
+        # 4. Create masked inputs and run batched forward pass
+        # input_tensor is (1, C_in, H, W) — broadcast multiply
+        masked_inputs = input_tensor * upsampled.unsqueeze(1)  # (k, C_in, H, W)
+
+        scores = self.model(masked_inputs)  # (k, num_classes)
+
+        # 5. Extract target class scores and apply softmax -> weights
+        target_scores = scores[:, target_class]  # (k,)
+        weights = F.softmax(target_scores, dim=0)  # (k,)
+
+        # 6. Weighted sum of the selected activation maps
+        cam = (weights.view(k, 1, 1) * selected_acts).sum(dim=0)  # (h_act, w_act)
+
+        # 7. ReLU and normalize
+        cam = F.relu(cam)
+        cam_min, cam_max = cam.min(), cam.max()
+        cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
+
+        # 8. Resize to input resolution
+        cam = F.interpolate(
+            cam.unsqueeze(0).unsqueeze(0),
+            size=(input_h, input_w),
             mode="bilinear",
             align_corners=False,
         )
@@ -473,8 +606,13 @@ class ExplainabilityEngine:
         original_image: Optional[np.ndarray] = None,
         target_class: Optional[int] = None,
         alpha: float = 0.5,
+        method: str = "gradcam++",
     ) -> Dict[str, Any]:
-        """Generate heatmap. Accepts preprocessed Tensor or raw Numpy array."""
+        """Generate heatmap. Accepts preprocessed Tensor or raw Numpy array.
+
+        Args:
+            method: ``"gradcam++"`` (default) or ``"scorecam"``.
+        """
         
         # Look up expected anatomical regions based on the target class' clinical rules
         class_name = ""
@@ -512,7 +650,7 @@ class ExplainabilityEngine:
                 "region_scores": score_lung_regions(empty_cam),
                 "quality": assess_cam_quality(empty_cam, expected_regions=expected_regions),
                 "target_class": target_class if target_class is not None else 0,
-                "method": "gradcam++ (fallback)",
+                "method": f"{method} (fallback)",
             }
 
         # Handle double forward-pass prevention
@@ -530,7 +668,10 @@ class ExplainabilityEngine:
             elif vis_image.ndim == 3 and vis_image.shape[2] == 1:
                 vis_image = np.concatenate([vis_image, vis_image, vis_image], axis=-1)
 
-        cam_gen = GradCAMPlusPlus(self.model, self._target_layer)
+        if method == "scorecam":
+            cam_gen = ScoreCAM(self.model, self._target_layer)
+        else:
+            cam_gen = GradCAMPlusPlus(self.model, self._target_layer)
         try:
             grayscale_cam, used_class = cam_gen.generate(input_tensor, target_class=target_class)
         finally:
@@ -552,7 +693,7 @@ class ExplainabilityEngine:
             "region_scores": region_scores,
             "quality": quality,
             "target_class": used_class,
-            "method": "gradcam++",
+            "method": method,
         }
 
     def explain_prediction(
@@ -580,7 +721,7 @@ class ExplainabilityEngine:
             class_name=class_name,
         )
 
-        return {
+        result: Dict[str, Any] = {
             "prediction": prediction,
             "class_name": class_name,
             "confidence": confidence,
@@ -589,6 +730,22 @@ class ExplainabilityEngine:
             "clinical_plausibility": plausibility,
             "quality": heatmap_result["quality"],
         }
+
+        # Conditional Score-CAM for low-confidence / low-quality predictions
+        if (
+            confidence < 0.6
+            or not heatmap_result["quality"].passes_qc
+            or plausibility < 0.6
+        ):
+            try:
+                scorecam_result = self.generate_heatmap(
+                    image, target_class=prediction, method="scorecam",
+                )
+                result["scorecam_visualization"] = scorecam_result
+            except Exception as exc:
+                logger.warning("Score-CAM fallback failed: %s", exc)
+
+        return result
 
     def explain_multilabel_prediction(
         self,
@@ -626,7 +783,7 @@ class ExplainabilityEngine:
                 heatmap_result["region_scores"],
                 class_name=class_name,
             )
-            per_class[class_name] = {
+            entry: Dict[str, Any] = {
                 "class_index": idx,
                 "confidence": confidence,
                 "visualization": heatmap_result,
@@ -634,6 +791,22 @@ class ExplainabilityEngine:
                 "clinical_plausibility": plausibility,
                 "quality": heatmap_result["quality"],
             }
+
+            # Conditional Score-CAM for uncertain / low-quality per-class results
+            if (
+                confidence < 0.6
+                or not heatmap_result["quality"].passes_qc
+                or plausibility < 0.6
+            ):
+                try:
+                    scorecam_result = self.generate_heatmap(
+                        image, target_class=idx, method="scorecam",
+                    )
+                    entry["scorecam_visualization"] = scorecam_result
+                except Exception as exc:
+                    logger.warning("Score-CAM fallback failed for class %s: %s", class_name, exc)
+
+            per_class[class_name] = entry
 
         return {
             "positive_classes": [
@@ -749,6 +922,29 @@ class ValidationXAI:
 
                         if not quality.passes_qc:
                             qc_failures += 1
+
+                        # Score-CAM fallback for QC failures / low plausibility
+                        if not quality.passes_qc or plaus < 0.6:
+                            try:
+                                scorecam_result = self.engine.generate_heatmap(
+                                    input_data=tensor_batch,
+                                    original_image=img_np,
+                                    target_class=label_idx,
+                                    method="scorecam",
+                                )
+                                sc_quality: CAMQualityReport = scorecam_result["quality"]
+                                if sc_quality.passes_qc:
+                                    region_scores = scorecam_result["region_scores"]
+                                    plaus = clinical_plausibility_score(region_scores, class_name)
+                                    plausibility_scores[-1] = plaus
+                                    per_class[label_idx][-1] = plaus
+                                    if not quality.passes_qc and sc_quality.passes_qc:
+                                        qc_failures -= 1
+                            except Exception as sc_exc:
+                                logger.warning(
+                                    "Score-CAM fallback failed for sample %d class %s: %s",
+                                    processed, class_name, sc_exc,
+                                )
 
                         for rname, rscore in region_scores.items():
                             region_accum[rname].append(rscore)

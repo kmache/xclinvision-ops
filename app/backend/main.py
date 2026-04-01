@@ -41,11 +41,9 @@ from schemas import (
     PatientHistoryEntry,
 )
 
-# Fix #4: maximum upload size (20 MB) to prevent out-of-memory denial-of-service.
 MAX_UPLOAD_MB = 20
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
-# Fix #16: hard cap for the in-memory image store to prevent unbounded RAM growth.
 _IMAGE_STORE_MAX = 200
 
 
@@ -59,7 +57,6 @@ async def _lifespan(app: "FastAPI"):
     """
     await log_dataset_info()
     yield
-    # Shutdown: nothing to clean up currently.
 
 
 app = FastAPI(
@@ -98,7 +95,6 @@ class FeedbackRequest(BaseModel):
     image_hash: str
     prediction: int
     correct_label: int
-    # Fix #20: use Literal to enforce valid values instead of unvalidated str.
     feedback_type: Literal["verify", "correct", "error"]
     notes: Optional[str] = None
     clinician_id: Optional[str] = None
@@ -137,12 +133,6 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
 
     checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
 
-    # Detect format: Lightning checkpoint vs plain state_dict.
-    # Fix #3: weights_only=True prevents arbitrary code execution via pickle
-    # when loading untrusted checkpoint files.  Lightning .ckpt files that
-    # contain non-tensor objects (e.g. hparams) are not supported with
-    # weights_only=True; export checkpoints as plain .pth state-dicts using
-    # BestModelExportCallback for safe production deployment.
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
         # Lightning checkpoint — strip "model." prefix from keys
         state_dict = {}
@@ -177,9 +167,6 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
             thresholds_dict = {str(k): float(v) for k, v in raw_thresh.items()}
             logger.info("Loaded per-class thresholds from payload: %s", thresholds_dict)
 
-    # Fix #22: use model-specific normalization stats so the inference pipeline
-    # matches the training distribution.  Without this, BiomedCLIP and other
-    # non-ImageNet models would silently use the wrong mean/std.
     norm_stats = get_model_normalization(model, architecture)
 
     return InferencePipeline(
@@ -206,9 +193,6 @@ def get_pipeline():
 
 # ---------------------------------------------------------------------------
 # Dataset helpers
-# ---------------------------------------------------------------------------
-# Fix #19: LLM agent cached at module level so it is initialised once at startup
-# rather than on every report/analysis request.
 # ---------------------------------------------------------------------------
 _agent_instance = None
 _agent_lock = threading.Lock()
@@ -273,8 +257,6 @@ async def log_dataset_info() -> None:
     raw_data_dir = os.getenv("XCLINVISION_DATA_DIR", "data/processed")
     data_dir = Path(raw_data_dir)
     if not data_dir.is_absolute():
-        # Resolve relative paths against the repository root (three levels up
-        # from app/backend/main.py)
         data_dir = (Path(__file__).parent.parent.parent / data_dir).resolve()
 
     logger.info("=" * 60)
@@ -378,10 +360,6 @@ async def predict(
         )
     image_hash = hashlib.sha256(contents).hexdigest()
 
-    # Validate actual file content via magic bytes, independent of the
-    # Content-Type header (which can be spoofed by the client).
-    # JPEG: FF D8 FF   PNG: 89 50 4E 47   BMP: 42 4D
-    # DICOM: 128-byte preamble + 'DICM' at offset 128
     _MAGIC = (
         (b"\xff\xd8\xff",),                    # JPEG
         (b"\x89PNG",),                         # PNG
@@ -525,8 +503,6 @@ async def generate_report(request: ReportRequest):
         patient_sex=request.patient_sex,
     )
 
-    # Fix #19: use the module-level cached agent instead of creating a new one
-    # per request (each creation initialises an LLM client, adding latency).
     agent = _get_agent()
     report = agent.generate_report(context)
 
@@ -605,10 +581,9 @@ async def get_metrics():
 # Dashboard v2: In-memory storage (replace with SQLite/Postgres in prod)
 # ---------------------------------------------------------------------------
 
-_analysis_store: Dict[str, dict] = {}   # analysis_id -> full result dict
-_feedback_store: List[dict] = []         # list of feedback entries
-_image_store: Dict[str, bytes] = {}      # analysis_id -> raw image bytes
-
+_analysis_store: Dict[str, dict] = {}   
+_feedback_store: List[dict] = []         
+_image_store: Dict[str, bytes] = {}    
 
 def _image_store_put(analysis_id: str, data: bytes) -> None:
     """Insert into _image_store with FIFO eviction capped at _IMAGE_STORE_MAX.
@@ -727,10 +702,7 @@ async def analyze_image(
     overlay_b64 = None
     explanation = result.get("explanation") or {}
     vis = explanation.get("visualization") or {}
-    # Fix #1: use grayscale_cam (raw 2-D saliency map) instead of "heatmap"
-    # which is already colour-overlaid by create_overlay() inside xai.py.
-    # Passing the pre-blended image into _generate_heatmap_overlay produced a
-    # double-overlay artefact.
+
     grayscale_cam = vis.get("grayscale_cam")
 
     # Also get vis_image from pipeline preprocess for overlay
@@ -781,8 +753,7 @@ async def analyze_image(
             patient_age=None,
             patient_sex=None,
         )
-        # Fix #19: use module-level cached agent — avoids re-initialising an
-        # LLM client on every request.
+        
         agent = _get_agent()
         report_dict = agent.generate_report(context)
         llm_summary = report_dict.get("findings", "") + " " + report_dict.get("impression", "")
@@ -977,17 +948,12 @@ async def llm_chat(request: ChatRequest):
             class_names=class_names,
         )
 
-        # Build a combined prompt with history and new message
-        # Fix #19: use module-level cached agent to avoid re-initialising
-        # the LLM client on every chat request.
         agent = _get_agent()
         history_text = "\n".join(
             f"{'User' if m.role == 'user' else 'AI'}: {m.content}"
             for m in request.history[-5:]  # Last 5 messages for context
         )
 
-        # Use agent's report generation as a workaround for chat
-        # (the agent only has generate_report; we adapt)
         report = agent.generate_report(context)
         base_text = report.get("findings", "") + " " + report.get("impression", "")
 
