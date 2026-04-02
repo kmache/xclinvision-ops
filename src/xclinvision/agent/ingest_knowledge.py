@@ -48,10 +48,32 @@ import tiktoken
 
 # ── Required Domain Imports ──
 import pandas as pd
-from unstructured.partition.pdf import partition_pdf
 import pydicom
 from PIL import Image
 import pytesseract
+
+# ── Optional PDF backends (lazy) ──
+# Primary: unstructured (hi-res, handles tables).  Fallback: pypdf / pdfplumber.
+try:
+    from unstructured.partition.pdf import partition_pdf as _partition_pdf
+    _UNSTRUCTURED_AVAILABLE = True
+except ImportError:
+    _partition_pdf = None  # type: ignore[assignment]
+    _UNSTRUCTURED_AVAILABLE = False
+
+try:
+    import pypdf as _pypdf
+    _PYPDF_AVAILABLE = True
+except ImportError:
+    _pypdf = None  # type: ignore[assignment]
+    _PYPDF_AVAILABLE = False
+
+try:
+    import pdfplumber as _pdfplumber
+    _PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    _pdfplumber = None  # type: ignore[assignment]
+    _PDFPLUMBER_AVAILABLE = False
 
 try:
     from bs4 import BeautifulSoup
@@ -251,44 +273,106 @@ def parse_iu_cxr_reports(reports_dir: Path) -> List[ClinicalDocument]:
 
 
 def load_pdf(file_path: Path) -> List[ClinicalDocument]:
-    """Extract text and tables from a PDF using unstructured.io."""
+    """Extract text and tables from a PDF.
+
+    Tries backends in order: unstructured (hi-res) → pdfplumber → pypdf.
+    Returns an empty list and logs a warning when no backend is available.
+    """
     docs: List[ClinicalDocument] = []
-    try:
-        logger.info("Parsing PDF with unstructured (this may take a moment): %s", file_path.name)
-        
-        elements = partition_pdf(
-            filename=str(file_path),
-            strategy="hi_res",
-            infer_table_structure=True,
-            chunking_strategy="by_title"  # Keeps paragraphs grouped under their headers
+
+    # ── Try primary backend: unstructured ──────────────────────────────
+    if _UNSTRUCTURED_AVAILABLE:
+        try:
+            logger.info("Parsing PDF with unstructured (this may take a moment): %s", file_path.name)
+
+            elements = _partition_pdf(
+                filename=str(file_path),
+                strategy="hi_res",
+                infer_table_structure=True,
+                chunking_strategy="by_title",
+            )
+
+            text_parts: List[str] = []
+            for el in elements:
+                category = getattr(el, "category", "")
+                if category == "Table" and hasattr(el.metadata, "text_as_html") and el.metadata.text_as_html:
+                    text_parts.append(f"\n[TABLE]\n{el.metadata.text_as_html}\n[/TABLE]\n")
+                elif category in ["Title", "Header"]:
+                    text_parts.append(f"\n### {el.text}\n")
+                else:
+                    text_parts.append(str(el.text))
+
+            full_text = "\n".join(text_parts).strip()
+
+            if full_text and len(full_text) >= 20:
+                conditions = _extract_conditions_from_text(full_text)
+                docs.append(ClinicalDocument(
+                    doc_id=f"pdf_{file_path.stem}", source="pdf", findings=full_text,
+                    impression="", conditions=conditions,
+                    anatomy=_extract_anatomy(full_text),
+                    urgency=_assess_urgency(conditions, full_text, ""),
+                ))
+                return docs
+            logger.warning("Unstructured returned no usable text for %s; trying fallback.", file_path)
+        except Exception as exc:
+            logger.warning(
+                "Unstructured failed for %s (%s); trying fallback PDF backend.",
+                file_path, exc,
+            )
+
+    # ── Fallback 1: pdfplumber (good table + text extraction) ─────────
+    if _PDFPLUMBER_AVAILABLE:
+        try:
+            logger.info("Parsing PDF with pdfplumber (fallback): %s", file_path.name)
+            text_parts = []
+            with _pdfplumber.open(str(file_path)) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text() or ""
+                    if page_text.strip():
+                        text_parts.append(page_text)
+            full_text = "\n".join(text_parts).strip()
+            if full_text and len(full_text) >= 20:
+                conditions = _extract_conditions_from_text(full_text)
+                docs.append(ClinicalDocument(
+                    doc_id=f"pdf_{file_path.stem}", source="pdf", findings=full_text,
+                    impression="", conditions=conditions,
+                    anatomy=_extract_anatomy(full_text),
+                    urgency=_assess_urgency(conditions, full_text, ""),
+                ))
+                return docs
+        except Exception as exc:
+            logger.warning("pdfplumber failed for %s: %s", file_path, exc)
+
+    # ── Fallback 2: pypdf (basic text extraction) ─────────────────────
+    if _PYPDF_AVAILABLE:
+        try:
+            logger.info("Parsing PDF with pypdf (fallback): %s", file_path.name)
+            reader = _pypdf.PdfReader(str(file_path))
+            text_parts = [page.extract_text() or "" for page in reader.pages]
+            full_text = "\n".join(text_parts).strip()
+            if full_text and len(full_text) >= 20:
+                conditions = _extract_conditions_from_text(full_text)
+                docs.append(ClinicalDocument(
+                    doc_id=f"pdf_{file_path.stem}", source="pdf", findings=full_text,
+                    impression="", conditions=conditions,
+                    anatomy=_extract_anatomy(full_text),
+                    urgency=_assess_urgency(conditions, full_text, ""),
+                ))
+                return docs
+        except Exception as exc:
+            logger.warning("pypdf failed for %s: %s", file_path, exc)
+
+    # ── No backend available ──────────────────────────────────────────
+    if not (_UNSTRUCTURED_AVAILABLE or _PDFPLUMBER_AVAILABLE or _PYPDF_AVAILABLE):
+        logger.warning(
+            "No PDF backend installed. Install one of: "
+            "'unstructured[pdf]' (recommended, requires poppler + tesseract), "
+            "'pdfplumber', or 'pypdf'.  Skipping %s.",
+            file_path,
         )
-        
-        text_parts: List[str] = []
-        for el in elements:
-            category = getattr(el, "category", "")
-            
-            if category == "Table" and hasattr(el.metadata, "text_as_html") and el.metadata.text_as_html:
-                text_parts.append(f"\n[TABLE]\n{el.metadata.text_as_html}\n[/TABLE]\n")
-            elif category in ["Title", "Header"]:
-                text_parts.append(f"\n### {el.text}\n")
-            else:
-                text_parts.append(str(el.text))
-                
-        full_text = "\n".join(text_parts).strip()
-        
-        if not full_text or len(full_text) < 20:
-            logger.warning("PDF has no extractable text: %s", file_path)
-            return []
-            
-        conditions = _extract_conditions_from_text(full_text)
-        docs.append(ClinicalDocument(
-            doc_id=f"pdf_{file_path.stem}", source="pdf", findings=full_text, impression="",
-            conditions=conditions, anatomy=_extract_anatomy(full_text),
-            urgency=_assess_urgency(conditions, full_text, ""),
-        ))
-    except Exception as exc:
-        logger.warning("Error reading PDF %s: %s", file_path, exc)
-        
+    else:
+        logger.warning("All PDF backends failed for %s. Returning empty.", file_path)
+
     return docs
 
 def _dataframe_to_docs(df: pd.DataFrame, file_path: Path, source_tag: str) -> List[ClinicalDocument]:

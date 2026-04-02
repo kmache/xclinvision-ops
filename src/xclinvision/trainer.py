@@ -441,14 +441,6 @@ class XClinVisionModel(pl.LightningModule):
                     assert logits.shape == y.shape, (
                         f"Shape mismatch: logits {logits.shape} vs targets {y.shape}"
                     )
-
-                # BCE expects floats, Multiclass CE expects long targets
-                # NOTE: Label smoothing for multilabel BCE is handled by
-                # the loss function or omitted entirely — manual target
-                # smoothing corrupts binary labels and causes plateau.
-                # if not self.multilabel and self.label_smoothing > 0:
-                #     y_loss = y.long()  # CrossEntropy handles label_smoothing natively
-                # else:
                 y_loss = y.float() if self.multilabel else y.long()
                 loss = self.criterion(logits, y_loss)
                 

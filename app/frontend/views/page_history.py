@@ -1,245 +1,125 @@
-"""Page: Historical Comparison — Temporal patient comparison with heatmaps and trends.
+"""Page 2: Historical Comparison — Temporal patient comparison with heatmaps and trends.
 
-Compare a patient's current chest X-ray exam with a historical exam.
-Visualises Grad-CAM overlays, a pixel-level difference map, and a
-probability-over-time trend chart, plus an AI-generated clinical summary.
+Compare a patient's current and historical analyses retrieved from the
+backend API.  Visualises XAI overlays, a pixel-level difference map,
+probability-over-time trend chart, and AI-generated clinical summary.
 """
 
-# ==============================================================================
-# Imports
-# ==============================================================================
+import base64
+import io
+
 import cv2
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from PIL import Image
 
-from styles import COLORS
 from config import CLASS_NAMES
+from styles import COLORS
 
-# ==============================================================================
-# Constants / mock data
-# ==============================================================================
-FINDINGS = CLASS_NAMES
+FINDINGS = [c for c in CLASS_NAMES if c != "No finding"]
 THRESHOLD = 0.50
 
-HISTORICAL_STUDIES = ["2023-08-15, PA", "2023-09-20, PA", "2023-10-10, PA"]
-CURRENT_STUDIES = ["2023-10-26, PA"]
-
-# Mock prediction tables keyed by study label — generated dynamically from CLASS_NAMES
-def _make_mock_predictions() -> dict[str, list[dict]]:
-    """Build mock prediction tables using the configured class names."""
-    import random
-    random.seed(42)
-    studies = HISTORICAL_STUDIES + CURRENT_STUDIES
-    base_probs = [round(random.uniform(0.10, 0.90), 2) for _ in CLASS_NAMES]
-    result: dict[str, list[dict]] = {}
-    for i, study in enumerate(studies):
-        result[study] = [
-            {"Finding": name, "Probability": round(min(base_probs[j] + i * 0.05, 0.99), 2), "Threshold": 0.50}
-            for j, name in enumerate(CLASS_NAMES)
-        ]
-    return result
-
-_MOCK_PREDICTIONS = _make_mock_predictions()
-
-# Probability-over-time mock data (per finding)
-def _make_temporal_data() -> dict:
-    import random
-    random.seed(7)
-    dates = ["2023-08-15", "2023-09-20", "2023-10-10", "2023-10-26"]
-    result = {}
-    for name in CLASS_NAMES:
-        base = round(random.uniform(0.10, 0.85), 2)
-        result[name] = {
-            "dates": dates,
-            "probs": [round(min(base + i * 0.04, 0.99), 2) for i in range(len(dates))],
-        }
-    return result
-
-_TEMPORAL_DATA = _make_temporal_data()
-
-_CLINICAL_SUMMARIES = {
-    "Improved": (
-        "Findings suggest regression of infiltrate in the right middle lobe compared "
-        "with the previous study. Patient's condition has improved, with reduced opacity "
-        "and better-defined lung margins."
-    ),
-    "Worsened": (
-        "Findings suggest progression of infiltrate in the right middle lobe since the "
-        "August 15th study. Patient's condition appears to have worsened; clinical "
-        "correlation and follow-up imaging are recommended."
-    ),
-    "No significant change": (
-        "No significant interval change is identified compared with the prior study. "
-        "Lung fields appear stable. Continued monitoring is advised."
-    ),
-}
-
-# ==============================================================================
+# ---------------------------------------------------------------------------
 # Helper functions
-# ==============================================================================
+# ---------------------------------------------------------------------------
 
-def load_exam_image(size: tuple = (224, 224)) -> np.ndarray:
-    """Return a synthetic grayscale chest-X-ray placeholder (numpy uint8 RGB array)."""
-    h, w = size
-    img = np.zeros((h, w), dtype=np.uint8)
-    img[:] = 18  # dark background
-
-    # Lung fields — two bright ellipses
-    cv2.ellipse(img, (w // 2 - 45, h // 2 + 10), (55, 80), 0, 0, 360, 160, -1)
-    cv2.ellipse(img, (w // 2 + 45, h // 2 + 10), (55, 80), 0, 0, 360, 160, -1)
-
-    # Rib-like arcs
-    for rib_y in range(h // 4, int(h * 0.75), 22):
-        cv2.ellipse(img, (w // 2, rib_y),
-                    (int(w * 0.44), int(h * 0.12)), 0, 180, 360, 80, 1)
-
-    # Spine / sternum
-    cv2.line(img, (w // 2, h // 5), (w // 2, int(h * 0.85)), 120, 3)
-
-    # Clavicles
-    cv2.line(img, (w // 2 - 60, h // 4 - 20), (w // 2, h // 4 + 10), 130, 2)
-    cv2.line(img, (w // 2 + 60, h // 4 - 20), (w // 2, h // 4 + 10), 130, 2)
-
-    img = cv2.GaussianBlur(img, (5, 5), 0)
-    return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+def _b64_to_image(b64_str: str) -> np.ndarray:
+    """Decode a base64-encoded PNG into an RGB numpy array."""
+    img_bytes = base64.b64decode(b64_str)
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    return np.array(img)
 
 
-def generate_mock_predictions(study_label: str) -> pd.DataFrame:
-    """Return a DataFrame of mock predictions for the given study label."""
-    rows = _MOCK_PREDICTIONS.get(study_label, _MOCK_PREDICTIONS["2023-10-26, PA"])
-    df = pd.DataFrame(rows)
-    df["Binary Label"] = df.apply(
-        lambda r: "Positive" if r["Probability"] >= r["Threshold"] else "Negative",
-        axis=1,
+def _resize_match(img: np.ndarray, target_hw: tuple) -> np.ndarray:
+    """Resize *img* to match *target_hw* (h, w)."""
+    h, w = target_hw
+    if img.shape[:2] != (h, w):
+        return cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
+    return img
+
+
+def _predictions_from_analysis(analysis: dict) -> pd.DataFrame:
+    """Build a DataFrame from a stored analysis entry."""
+    top_k = analysis.get("top_k_predictions", [])
+    rows = []
+    for entry in top_k:
+        name = entry.get("class_name", "")
+        if name == "No finding":
+            continue
+        prob = entry.get("probability", 0.0)
+        rows.append({
+            "Finding": name,
+            "Probability": round(prob, 2),
+            "Threshold": THRESHOLD,
+            "Binary Label": "Positive" if prob >= THRESHOLD else "Negative",
+        })
+    return pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=["Finding", "Probability", "Threshold", "Binary Label"],
     )
-    return df
-
-
-def generate_gradcam_heatmap(
-    base_img: np.ndarray,
-    finding: str,
-    study_label: str,
-    intensity: float = 0.55,
-) -> np.ndarray:
-    """Overlay a synthetic Grad-CAM heatmap on *base_img* and return an RGB array."""
-    h, w = base_img.shape[:2]
-
-    _lobe_centers = {
-        "Pneumonia":    (int(w * 0.63), int(h * 0.55)),
-        "Effusion":     (int(w * 0.37), int(h * 0.65)),
-        "Cardiomegaly": (int(w * 0.50), int(h * 0.55)),
-    }
-    cx, cy = _lobe_centers.get(finding, (w // 2, h // 2))
-
-    # Gaussian activation blob
-    xs = np.arange(w)
-    ys = np.arange(h)
-    xx, yy = np.meshgrid(xs, ys)
-    activation = np.exp(
-        -((xx - cx) ** 2 / (2 * (w * 0.15) ** 2) +
-          (yy - cy) ** 2 / (2 * (h * 0.18) ** 2))
-    ).astype(np.float32)
-
-    activation = cv2.GaussianBlur(activation, (31, 31), 0)
-    activation = (activation / (activation.max() + 1e-8) * 255).astype(np.uint8)
-
-    heatmap_coloured = cv2.applyColorMap(activation, cv2.COLORMAP_JET)
-    heatmap_rgb = cv2.cvtColor(heatmap_coloured, cv2.COLOR_BGR2RGB)
-
-    base_rgb = base_img.copy() if base_img.ndim == 3 else cv2.cvtColor(base_img, cv2.COLOR_GRAY2RGB)
-    overlay = cv2.addWeighted(base_rgb, 1.0, heatmap_rgb, intensity, 0)
-    return overlay
 
 
 def compute_difference_map(
-    hist_img: np.ndarray,
-    curr_img: np.ndarray,
-    threshold: float = 0.1,
-    opacity: float = 0.6,
+    hist_img: np.ndarray, curr_img: np.ndarray,
+    threshold: float = 0.1, opacity: float = 0.6,
 ) -> np.ndarray:
     """Signed difference map overlay.  Red = increase, Blue = decrease."""
+    curr_img = _resize_match(curr_img, hist_img.shape[:2])
     h_gray = cv2.cvtColor(hist_img, cv2.COLOR_RGB2GRAY).astype(np.float32)
     c_gray = cv2.cvtColor(curr_img, cv2.COLOR_RGB2GRAY).astype(np.float32)
-
     diff = c_gray - h_gray
     max_abs = np.abs(diff).max() + 1e-8
-    diff_norm = diff / max_abs  # range [-1, 1]
+    diff_norm = diff / max_abs
 
     base = cv2.addWeighted(hist_img, 0.5, curr_img, 0.5, 0).astype(np.float32)
     overlay = np.zeros_like(base)
-
-    # Red → increase
-    increase_mask = diff_norm > threshold
-    overlay[increase_mask] = [255, 0, 0]
-
-    # Blue → decrease
-    decrease_mask = diff_norm < -threshold
-    overlay[decrease_mask] = [0, 0, 255]
-
-    result = cv2.addWeighted(base, 1.0 - opacity, overlay, opacity, 0)
-    return result.astype(np.uint8)
+    overlay[diff_norm > threshold] = [255, 0, 0]
+    overlay[diff_norm < -threshold] = [0, 0, 255]
+    return cv2.addWeighted(base, 1.0 - opacity, overlay, opacity, 0).astype(np.uint8)
 
 
-def plot_probability_over_time(finding: str) -> go.Figure:
-    """Return a Plotly line chart of probability over time for *finding*."""
-    data = _TEMPORAL_DATA.get(finding, _TEMPORAL_DATA["Pneumonia"])
-    dates = data["dates"]
-    probs = [p * 100 for p in data["probs"]]
+def _build_temporal_chart(history: list, finding: str) -> go.Figure:
+    """Line chart of probability over time for *finding*."""
+    dates, probs = [], []
+    for entry in sorted(history, key=lambda x: x.get("timestamp", "")):
+        ts = entry.get("timestamp", "")[:10]
+        for pk in entry.get("top_k_predictions", []):
+            if pk.get("class_name") == finding:
+                dates.append(ts)
+                probs.append(pk["probability"] * 100)
+                break
 
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=dates,
-            y=probs,
-            mode="lines+markers",
+    if dates:
+        fig.add_trace(go.Scatter(
+            x=dates, y=probs, mode="lines+markers",
             line=dict(color=COLORS["safe"], width=3),
             marker=dict(size=8, color=COLORS["safe"]),
             hovertemplate="%{x}<br>Probability: %{y:.1f}%<extra></extra>",
-        )
-    )
+        ))
     fig.update_layout(
-        height=280,
-        margin=dict(l=10, r=10, t=10, b=40),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        height=280, margin=dict(l=10, r=10, t=10, b=40),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color=COLORS["text"], size=12),
-        xaxis=dict(showgrid=False, linecolor=COLORS["border"], tickcolor=COLORS["neutral"]),
-        yaxis=dict(showgrid=True, gridcolor=COLORS["border"], linecolor=COLORS["border"]),
+        xaxis=dict(showgrid=False, linecolor=COLORS["border"]),
+        yaxis=dict(showgrid=True, gridcolor=COLORS["border"], linecolor=COLORS["border"],
+                   title="Probability (%)"),
         hovermode="x unified",
     )
     return fig
 
 
-def generate_clinical_summary(
-    finding: str,
-    historical_study: str,
-    current_study: str,
-    trend: str,
-) -> str:
-    """Return an AI-style clinical summary string."""
-    return _CLINICAL_SUMMARIES.get(trend, _CLINICAL_SUMMARIES["No significant change"])
-
-
-# ==============================================================================
+# ---------------------------------------------------------------------------
 # Styling helpers
-# ==============================================================================
+# ---------------------------------------------------------------------------
 
 def _card_start(title: str, title_color: str = COLORS["text"]) -> None:
     st.markdown(
-        f"""
-        <div style="
-            background:{COLORS['card_bg']};
-            border:1px solid {COLORS['border']};
-            border-radius:10px;
-            padding:16px 18px 14px 18px;
-            margin-bottom:14px;
-        ">
-        <div style="font-weight:700;font-size:15px;color:{title_color};margin-bottom:10px;">
-            {title}
-        </div>
-        """,
+        f'<div style="background:{COLORS["card_bg"]};border:1px solid {COLORS["border"]};'
+        f'border-radius:10px;padding:16px 18px 14px 18px;margin-bottom:14px;">'
+        f'<div style="font-weight:700;font-size:15px;color:{title_color};margin-bottom:10px;">'
+        f'{title}</div>',
         unsafe_allow_html=True,
     )
 
@@ -258,165 +138,162 @@ def _badge(is_positive: bool) -> str:
 
 
 def _render_prediction_table(df: pd.DataFrame) -> None:
-    """Render a styled HTML prediction table."""
+    if df.empty:
+        st.info("No predictions available.")
+        return
     rows_html = ""
     for _, row in df.iterrows():
-        is_pos = row["Binary Label"] == "Positive"
-        badge = _badge(is_pos)
+        badge = _badge(row["Binary Label"] == "Positive")
         rows_html += (
-            f"<tr>"
-            f"<td style='padding:5px 8px;color:{COLORS['text']};font-size:13px;'>{row['Finding']}</td>"
+            f"<tr><td style='padding:5px 8px;color:{COLORS['text']};font-size:13px;'>{row['Finding']}</td>"
             f"<td style='padding:5px 8px;color:{COLORS['text']};font-size:13px;'>{row['Probability']:.2f}</td>"
             f"<td style='padding:5px 8px;color:{COLORS['neutral']};font-size:13px;'>{row['Threshold']:.2f}</td>"
-            f"<td style='padding:5px 8px;'>{badge}</td>"
-            f"</tr>"
+            f"<td style='padding:5px 8px;'>{badge}</td></tr>"
         )
     hdr = (
         f"padding:5px 8px;font-size:12px;font-weight:600;"
         f"color:{COLORS['neutral']};text-transform:uppercase;letter-spacing:0.5px;"
     )
-    html = (
-        f"<table style='width:100%;border-collapse:collapse;'>"
-        f"<thead><tr>"
-        f"<th style='{hdr}'>Finding</th>"
-        f"<th style='{hdr}'>Prob.</th>"
-        f"<th style='{hdr}'>Threshold</th>"
-        f"<th style='{hdr}'>Label</th>"
-        f"</tr></thead>"
-        f"<tbody>{rows_html}</tbody>"
-        f"</table>"
-    )
-    st.markdown(html, unsafe_allow_html=True)
-
-
-# ==============================================================================
-# Main render function (called by the app router)
-# ==============================================================================
-
-def render() -> None:
-    # ------------------------------------------------------------------
-    # PAGE HEADER
-    # ------------------------------------------------------------------
     st.markdown(
-        f"""
-        <div style="text-align:center;margin-bottom:28px;">
-            <h1 style="
-                color:{COLORS['highlight']};
-                font-size:2.2rem;
-                font-weight:800;
-                margin-bottom:4px;
-                text-shadow:0 0 10px rgba(0,204,150,0.25);
-            ">Historical Comparison</h1>
-            <p style="color:{COLORS['neutral']};font-size:15px;margin:0;">
-                Compare current exam with previous exams for the same patient.
-            </p>
-        </div>
-        """,
+        f"<table style='width:100%;border-collapse:collapse;'><thead><tr>"
+        f"<th style='{hdr}'>Finding</th><th style='{hdr}'>Prob.</th>"
+        f"<th style='{hdr}'>Threshold</th><th style='{hdr}'>Label</th>"
+        f"</tr></thead><tbody>{rows_html}</tbody></table>",
         unsafe_allow_html=True,
     )
 
-    # ------------------------------------------------------------------
-    # SECTION 1 — Study Selection Bar
-    # ------------------------------------------------------------------
-    sel_c1, sel_c2, sel_c3, sel_c4, sel_c5 = st.columns([2, 2, 2, 2, 2])
 
-    with sel_c1:
-        patient_id = st.text_input("Patient ID", value="2023-10-26, PA")
-    with sel_c2:
-        historical_study = st.selectbox("Historical Study", HISTORICAL_STUDIES, index=0)
-    with sel_c3:
-        current_study = st.selectbox("Current Study", CURRENT_STUDIES, index=0)
-    with sel_c4:
-        finding_to_compare = st.selectbox("Finding to Compare", FINDINGS, index=0)
-    with sel_c5:
+# ---------------------------------------------------------------------------
+# Main render
+# ---------------------------------------------------------------------------
+
+def render() -> None:
+    client = st.session_state.get("api_client")
+
+    st.markdown(
+        f'<div style="text-align:center;margin-bottom:28px;">'
+        f'<h1 style="color:{COLORS["highlight"]};font-size:2.2rem;font-weight:800;'
+        f'margin-bottom:4px;text-shadow:0 0 10px rgba(0,204,150,0.25);">'
+        f'Historical Comparison</h1>'
+        f'<p style="color:{COLORS["neutral"]};font-size:15px;margin:0;">'
+        f'Compare current exam with previous exams for the same patient.</p></div>',
+        unsafe_allow_html=True,
+    )
+
+    # --- Study selection bar --------------------------------------------------
+    sel1, sel2 = st.columns([2, 1])
+    with sel1:
+        patient_id = st.text_input("Patient ID", value=st.session_state.get("current_patient_id", ""),
+                                    placeholder="Enter a patient ID")
+    with sel2:
         st.markdown("<div style='height:27px'></div>", unsafe_allow_html=True)
-        compute_btn = st.button(
-            "Compute Difference Map", type="primary", width='stretch'
+        fetch_btn = st.button("📥 Fetch History", type="primary", width='stretch',
+                               disabled=(not patient_id))
+
+    # Fetch history from backend
+    if fetch_btn and patient_id and client:
+        with st.spinner("Fetching patient history..."):
+            history = client.get_patient_history(patient_id)
+            if history:
+                st.session_state["patient_history"] = history
+            else:
+                st.warning("No history found for this patient. Run analyses on the Inference page first.")
+                st.session_state["patient_history"] = []
+
+    history = st.session_state.get("patient_history", [])
+
+    if not history:
+        st.info(
+            "Enter a patient ID and click **Fetch History** to load previous analyses. "
+            "The patient must have been analyzed on the **Inference** page at least once."
         )
 
-    # Persist compute state across reruns
-    if compute_btn:
-        st.session_state["hist_computed"] = True
-        st.session_state["hist_historical_study"] = historical_study
-        st.session_state["hist_current_study"] = current_study
-        st.session_state["hist_finding"] = finding_to_compare
+        # Footer
+        st.markdown(
+            f'<div style="margin-top:20px;padding:10px 16px;border-top:1px solid {COLORS["border"]};'
+            f'font-size:11px;color:{COLORS["neutral"]};text-align:center;">'
+            f'These AI-generated findings are intended to assist — not replace — clinical judgement.</div>',
+            unsafe_allow_html=True,
+        )
+        return
 
-    active_hist    = st.session_state.get("hist_historical_study", historical_study)
-    active_curr    = st.session_state.get("hist_current_study", current_study)
-    active_finding = st.session_state.get("hist_finding", finding_to_compare)
+    # --- Build selection options from real history ----------------------------
+    study_labels = [
+        f"{h.get('timestamp', '?')[:10]} — {h.get('prediction', '?')} ({h.get('confidence', 0):.0%})"
+        for h in history
+    ]
+
+    sel_c1, sel_c2, sel_c3 = st.columns([3, 3, 3])
+    with sel_c1:
+        hist_idx = st.selectbox("Historical Study", range(len(study_labels)),
+                                format_func=lambda i: study_labels[i],
+                                index=min(1, len(study_labels) - 1) if len(study_labels) > 1 else 0)
+    with sel_c2:
+        curr_idx = st.selectbox("Current Study", range(len(study_labels)),
+                                format_func=lambda i: study_labels[i], index=0)
+    with sel_c3:
+        finding_to_compare = st.selectbox("Finding to Compare", FINDINGS, index=0)
+
+    hist_entry = history[hist_idx]
+    curr_entry = history[curr_idx]
 
     st.markdown(
         f"<div style='border-top:1px solid {COLORS['border']};margin:12px 0 16px 0;'></div>",
         unsafe_allow_html=True,
     )
-    st.markdown(
-        f"<span style='color:{COLORS['neutral']};font-size:13px;font-weight:600;"
-        f"text-transform:uppercase;letter-spacing:1px;'>Selection</span>",
-        unsafe_allow_html=True,
-    )
 
-    # ------------------------------------------------------------------
-    # SECTION 2 — Exam Comparison (3 columns)
-    # ------------------------------------------------------------------
+    # --- Exam comparison (3 columns) ------------------------------------------
     col_hist, col_curr, col_diff = st.columns(3)
 
-    # Pre-generate images and tables
-    base_img     = load_exam_image()
-    hist_heatmap = generate_gradcam_heatmap(base_img, active_finding, active_hist,  intensity=0.45)
-    curr_heatmap = generate_gradcam_heatmap(base_img, active_finding, active_curr,  intensity=0.65)
-    hist_df      = generate_mock_predictions(active_hist)
-    curr_df      = generate_mock_predictions(active_curr)
+    hist_df = _predictions_from_analysis(hist_entry)
+    curr_df = _predictions_from_analysis(curr_entry)
 
-    # ── Historical Exam ──────────────────────────────────────────────
+    # Images from heatmap thumbnails
+    hist_has_img = hist_entry.get("thumbnail") or hist_entry.get("heatmap_overlay")
+    curr_has_img = curr_entry.get("thumbnail") or curr_entry.get("heatmap_overlay")
+
     with col_hist:
         _card_start("Historical Exam")
-        st.image(hist_heatmap, width='stretch')
+        if hist_has_img:
+            img_b64 = hist_entry.get("heatmap_overlay") or hist_entry.get("thumbnail")
+            hist_img = _b64_to_image(img_b64)
+            st.image(hist_img, width='stretch')
+        else:
+            st.info("No heatmap available")
+            hist_img = None
         _render_prediction_table(hist_df)
         _card_end()
 
-    # ── Current Exam ─────────────────────────────────────────────────
     with col_curr:
         _card_start("Current Exam")
-        st.image(curr_heatmap, width='stretch')
+        if curr_has_img:
+            img_b64 = curr_entry.get("heatmap_overlay") or curr_entry.get("thumbnail")
+            curr_img = _b64_to_image(img_b64)
+            st.image(curr_img, width='stretch')
+        else:
+            st.info("No heatmap available")
+            curr_img = None
         _render_prediction_table(curr_df)
         _card_end()
 
-    # ── Difference Map ───────────────────────────────────────────────
     with col_diff:
         _card_start("Difference Map")
-
-        _sl_left, _sl_right = st.columns(2)
-        with _sl_left:
-            diff_thresh = st.slider(
-                "Difference Threshold", min_value=0.0, max_value=1.0,
-                value=0.1, step=0.05, key="diff_threshold",
+        if hist_img is not None and curr_img is not None:
+            sl1, sl2 = st.columns(2)
+            with sl1:
+                diff_thresh = st.slider("Diff Threshold", 0.0, 1.0, 0.1, 0.05, key="diff_threshold")
+            with sl2:
+                diff_opacity = st.slider("Diff Opacity", 0.0, 1.0, 0.6, 0.05, key="diff_opacity")
+            diff_map = compute_difference_map(hist_img, curr_img, diff_thresh, diff_opacity)
+            st.image(diff_map, width='stretch')
+            st.markdown(
+                f'<div style="display:flex;gap:18px;margin-top:8px;font-size:13px;color:{COLORS["neutral"]};">'
+                f'<span><span style="color:{COLORS["danger"]};font-weight:700;">■ Red</span> = Increase</span>'
+                f'<span><span style="color:#4a90d9;font-weight:700;">■ Blue</span> = Decrease</span></div>',
+                unsafe_allow_html=True,
             )
-        with _sl_right:
-            diff_opacity = st.slider(
-                "Difference Opacity", min_value=0.0, max_value=1.0,
-                value=0.1, step=0.05, key="diff_opacity",
-            )
-
-        diff_map = compute_difference_map(
-            hist_heatmap, curr_heatmap,
-            threshold=diff_thresh,
-            opacity=diff_opacity,
-        )
-        st.image(diff_map, width='stretch')
-
-        # Colour legend
-        st.markdown(
-            f"""
-            <div style="display:flex;gap:18px;margin-top:8px;font-size:13px;
-                        color:{COLORS['neutral']};">
-                <span><span style="color:{COLORS['danger']};font-weight:700;">■ Red</span>
-                      &nbsp;= Increase</span>
-                <span><span style="color:#4a90d9;font-weight:700;">■ Blue</span>
-                      &nbsp;= Decrease</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        else:
+            st.info("Need two analyses with heatmaps to compute difference.")
         _card_end()
 
     st.markdown(
@@ -424,76 +301,72 @@ def render() -> None:
         unsafe_allow_html=True,
     )
 
-    # ------------------------------------------------------------------
-    # SECTION 3 & 4 — Temporal Trend | Clinical Summary (side-by-side)
-    # ------------------------------------------------------------------
+    # --- Temporal trend & summary ---------------------------------------------
     col_trend, col_summary = st.columns(2)
 
-    # ── Probability Over Time ────────────────────────────────────────
     with col_trend:
         _card_start("Probability over time")
-        fig = plot_probability_over_time(active_finding)
+        fig = _build_temporal_chart(history, finding_to_compare)
         st.plotly_chart(fig, width='stretch', key="temporal_chart")
         _card_end()
 
-    # ── Overall Change & Clinical Summary ────────────────────────────
     with col_summary:
         _card_start("Overall Change")
 
+        # Compute real trend from probabilities
+        hist_prob = 0.0
+        curr_prob = 0.0
+        for pk in hist_entry.get("top_k_predictions", []):
+            if pk.get("class_name") == finding_to_compare:
+                hist_prob = pk["probability"]
+        for pk in curr_entry.get("top_k_predictions", []):
+            if pk.get("class_name") == finding_to_compare:
+                curr_prob = pk["probability"]
+
+        diff_val = curr_prob - hist_prob
+        if diff_val > 0.05:
+            auto_trend = "Worsened"
+        elif diff_val < -0.05:
+            auto_trend = "Improved"
+        else:
+            auto_trend = "No significant change"
+
         trend_choice = st.radio(
-            "Assessment",
-            options=["Improved", "Worsened", "No significant change"],
-            index=1,  # default: Worsened
-            label_visibility="collapsed",
-            key="overall_trend",
+            "Assessment", ["Improved", "Worsened", "No significant change"],
+            index=["Improved", "Worsened", "No significant change"].index(auto_trend),
+            label_visibility="collapsed", key="overall_trend",
         )
 
-        summary_text = generate_clinical_summary(
-            finding=active_finding,
-            historical_study=active_hist,
-            current_study=active_curr,
-            trend=trend_choice,
+        # Build dynamic summary from real data
+        summary_text = (
+            f"Comparing {finding_to_compare}: historical probability {hist_prob:.1%} → "
+            f"current {curr_prob:.1%} (Δ {diff_val:+.1%}). "
         )
+        curr_summary = curr_entry.get("llm_summary", "")
+        if curr_summary:
+            summary_text += curr_summary
+        else:
+            summary_text += "Clinical correlation recommended."
 
         accent = {
-            "Improved":             COLORS["safe"],
-            "Worsened":             COLORS["danger"],
+            "Improved": COLORS["safe"],
+            "Worsened": COLORS["danger"],
             "No significant change": COLORS["neutral"],
         }.get(trend_choice, COLORS["neutral"])
 
         st.markdown(
-            f"""
-            <div style="
-                background:rgba(0,0,0,0.2);
-                border-left:3px solid {accent};
-                border-radius:4px;
-                padding:10px 14px;
-                margin-top:8px;
-                font-size:14px;
-                color:{COLORS['text']};
-                line-height:1.65;
-            ">{summary_text}</div>
-            """,
+            f'<div style="background:rgba(0,0,0,0.2);border-left:3px solid {accent};'
+            f'border-radius:4px;padding:10px 14px;margin-top:8px;font-size:14px;'
+            f'color:{COLORS["text"]};line-height:1.65;">{summary_text}</div>',
             unsafe_allow_html=True,
         )
         _card_end()
 
-    # ------------------------------------------------------------------
-    # Footer disclaimer
-    # ------------------------------------------------------------------
+    # Footer
     st.markdown(
-        f"""
-        <div style="
-            margin-top:20px;
-            padding:10px 16px;
-            border-top:1px solid {COLORS['border']};
-            font-size:11px;
-            color:{COLORS['neutral']};
-            text-align:center;
-        ">
-            These AI-generated findings are intended to assist — not replace — clinical judgement.
-            Always correlate with clinical presentation and consult a qualified radiologist.
-        </div>
-        """,
+        f'<div style="margin-top:20px;padding:10px 16px;border-top:1px solid {COLORS["border"]};'
+        f'font-size:11px;color:{COLORS["neutral"]};text-align:center;">'
+        f'These AI-generated findings are intended to assist — not replace — clinical judgement. '
+        f'Always correlate with clinical presentation and consult a qualified radiologist.</div>',
         unsafe_allow_html=True,
     )

@@ -236,14 +236,36 @@ def _short_hash(data: Any) -> str:
 
 
 def _sanitise_for_json(data: Any) -> Any:
-    """Recursively convert non-serialisable types (numpy, torch) to native Python."""
+    """Recursively convert non-serialisable types to native Python.
+
+    Handles: numpy, torch, sets/frozensets, Decimal, pandas Series/DataFrame.
+    """
     if data is None:
         return None
     if isinstance(data, dict):
         return {k: _sanitise_for_json(v) for k, v in data.items()}
     if isinstance(data, (list, tuple)):
         return [_sanitise_for_json(v) for v in data]
-    # Handle numpy / torch scalars
+    if isinstance(data, (set, frozenset)):
+        return [_sanitise_for_json(v) for v in sorted(data, key=str)]
+
+    # Decimal
+    import decimal
+    if isinstance(data, decimal.Decimal):
+        return int(data) if data == int(data) else float(data)
+
+    # pandas
+    try:
+        import pandas as pd
+
+        if isinstance(data, pd.Series):
+            return data.tolist()
+        if isinstance(data, pd.DataFrame):
+            return data.to_dict(orient="records")
+    except ImportError:
+        pass
+
+    # numpy
     try:
         import numpy as np
 
@@ -253,6 +275,8 @@ def _sanitise_for_json(data: Any) -> Any:
             return data.tolist()
     except ImportError:
         pass
+
+    # torch
     try:
         import torch
 

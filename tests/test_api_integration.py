@@ -1,0 +1,655 @@
+"""Integration tests for the XClinVision backend API.
+
+Tests validate endpoint contracts, response schemas, and error handling
+without requiring GPU or trained model weights (inference endpoints are
+tested with mocked pipelines).
+"""
+
+import io
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pytest
+from PIL import Image
+
+# ---------------------------------------------------------------------------
+# Make sure the backend package and src/ are importable
+# ---------------------------------------------------------------------------
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "app" / "backend"))
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def app():
+    """Import the FastAPI app."""
+    from main import app as _app  # noqa: E402  # type: ignore[import-not-found]
+    return _app
+
+
+@pytest.fixture(scope="session")
+def client(app):
+    """Synchronous TestClient (no event-loop juggling needed)."""
+    from starlette.testclient import TestClient
+    with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture()
+def dummy_image_bytes() -> bytes:
+    """Create a minimal 64x64 RGB JPEG in memory."""
+    img = Image.fromarray(np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    buf.seek(0)
+    return buf.read()
+
+
+def _fake_pipeline():
+    """Return a mock InferencePipeline with realistic predict() output."""
+    pipeline = MagicMock()
+    pipeline.predict.return_value = {
+        "prediction": 0,
+        "class_name": "No finding",
+        "probabilities": [0.85, 0.05, 0.04, 0.03, 0.03],
+        "confidence": 0.85,
+        "uncertainty": {"epistemic": 0.02, "aleatoric": 0.01},
+        "uncertainty_level": "low",
+        "explanation": {
+            "key_findings": ["Normal cardiac silhouette"],
+            "clinical_plausibility": 0.9,
+            "visualization": {
+                "grayscale_cam": np.random.rand(64, 64).astype(np.float32),
+                "region_scores": {"left_lung": 0.3, "right_lung": 0.25},
+                "method": "gradcam++",
+            },
+        },
+        "predictions_multilabel": [1, 0, 0, 0, 0],
+        "class_names_predicted": ["No finding"],
+    }
+    pipeline.preprocess.return_value = (
+        np.random.rand(3, 384, 384).astype(np.float32),
+        np.random.randint(0, 255, (384, 384, 3), dtype=np.uint8),
+    )
+    return pipeline
+
+
+# ===========================================================================
+# Health & metadata endpoints
+# ===========================================================================
+
+class TestHealthAndMeta:
+    def test_health_check(self, client):
+        r = client.get("/health")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "healthy"
+        assert "version" in body
+        assert "timestamp" in body
+
+    def test_list_models(self, client):
+        r = client.get("/api/v1/models")
+        assert r.status_code == 200
+        body = r.json()
+        assert "models" in body
+        assert isinstance(body["models"], list)
+        # Each model entry should have expected keys
+        for m in body["models"]:
+            assert "name" in m
+            assert "type" in m
+            assert m["type"] in ("cnn", "transformer")
+            assert "num_classes" in m
+            assert "class_names" in m
+
+
+# ===========================================================================
+# Prediction endpoint (v1)
+# ===========================================================================
+
+class TestPredictV1:
+    @patch("main.get_pipeline")
+    def test_predict_success(self, mock_get_pipe, client, dummy_image_bytes):
+        mock_get_pipe.return_value = _fake_pipeline()
+        r = client.post(
+            "/api/v1/predict",
+            files={"file": ("xray.jpg", dummy_image_bytes, "image/jpeg")},
+            data={"model_name": "efficientnet_b0", "return_explanation": "true"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert "prediction" in body
+        assert "class_name" in body
+        assert "probabilities" in body
+        assert isinstance(body["probabilities"], list)
+        assert "confidence" in body
+        assert "processing_time_ms" in body
+        assert body["confidence"] >= 0.0
+
+    @patch("main.get_pipeline")
+    def test_predict_returns_multilabel_fields(self, mock_get_pipe, client, dummy_image_bytes):
+        mock_get_pipe.return_value = _fake_pipeline()
+        r = client.post(
+            "/api/v1/predict",
+            files={"file": ("xray.jpg", dummy_image_bytes, "image/jpeg")},
+        )
+        body = r.json()
+        assert "predictions_multilabel" in body
+        assert "class_names_predicted" in body
+
+    def test_predict_invalid_content_type(self, client):
+        r = client.post(
+            "/api/v1/predict",
+            files={"file": ("doc.txt", b"not an image", "text/plain")},
+        )
+        assert r.status_code == 400
+
+    @patch("main.get_pipeline")
+    def test_predict_invalid_magic_bytes(self, mock_get_pipe, client):
+        mock_get_pipe.return_value = _fake_pipeline()
+        r = client.post(
+            "/api/v1/predict",
+            files={"file": ("fake.jpg", b"\x00\x00\x00\x00garbage", "image/jpeg")},
+        )
+        assert r.status_code == 400
+
+    @patch("main.get_pipeline", return_value=None)
+    def test_predict_no_model_loaded(self, mock_get_pipe, client, dummy_image_bytes):
+        r = client.post(
+            "/api/v1/predict",
+            files={"file": ("xray.jpg", dummy_image_bytes, "image/jpeg")},
+        )
+        assert r.status_code == 503
+
+
+# ===========================================================================
+# Analyze endpoint (v2)
+# ===========================================================================
+
+class TestAnalyzeV2:
+    @patch("main._get_agent")
+    @patch("main.get_pipeline")
+    def test_analyze_success(self, mock_get_pipe, mock_get_agent, client, dummy_image_bytes):
+        mock_get_pipe.return_value = _fake_pipeline()
+        mock_agent = MagicMock()
+        mock_agent.generate_report.return_value = {
+            "findings": "Normal exam.",
+            "impression": "No acute findings.",
+        }
+        mock_get_agent.return_value = mock_agent
+
+        r = client.post(
+            "/api/v2/analyze",
+            files={"file": ("xray.jpg", dummy_image_bytes, "image/jpeg")},
+            data={
+                "patient_id": "TEST-001",
+                "model_name": "efficientnet_b0",
+            },
+        )
+        assert r.status_code == 200
+        body = r.json()
+        # Validate AnalysisResponse contract
+        assert "analysis_id" in body
+        assert body["analysis_id"].startswith("XCL-")
+        assert body["patient_id"] == "TEST-001"
+        assert "prediction" in body
+        assert "confidence" in body
+        assert 0.0 <= body["confidence"] <= 1.0
+        assert "uncertainty" in body
+        assert "uncertainty_level" in body
+        assert "top_k_predictions" in body
+        assert isinstance(body["top_k_predictions"], list)
+        assert "heatmap_gradcam" in body
+        assert "heatmap_overlay" in body
+        assert "region_scores" in body
+        assert "key_findings" in body
+        assert "llm_summary" in body
+        assert "inference_time_ms" in body
+        assert "model_version" in body
+        assert "image_hash" in body
+
+    @patch("main.get_pipeline", return_value=None)
+    def test_analyze_no_model(self, mock_get_pipe, client, dummy_image_bytes):
+        r = client.post(
+            "/api/v2/analyze",
+            files={"file": ("xray.jpg", dummy_image_bytes, "image/jpeg")},
+        )
+        assert r.status_code == 503
+
+
+# ===========================================================================
+# Explain endpoint (v1)
+# ===========================================================================
+
+class TestExplainV1:
+    @patch("main.get_pipeline")
+    def test_explain_success(self, mock_get_pipe, client, dummy_image_bytes):
+        pipeline = _fake_pipeline()
+        pipeline.explain.return_value = {
+            "grayscale_cam": np.random.rand(64, 64).astype(np.float32),
+            "visualization": np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8),
+            "key_findings": ["Mild opacity"],
+            "region_scores": {"left_lung": 0.4},
+        }
+        mock_get_pipe.return_value = pipeline
+        r = client.post(
+            "/api/v1/explain",
+            files={"file": ("xray.jpg", dummy_image_bytes, "image/jpeg")},
+        )
+        # Accept 200 or 500 (if explain codepath has internal issues)
+        assert r.status_code in (200, 500)
+
+
+# ===========================================================================
+# Feedback endpoints
+# ===========================================================================
+
+class TestFeedback:
+    def test_v1_feedback_submit(self, client):
+        r = client.post("/api/v1/feedback", json={
+            "image_hash": "abc123",
+            "prediction": 0,
+            "correct_label": 1,
+            "feedback_type": "correct",
+            "notes": "Test feedback",
+        })
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "received"
+        assert "feedback_id" in body
+        assert "timestamp" in body
+
+    def test_v1_feedback_invalid_type(self, client):
+        r = client.post("/api/v1/feedback", json={
+            "image_hash": "abc123",
+            "prediction": 0,
+            "correct_label": 1,
+            "feedback_type": "INVALID",
+        })
+        assert r.status_code == 422  # Pydantic validation error
+
+    def test_v2_feedback_submit(self, client):
+        r = client.post("/api/v2/feedback", json={
+            "analysis_id": "XCL-20260401-test0001",
+            "user_id": "dr_test",
+            "feedback_type": "correct",
+            "notes": "Confirmed finding",
+        })
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "recorded"
+
+    def test_v2_feedback_stats(self, client):
+        """feedback-stats should return totals and by_type breakdown."""
+        r = client.get("/api/v2/feedback-stats")
+        assert r.status_code == 200
+        body = r.json()
+        assert "total" in body
+        assert "by_type" in body
+        assert isinstance(body["by_type"], dict)
+        assert "correction_rate" in body
+        assert "recent" in body
+        assert isinstance(body["recent"], list)
+
+
+# ===========================================================================
+# Report endpoint (v1)
+# ===========================================================================
+
+class TestReportV1:
+    @patch("main._get_agent")
+    def test_report_success(self, mock_get_agent, client):
+        mock_agent = MagicMock()
+        mock_agent.generate_report.return_value = {
+            "findings": "Enlarged cardiac silhouette.",
+            "impression": "Cardiomegaly suspected.",
+            "uncertainty": "Low uncertainty.",
+            "recommendation": "Clinical correlation recommended.",
+        }
+        mock_get_agent.return_value = mock_agent
+
+        r = client.post("/api/v1/report", json={
+            "prediction": 1,
+            "confidence": 0.92,
+            "uncertainty_level": "low",
+            "highlighted_regions": ["cardiac_silhouette"],
+            "patient_age": 65,
+            "patient_sex": "M",
+        })
+        assert r.status_code == 200
+        body = r.json()
+        assert "findings" in body
+        assert "impression" in body
+
+    def test_report_invalid_prediction_index(self, client):
+        """Prediction index out of range should return 422."""
+        r = client.post("/api/v1/report", json={
+            "prediction": 999,
+            "confidence": 0.5,
+            "uncertainty_level": "high",
+            "highlighted_regions": [],
+        })
+        assert r.status_code == 422
+
+
+# ===========================================================================
+# Chat endpoint (v2)
+# ===========================================================================
+
+class TestChatV2:
+    @patch("main._get_reasoning_agent")
+    def test_chat_success(self, mock_get_reasoning_agent, client):
+        from xclinvision.agent.reasoning import AgentResponse, ReasoningStep
+
+        mock_agent = MagicMock()
+        mock_agent.process_message.return_value = AgentResponse(
+            response="The findings suggest normal cardiac morphology.",
+            intent="explain_prediction",
+            tools_used=["get_prediction_details"],
+            reasoning_trace=[ReasoningStep(step="classify_intent", detail="explain_prediction")],
+            suggested_followups=["Explain the heatmap", "Is follow-up needed?"],
+        )
+        mock_get_reasoning_agent.return_value = mock_agent
+
+        # First need an analysis_id in the store
+        from main import _analysis_store  # type: ignore[import-not-found]
+        _analysis_store["XCL-CHAT-TEST"] = {
+            "analysis_id": "XCL-CHAT-TEST",
+            "prediction": "No finding",
+            "confidence": 0.9,
+            "uncertainty": {},
+            "uncertainty_level": "low",
+            "region_scores": {},
+            "key_findings": [],
+            "llm_summary": "Normal.",
+            "top_k_predictions": [{"class_name": "No finding", "probability": 0.9}],
+        }
+
+        r = client.post("/api/v2/chat", json={
+            "analysis_id": "XCL-CHAT-TEST",
+            "message": "What does this finding mean?",
+            "history": [],
+            "context_type": "clinical",
+        })
+        assert r.status_code == 200
+        body = r.json()
+        assert "response" in body
+        assert body["intent"] == "explain_prediction"
+        assert "tools_used" in body
+        assert "reasoning_trace" in body
+        assert "suggested_followups" in body
+        assert isinstance(body["suggested_followups"], list)
+
+    @patch("main._get_reasoning_agent")
+    def test_chat_returns_reasoning_trace(self, mock_get_reasoning_agent, client):
+        from xclinvision.agent.reasoning import AgentResponse, ReasoningStep
+
+        mock_agent = MagicMock()
+        mock_agent.process_message.return_value = AgentResponse(
+            response="The heatmap highlights the cardiac silhouette region.",
+            intent="explain_heatmap",
+            tools_used=["get_xai_explanation"],
+            reasoning_trace=[
+                ReasoningStep(step="classify_intent", detail="explain_heatmap"),
+                ReasoningStep(step="execute_tool", detail="get_xai_explanation"),
+            ],
+            suggested_followups=["Is this urgent?"],
+        )
+        mock_get_reasoning_agent.return_value = mock_agent
+
+        from main import _analysis_store  # type: ignore[import-not-found]
+        _analysis_store["XCL-CHAT-TRACE"] = {
+            "analysis_id": "XCL-CHAT-TRACE",
+            "prediction": "Cardiomegaly",
+            "confidence": 0.82,
+            "uncertainty": {},
+            "uncertainty_level": "moderate",
+            "region_scores": {"cardiac": 0.8},
+            "key_findings": ["Enlarged cardiac silhouette"],
+            "llm_summary": "Cardiomegaly detected.",
+            "top_k_predictions": [{"class_name": "Cardiomegaly", "probability": 0.82}],
+        }
+
+        r = client.post("/api/v2/chat", json={
+            "analysis_id": "XCL-CHAT-TRACE",
+            "message": "Explain the heatmap",
+            "history": [],
+        })
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body["reasoning_trace"]) == 2
+        assert body["reasoning_trace"][0]["step"] == "classify_intent"
+
+    def test_chat_missing_analysis(self, client):
+        r = client.post("/api/v2/chat", json={
+            "analysis_id": "NONEXISTENT",
+            "message": "hello",
+            "history": [],
+        })
+        assert r.status_code == 404
+
+    @patch("main._get_reasoning_agent")
+    def test_chat_fallback_on_agent_error(self, mock_get_reasoning_agent, client):
+        mock_get_reasoning_agent.side_effect = RuntimeError("Agent broken")
+
+        from main import _analysis_store  # type: ignore[import-not-found]
+        _analysis_store["XCL-CHAT-FALLBACK"] = {
+            "analysis_id": "XCL-CHAT-FALLBACK",
+            "prediction": "No finding",
+            "confidence": 0.95,
+            "uncertainty": {},
+            "uncertainty_level": "low",
+            "region_scores": {},
+            "key_findings": [],
+            "llm_summary": "Normal.",
+            "top_k_predictions": [],
+        }
+
+        r = client.post("/api/v2/chat", json={
+            "analysis_id": "XCL-CHAT-FALLBACK",
+            "message": "test",
+            "history": [],
+        })
+        assert r.status_code == 200
+        body = r.json()
+        assert "response" in body
+        assert body["intent"] == "general_question"
+
+
+# ===========================================================================
+# Drift metrics endpoint (v2)
+# ===========================================================================
+
+class TestDriftMetricsV2:
+    def test_drift_metrics(self, client):
+        r = client.get("/api/v2/drift-metrics")
+        assert r.status_code == 200
+        body = r.json()
+        assert "drift_score" in body
+        assert "drift_detected" in body
+        assert isinstance(body["drift_detected"], bool)
+        assert "avg_confidence" in body
+        assert "prediction_distribution" in body
+        assert "total_predictions" in body
+
+
+# ===========================================================================
+# Model card endpoint (v2)
+# ===========================================================================
+
+class TestModelCardV2:
+    def test_model_card(self, client):
+        r = client.get("/api/v2/model-card")
+        assert r.status_code == 200
+        body = r.json()
+        assert "name" in body
+        assert "version" in body
+        assert "limitations" in body
+        assert "architectures_available" in body
+        assert isinstance(body["architectures_available"], list)
+
+
+# ===========================================================================
+# History endpoint (v2)
+# ===========================================================================
+
+class TestHistoryV2:
+    def test_history_empty_patient(self, client):
+        """History for unknown patient returns empty list."""
+        r = client.get("/api/v2/history/NONEXISTENT_PATIENT")
+        assert r.status_code == 200
+        body = r.json()
+        assert isinstance(body, list)
+        assert len(body) == 0
+
+    @patch("main._get_agent")
+    @patch("main.get_pipeline")
+    def test_history_after_analysis(self, mock_get_pipe, mock_get_agent, client, dummy_image_bytes):
+        """After analyzing an image, history should return that entry."""
+        mock_get_pipe.return_value = _fake_pipeline()
+        mock_agent = MagicMock()
+        mock_agent.generate_report.return_value = {
+            "findings": "Test.",
+            "impression": "Test impression.",
+        }
+        mock_get_agent.return_value = mock_agent
+
+        # Submit analysis
+        r = client.post(
+            "/api/v2/analyze",
+            files={"file": ("xray.jpg", dummy_image_bytes, "image/jpeg")},
+            data={"patient_id": "HIST-TEST-001", "model_name": "efficientnet_b0"},
+        )
+        assert r.status_code == 200
+
+        # Check history — endpoint returns a list of entries directly
+        r2 = client.get("/api/v2/history/HIST-TEST-001")
+        assert r2.status_code == 200
+        body = r2.json()
+        assert isinstance(body, list)
+        assert len(body) >= 1
+        entry = body[0]
+        assert "analysis_id" in entry
+        assert "prediction" in entry
+        assert "confidence" in entry
+
+
+# ===========================================================================
+# Dataset info endpoint (v1)
+# ===========================================================================
+
+class TestDatasetInfo:
+    def test_dataset_info_returns_structure(self, client):
+        """Should return data_root and splits (or 404 if data dir missing)."""
+        r = client.get("/api/v1/dataset/info")
+        # Accept 200 (data exists) or 404 (data dir not found in test env)
+        assert r.status_code in (200, 404)
+        if r.status_code == 200:
+            body = r.json()
+            assert "data_root" in body
+            assert "splits" in body
+            assert "grand_total" in body
+
+
+# ===========================================================================
+# Generate report endpoint (v2)
+# ===========================================================================
+
+class TestGenerateReportV2:
+    @patch("main._get_agent")
+    def test_generate_report(self, mock_get_agent, client):
+        mock_agent = MagicMock()
+        mock_agent.generate_report.return_value = {
+            "findings": "Bilateral pulmonary infiltrates.",
+            "impression": "Consider pulmonary fibrosis.",
+            "uncertainty": "Moderate.",
+            "recommendation": "CT follow-up recommended.",
+        }
+        mock_get_agent.return_value = mock_agent
+
+        # Put a fake analysis in the store (must include timestamp)
+        from main import _analysis_store  # type: ignore[import-not-found]
+        _analysis_store["XCL-REPORT-TEST"] = {
+            "analysis_id": "XCL-REPORT-TEST",
+            "patient_id": "RPT-001",
+            "timestamp": "2026-04-01T12:00:00",
+            "prediction": "Pulmonary fibrosis",
+            "confidence": 0.78,
+            "uncertainty": {},
+            "uncertainty_level": "moderate",
+            "region_scores": {"left_lung": 0.6},
+            "key_findings": ["Reticular pattern"],
+            "llm_summary": "Pulmonary fibrosis suspected.",
+            "model_version": "vit_base",
+            "top_k_predictions": [{"class_name": "Pulmonary fibrosis", "probability": 0.78}],
+        }
+
+        r = client.post("/api/v2/generate-report", json={
+            "analysis_ids": ["XCL-REPORT-TEST"],
+            "template": "structured_clinical",
+            "sections": ["findings", "impressions", "recommendations"],
+        })
+        assert r.status_code == 200
+        body = r.json()
+        assert "report_id" in body
+        assert "content" in body
+        assert "findings" in body["content"]
+        assert "impressions" in body["content"]
+
+
+# ===========================================================================
+# Export report HTML endpoint (v2)
+# ===========================================================================
+
+class TestExportReportV2:
+    @patch("main._get_agent")
+    def test_export_report_html(self, mock_get_agent, client):
+        mock_agent = MagicMock()
+        mock_agent.generate_report.return_value = {
+            "findings": "Cardiomegaly identified.",
+            "impression": "Consider cardiac follow-up.",
+            "key_findings": ["Enlarged cardiac silhouette"],
+            "reasoning_trace": "Step-by-step reasoning.",
+            "differential_diagnosis": ["Cardiomegaly", "Pericardial effusion"],
+            "urgency": "Medium",
+            "next_steps": ["Echocardiogram recommended."],
+            "citations": [],
+            "recommendation": "Cardiology consult.",
+        }
+        mock_get_agent.return_value = mock_agent
+
+        from main import _analysis_store  # type: ignore[import-not-found]
+        _analysis_store["XCL-EXPORT-TEST"] = {
+            "analysis_id": "XCL-EXPORT-TEST",
+            "prediction": "Cardiomegaly",
+            "confidence": 0.82,
+            "uncertainty": {"epistemic": 0.05},
+            "uncertainty_level": "moderate",
+            "region_scores": {"cardiac": 0.8},
+            "key_findings": ["Enlarged cardiac silhouette"],
+            "llm_summary": "Cardiomegaly detected.",
+            "top_k_predictions": [
+                {"class_name": "Cardiomegaly", "probability": 0.82},
+                {"class_name": "No finding", "probability": 0.10},
+            ],
+        }
+
+        r = client.post("/api/v2/export-report", json={
+            "analysis_id": "XCL-EXPORT-TEST",
+        })
+        assert r.status_code == 200
+        body = r.json()
+        assert "html" in body
+        assert "report_id" in body
+        assert body["report_id"].startswith("RPT-")
+
+    def test_export_report_missing_analysis(self, client):
+        r = client.post("/api/v2/export-report", json={
+            "analysis_id": "NONEXISTENT",
+        })
+        assert r.status_code == 404

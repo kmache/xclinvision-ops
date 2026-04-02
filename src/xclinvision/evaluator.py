@@ -385,13 +385,19 @@ class CalibrationAnalyzer:
         y_true: np.ndarray,
         y_probs: np.ndarray,
     ) -> float:
-        """Compute mean per-label binary ECE for multilabel classification."""
+        """Compute mean per-label binary ECE for multilabel classification.
+
+        For each label, bins samples by predicted P(positive) and compares
+        against the actual positive rate in each bin.  This is the standard
+        binary calibration measure: "when the model says P=0.7, is the
+        condition actually present ~70% of the time?"
+        """
         num_labels = y_probs.shape[1]
         eces = []
         for c in range(num_labels):
-            confidences = y_probs[:, c]
-            accuracies = (y_true[:, c] == (confidences >= 0.5).astype(int)).astype(float)
-            eces.append(self._bin_ece(confidences, accuracies))
+            probs = y_probs[:, c]                   # P(positive)
+            labels = y_true[:, c].astype(float)      # actual positive rate
+            eces.append(self._bin_ece(probs, labels))
         return float(np.mean(eces))
 
     def _bin_ece(self, confidences: np.ndarray, accuracies: np.ndarray) -> float:
@@ -444,9 +450,9 @@ class CalibrationAnalyzer:
         all_counts = np.zeros(self.num_bins, dtype=int)
         centers = None
         for c in range(num_labels):
-            confidences = y_probs[:, c]
-            accuracies = (y_true[:, c] == (confidences >= 0.5).astype(int)).astype(float)
-            bc, ba, bn = self._bin_calibration_curve(confidences, accuracies)
+            probs = y_probs[:, c]                   # P(positive)
+            labels = y_true[:, c].astype(float)      # actual positive rate
+            bc, ba, bn = self._bin_calibration_curve(probs, labels)
             centers = bc
             all_accs += ba * bn
             all_counts += bn
@@ -497,6 +503,7 @@ class TemperatureScaler:
         self,
         logits: np.ndarray,
         y_true: np.ndarray,
+        multilabel: bool = False,
     ) -> float:
         """Learn the optimal temperature on a validation set.
 
@@ -504,7 +511,10 @@ class TemperatureScaler:
 
         Args:
             logits: Raw model logits, shape (N, num_classes).
-            y_true: Ground-truth integer labels, shape (N,).
+            y_true: Ground-truth labels — shape (N,) for multiclass
+                    or (N, C) for multilabel.
+            multilabel: If True, use BCEWithLogitsLoss instead of
+                        CrossEntropyLoss.
 
         Returns:
             The learned temperature scalar T.
@@ -512,14 +522,20 @@ class TemperatureScaler:
         from torch.optim import LBFGS
 
         logits_t = torch.FloatTensor(logits)
-        labels_t = torch.LongTensor(y_true)
         # Initialize log(T=1.5) ≈ 0.405
         log_temperature = torch.nn.Parameter(torch.ones(1) * 0.405)
+
+        if multilabel:
+            labels_t = torch.FloatTensor(y_true)
+            loss_fn = torch.nn.BCEWithLogitsLoss()
+        else:
+            labels_t = torch.LongTensor(y_true)
+            loss_fn = torch.nn.CrossEntropyLoss()
 
         def eval_fn():
             optimizer.zero_grad()
             # torch.exp guarantees strictly positive temperature
-            loss = torch.nn.CrossEntropyLoss()(logits_t / torch.exp(log_temperature), labels_t)
+            loss = loss_fn(logits_t / torch.exp(log_temperature), labels_t)
             loss.backward()
             return loss
 
@@ -528,9 +544,12 @@ class TemperatureScaler:
 
         self.temperature = max(float(torch.exp(log_temperature).item()), 0.01)
         self._is_fitted = True
+        final_loss = loss_fn(
+            logits_t / self.temperature, labels_t
+        ).item()
         logger.info(
             f"Temperature scaling converged: T = {self.temperature:.4f}, "
-            f"NLL = {torch.nn.CrossEntropyLoss()(logits_t / self.temperature, labels_t).item():.4f}"
+            f"loss = {final_loss:.4f}"
         )
         return self.temperature
 
@@ -550,16 +569,21 @@ class TemperatureScaler:
             )
         return logits / max(self.temperature, 1e-4)
 
-    def predict_proba(self, logits: np.ndarray) -> np.ndarray:
-        """Return calibrated softmax probabilities.
+    def predict_proba(
+        self, logits: np.ndarray, multilabel: bool = False,
+    ) -> np.ndarray:
+        """Return calibrated probabilities.
 
         Args:
             logits: Raw model logits, shape (N, num_classes).
+            multilabel: If True, apply sigmoid; otherwise softmax.
 
         Returns:
             Calibrated probabilities, shape (N, num_classes).
         """
         scaled = self.scale(logits)
+        if multilabel:
+            return 1.0 / (1.0 + np.exp(-scaled))
         exp = np.exp(scaled - np.max(scaled, axis=1, keepdims=True))
         return exp / np.sum(exp, axis=1, keepdims=True)
 

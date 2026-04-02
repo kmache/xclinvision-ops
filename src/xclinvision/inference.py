@@ -178,12 +178,13 @@ class InferencePipeline:
                 gray = arr
 
         # --- Apply full preprocessing pipeline (CLAHE, crop, letterbox) ---
-        processed, status = process_and_filter_xray(gray, target_size=self.image_size)
+        proc_result = process_and_filter_xray(gray, target_size=self.image_size)
+        processed = proc_result.image
         if processed is None:
             logger.warning(
                 "process_and_filter_xray rejected image (%s); "
                 "falling back to plain resize. Predictions may be less reliable.",
-                status,
+                proc_result.reason,
             )
             processed = cv2.resize(gray, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
 

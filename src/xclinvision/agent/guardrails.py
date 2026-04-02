@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -22,9 +23,10 @@ logger = logging.getLogger(__name__)
 # 1.  Disallowed-term scanner
 # ════════════════════════════════════════════════════════════════════════════════
 
-# Mapping: disallowed phrase (case-insensitive) → suggested replacement.
-# The replacements use evidence-based clinical hedging language.
-DISALLOWED_TERMS: Dict[str, str] = {
+_GUARDRAIL_TERMS_PATH = Path(__file__).resolve().parents[3] / "configs" / "guardrail_terms.yaml"
+
+# Hardcoded fallback used when the YAML file is missing or corrupt.
+_FALLBACK_DISALLOWED_TERMS: Dict[str, str] = {
     "definitely has": "findings are consistent with",
     "certainly has": "findings are consistent with",
     "clearly shows": "findings suggest",
@@ -56,11 +58,48 @@ DISALLOWED_TERMS: Dict[str, str] = {
     "negative for": "no significant findings suggestive of",
 }
 
+
+def _load_disallowed_terms(path: Path = _GUARDRAIL_TERMS_PATH) -> Dict[str, str]:
+    """Load disallowed terms from a YAML file, falling back to hardcoded defaults."""
+    try:
+        import yaml
+
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+        terms = data.get("disallowed_terms", {})
+        if isinstance(terms, dict) and terms:
+            logger.info("Loaded %d disallowed terms from %s", len(terms), path)
+            return terms
+    except Exception as exc:
+        logger.warning("Could not load guardrail terms from %s (%s); using fallback.", path, exc)
+    return dict(_FALLBACK_DISALLOWED_TERMS)
+
+
+def _compile_patterns(terms: Dict[str, str]) -> List[Tuple[re.Pattern, str]]:
+    """Compile regex patterns for each disallowed term (case-insensitive)."""
+    return [
+        (re.compile(re.escape(term), re.IGNORECASE), replacement)
+        for term, replacement in terms.items()
+    ]
+
+
+# Mapping: disallowed phrase (case-insensitive) → suggested replacement.
+# The replacements use evidence-based clinical hedging language.
+DISALLOWED_TERMS: Dict[str, str] = _load_disallowed_terms()
+
 # Compiled regex patterns for each disallowed term (case-insensitive)
-_DISALLOWED_PATTERNS: List[Tuple[re.Pattern, str]] = [
-    (re.compile(re.escape(term), re.IGNORECASE), replacement)
-    for term, replacement in DISALLOWED_TERMS.items()
-]
+_DISALLOWED_PATTERNS: List[Tuple[re.Pattern, str]] = _compile_patterns(DISALLOWED_TERMS)
+
+
+def reload_terms(path: Optional[Path] = None) -> None:
+    """Reload disallowed terms from YAML and recompile patterns.
+
+    Useful after editing ``configs/guardrail_terms.yaml`` at runtime.
+    """
+    global DISALLOWED_TERMS, _DISALLOWED_PATTERNS  # noqa: PLW0603
+    DISALLOWED_TERMS = _load_disallowed_terms(path or _GUARDRAIL_TERMS_PATH)
+    _DISALLOWED_PATTERNS = _compile_patterns(DISALLOWED_TERMS)
+    logger.info("Guardrail terms reloaded (%d terms).", len(DISALLOWED_TERMS))
 
 
 def _scan_and_rewrite(text: str) -> Tuple[str, List[str]]:

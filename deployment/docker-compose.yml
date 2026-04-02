@@ -1,29 +1,49 @@
 services:
   backend:
-    build: ./app/backend
+    build:
+      context: ..
+      dockerfile: app/backend/Dockerfile
     restart: unless-stopped
+    environment:
+      - XCLINVISION_MODELS_DIR=/app/models/best_models
+      - XCLINVISION_DATA_DIR=/app/data/processed_384
+      - XCLINVISION_CORS_ORIGINS=http://frontend:8501,http://localhost:8501,http://localhost:80
+    volumes:
+      - ../models/best_models:/app/models/best_models:ro
+      - ../data/processed_384:/app/data/processed_384:ro
+      - ../outputs:/app/outputs
+      - ../logs:/app/logs
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 60s
+
   frontend:
-    build: ./app/frontend
+    build:
+      context: ..
+      dockerfile: app/frontend/Dockerfile
     restart: unless-stopped
+    environment:
+      - API_URL=http://backend:8000
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
+    depends_on:
+      backend:
+        condition: service_healthy
+
   nginx:
     image: nginx:latest
     restart: unless-stopped
     volumes:
-      - ./deployment/nginx.conf:/etc/nginx/conf.d/default.conf
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
     ports:
-      - "80:80" 
+      - "80:80"
     depends_on:
       backend:
         condition: service_healthy

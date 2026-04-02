@@ -28,7 +28,7 @@ class ModelInfo(BaseModel):
 
 
 class PredictRequest(BaseModel):
-    model_name: str = "efficientnet_b2"
+    model_name: str = "convnext_small"
     return_explanation: bool = True
 
 
@@ -41,13 +41,11 @@ class PredictResponse(BaseModel):
     uncertainty_level: Optional[str] = None
     explanation: Optional[Dict] = None
     processing_time_ms: float
-    # Multi-label fields (populated only when classification_mode == "multilabel")
     predictions_multilabel: Optional[List[int]] = None
     class_names_predicted: Optional[List[str]] = None
 
-
 class ExplainRequest(BaseModel):
-    model_name: str = "efficientnet_b2"
+    model_name: str = "convnext_small"
     target_class: Optional[int] = None
 
 
@@ -191,4 +189,11 @@ class PatientHistoryEntry(BaseModel):
     uncertainty_level: str = "unknown"
     llm_summary: str = ""
     model_version: str = "unknown"
-    thumbnail: Optional[str] = None  # Base64 encoded heatmap thumbnail
+    thumbnail: Optional[str] = None
+
+
+class ExportReportRequest(BaseModel):
+    """Request to export a self-contained HTML clinical report."""
+    analysis_id: str
+    include_xai: bool = True
+    include_uncertainty: bool = True

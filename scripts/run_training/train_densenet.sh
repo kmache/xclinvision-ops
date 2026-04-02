@@ -18,11 +18,12 @@ python3 scripts/train.py \
   --config  configs/densenet.yaml \
   --model   densenet \
   --epochs  50 \
-  --batch-size 24 \
+  --batch-size 32 \
   --image-size  384 \
-  --process-size 1024 \
+  --process-size 384 \
   --lr      5e-4 \
-  --loss    ce \
+  --loss    focal \
+  --pooling gem \
   --weight-decay 1e-4 \
   --accumulate-grad-batches 3 \
   --output-dir models \

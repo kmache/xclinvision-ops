@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
@@ -206,6 +207,10 @@ def _default_call_llm(system: str, user: str, *, temperature: float = 0.2) -> st
 
     Uses ``OPENAI_API_KEY`` and optionally ``OPENAI_MODEL`` / ``OPENAI_API_BASE``
     from environment variables.
+
+    Attempts ``response_format={"type": "json_object"}`` first (supported by
+    OpenAI / compatible providers).  If the provider rejects it, falls back
+    to a plain completion and extracts JSON from the response with a regex.
     """
     try:
         from openai import OpenAI
@@ -218,16 +223,44 @@ def _default_call_llm(system: str, user: str, *, temperature: float = 0.2) -> st
     )
     model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+    # First attempt: structured JSON mode (OpenAI-native).
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            response_format={"type": "json_object"},
+        )
+        return response.choices[0].message.content or ""
+    except Exception as exc:
+        # Catch provider-specific errors (e.g. BadRequestError for models
+        # that don't support response_format) and fall back gracefully.
+        logger.warning(
+            "Structured JSON mode failed (%s); falling back to plain completion "
+            "with regex JSON extraction.",
+            exc,
+        )
+
+    # Fallback: plain completion → regex-extract the first JSON object.
     response = client.chat.completions.create(
         model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        messages=messages,
         temperature=temperature,
-        response_format={"type": "json_object"},
     )
-    return response.choices[0].message.content or ""
+    raw = response.choices[0].message.content or ""
+
+    # Try to extract a JSON object from the free-form response.
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        return match.group()
+    # If no JSON found, return the raw text and let the caller handle parsing.
+    logger.warning("No JSON object found in fallback LLM response; returning raw text.")
+    return raw
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -512,12 +545,44 @@ class ClinicalReasoningAgent:
         spatial_block: str,
         rag_block: str,
     ) -> ClinicalReport:
-        """Cross-verification step: check that every claim is evidence-backed."""
+        """Cross-verification step: check that every claim is evidence-backed.
+
+        To stay within safe prompt limits the RAG block is restricted to the
+        first 3 chunks and the draft report JSON is truncated if the total
+        prompt would exceed ~6 000 tokens (estimated via tiktoken).
+        """
+        # Limit RAG to top-3 chunks to keep the prompt concise.
+        rag_lines = rag_block.split("\n\n")
+        rag_block_trimmed = "\n\n".join(rag_lines[:3]) if len(rag_lines) > 3 else rag_block
+
+        draft_json = report.model_dump_json(indent=2)
+
+        # Estimate token count and truncate draft if too long.
+        _MAX_PROMPT_TOKENS = 6000
+        try:
+            import tiktoken
+            enc = tiktoken.encoding_for_model("gpt-4o-mini")
+            total = len(enc.encode(
+                _SYSTEM_PROMPT + draft_json + predictions_block + spatial_block + rag_block_trimmed
+            ))
+            if total > _MAX_PROMPT_TOKENS:
+                # Truncate the draft JSON to keep within budget.
+                budget_chars = max(500, len(draft_json) - (total - _MAX_PROMPT_TOKENS) * 4)
+                draft_json = draft_json[:budget_chars] + "\n... [truncated for token limit]"
+                logger.info(
+                    "Cross-verify prompt truncated: %d tokens estimated, draft trimmed to %d chars.",
+                    total, budget_chars,
+                )
+        except Exception:
+            # tiktoken unavailable — apply a simple character cap.
+            if len(draft_json) > 2000:
+                draft_json = draft_json[:2000] + "\n... [truncated]"
+
         verification_prompt = _CROSS_VERIFICATION_PROMPT_TEMPLATE.format(
-            draft_json=report.model_dump_json(indent=2),
+            draft_json=draft_json,
             predictions_block=predictions_block,
             spatial_block=spatial_block,
-            rag_block=rag_block,
+            rag_block=rag_block_trimmed,
         )
 
         try:
@@ -545,7 +610,7 @@ class ClinicalReasoningAgent:
                 report.reasoning_trace += (
                     "\nSuggested revisions: " + "; ".join(revisions)
                 )
- 
+
         if force_review or unsupported:
             report.requires_human_review = True
 

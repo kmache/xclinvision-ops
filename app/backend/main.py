@@ -7,7 +7,6 @@ import base64
 import time
 import threading
 from contextlib import asynccontextmanager
-from functools import lru_cache
 from pathlib import Path
 
 logging.basicConfig(
@@ -18,12 +17,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent))
 
 from xclinvision.config import get_class_names, get_num_classes
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Form, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Literal
+from typing import Any, List, Optional, Dict
 import numpy as np
 from PIL import Image
 import cv2
@@ -36,9 +37,14 @@ from schemas import (
     ExplanationParams,
     DashboardFeedbackRequest,
     ChatRequest,
+    ChatMessage,
     DashboardReportRequest,
     DriftMetrics,
     PatientHistoryEntry,
+    PredictResponse as PredictionResponse,
+    FeedbackRequest,
+    ReportRequest,
+    ExportReportRequest,
 )
 
 MAX_UPLOAD_MB = 20
@@ -76,53 +82,54 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
-# Request/Response models
-class PredictionResponse(BaseModel):
-    prediction: int
-    class_name: str
-    probabilities: List[float]
-    confidence: float
-    uncertainty: Optional[Dict] = None
-    uncertainty_level: Optional[str] = None
-    explanation: Optional[Dict] = None
-    processing_time_ms: float
-    # Multi-label fields (populated only when classification_mode == "multilabel")
-    predictions_multilabel: Optional[List[int]] = None
-    class_names_predicted: Optional[List[str]] = None
-
-
-class FeedbackRequest(BaseModel):
-    image_hash: str
-    prediction: int
-    correct_label: int
-    feedback_type: Literal["verify", "correct", "error"]
-    notes: Optional[str] = None
-    clinician_id: Optional[str] = None
-
-
-class ReportRequest(BaseModel):
-    prediction: int
-    confidence: float
-    uncertainty_level: str
-    highlighted_regions: List[str]
-    patient_age: Optional[int] = None
-    patient_sex: Optional[str] = None
+# All Pydantic schemas are consolidated in schemas.py (imported at top).
 
 
 # ---------------------------------------------------------------------------
-# Model loading  (C-1 fix)
+# Model loading — dynamic model registry with per-architecture caching
 # ---------------------------------------------------------------------------
 
-@lru_cache(maxsize=None)
+_pipeline_cache: Dict[str, "InferencePipeline"] = {}
+_pipeline_lock = threading.Lock()
+
+# Directory containing exported best model .pth files + _meta.json sidecars
+_MODELS_DIR = Path(os.getenv(
+    "XCLINVISION_MODELS_DIR",
+    str(Path(__file__).parent.parent.parent / "models" / "best_models"),
+))
+
+
+def _discover_models() -> Dict[str, dict]:
+    """Scan _MODELS_DIR for *_meta.json files and return {arch_name: metadata}."""
+    registry: Dict[str, dict] = {}
+    if not _MODELS_DIR.is_dir():
+        return registry
+    for meta_file in sorted(_MODELS_DIR.glob("*_meta.json")):
+        try:
+            meta = json.loads(meta_file.read_text())
+            arch = meta.get("model_name", "")
+            if not arch:
+                continue
+            pth_path = meta_file.with_name(meta_file.name.replace("_meta.json", ".pth"))
+            if not pth_path.exists():
+                logger.warning("Model checkpoint not found for %s: %s", arch, pth_path)
+                continue
+            meta["_pth_path"] = str(pth_path)
+            meta["_meta_path"] = str(meta_file)
+            registry[arch] = meta
+        except Exception as exc:
+            logger.warning("Failed to read model metadata %s: %s", meta_file, exc)
+    return registry
+
+
+# Discover models once at import time; refresh on demand
+_model_registry: Dict[str, dict] = _discover_models()
+
+
 def _build_pipeline(model_path: str, architecture: str, image_size: int):
-    """Load a trained checkpoint once and cache the InferencePipeline.
+    """Load a trained checkpoint and return an InferencePipeline.
 
     Supports both plain state-dict (.pth) and PyTorch Lightning (.ckpt) files.
-
-    Parameters are read from environment variables:
-      XCLINVISION_MODEL_PATH   - path to a .pth state-dict or .ckpt Lightning checkpoint
-      XCLINVISION_ARCHITECTURE - model architecture name (default: efficientnet_b2)
-      XCLINVISION_IMAGE_SIZE   - input image size used during training (default: 384)
     """
     import torch
     from xclinvision.modeling import build_model, get_model_normalization
@@ -134,7 +141,6 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
     checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
 
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        # Lightning checkpoint — strip "model." prefix from keys
         state_dict = {}
         for k, v in checkpoint["state_dict"].items():
             new_key = k.replace("model.", "", 1) if k.startswith("model.") else k
@@ -142,11 +148,9 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
         model.load_state_dict(state_dict, strict=False)
         logger.info("Loaded Lightning checkpoint: %s", model_path)
     elif isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        # BestModelExportCallback .pth payload
         model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         logger.info("Loaded exported .pth payload: %s", model_path)
     elif isinstance(checkpoint, dict):
-        # Plain state_dict (e.g. torch.save(model.state_dict(), ...))
         model.load_state_dict(checkpoint, strict=False)
         logger.info("Loaded state_dict checkpoint: %s", model_path)
     else:
@@ -154,7 +158,6 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
 
     model.eval()
 
-    # Extract temperature and thresholds from the payload if present
     temperature_value = None
     thresholds_dict = None
     if isinstance(checkpoint, dict):
@@ -181,14 +184,55 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
     )
 
 
-def get_pipeline():
-    """Return the cached InferencePipeline or None if not configured."""
-    model_path = os.getenv("XCLINVISION_MODEL_PATH", "")
-    if not model_path or not Path(model_path).exists():
-        return None
-    architecture = os.getenv("XCLINVISION_ARCHITECTURE", "efficientnet_b2")
-    image_size = int(os.getenv("XCLINVISION_IMAGE_SIZE", "384"))
-    return _build_pipeline(model_path, architecture, image_size)
+def get_pipeline(model_name: Optional[str] = None):
+    """Return a cached InferencePipeline for the requested model architecture.
+
+    Looks up models in the auto-discovered registry (models/best_models/).
+    Falls back to XCLINVISION_MODEL_PATH env var if no registry match.
+    Caches pipelines so each architecture is loaded only once.
+    """
+    # 1. Try to resolve from the auto-discovered registry
+    if model_name and model_name in _model_registry:
+        if model_name in _pipeline_cache:
+            return _pipeline_cache[model_name]
+        meta = _model_registry[model_name]
+        with _pipeline_lock:
+            # Double-check after acquiring lock
+            if model_name in _pipeline_cache:
+                return _pipeline_cache[model_name]
+            try:
+                pipeline = _build_pipeline(
+                    model_path=meta["_pth_path"],
+                    architecture=model_name,
+                    image_size=384,  # All best_models are trained at 384
+                )
+                _pipeline_cache[model_name] = pipeline
+                logger.info("Loaded model '%s' from registry (%s)", model_name, meta["_pth_path"])
+                return pipeline
+            except Exception as exc:
+                logger.error("Failed to load model '%s': %s", model_name, exc)
+
+    # 2. Fallback to env-var based loading
+    env_path = os.getenv("XCLINVISION_MODEL_PATH", "")
+    if env_path and Path(env_path).exists():
+        env_arch = os.getenv("XCLINVISION_ARCHITECTURE", "convnext_small")
+        cache_key = f"_env_{env_arch}"
+        if cache_key in _pipeline_cache:
+            return _pipeline_cache[cache_key]
+        image_size = int(os.getenv("XCLINVISION_IMAGE_SIZE", "384"))
+        with _pipeline_lock:
+            if cache_key in _pipeline_cache:
+                return _pipeline_cache[cache_key]
+            pipeline = _build_pipeline(env_path, env_arch, image_size)
+            _pipeline_cache[cache_key] = pipeline
+            return pipeline
+
+    # 3. Auto-load the first available model from the registry
+    if _model_registry and not _pipeline_cache:
+        first_arch = next(iter(_model_registry))
+        return get_pipeline(first_arch)
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +240,12 @@ def get_pipeline():
 # ---------------------------------------------------------------------------
 _agent_instance = None
 _agent_lock = threading.Lock()
+
+_reasoning_agent_instance = None
+_reasoning_agent_lock = threading.Lock()
+
+# Per-analysis session memory for the dialogue manager
+_session_memory_store: Dict[str, Any] = {}
 
 
 def _get_agent():
@@ -215,6 +265,21 @@ def _get_agent():
                 raise HTTPException(503, detail=f"LLM agent unavailable: {exc}")
     return _agent_instance
 
+
+def _get_reasoning_agent():
+    """Return a module-level cached ReasoningAgent (tool-calling reasoning loop)."""
+    global _reasoning_agent_instance
+    with _reasoning_agent_lock:
+        if _reasoning_agent_instance is None:
+            try:
+                from xclinvision.agent import create_reasoning_agent
+                _reasoning_agent_instance = create_reasoning_agent()
+            except Exception as exc:
+                logger.warning("Failed to initialise reasoning agent: %s", exc)
+                raise HTTPException(503, detail=f"Reasoning agent unavailable: {exc}")
+    return _reasoning_agent_instance
+    return _agent_instance
+
 # ---------------------------------------------------------------------------
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp", ".dcm"}
@@ -228,9 +293,50 @@ def _count_images(directory: Path) -> int:
 
 
 def _dataset_stats(data_dir: Path) -> dict:
-    """Build a nested dict with per-split, per-class image counts."""
+    """Build a nested dict with per-split image counts.
+
+    Supports two layouts:
+    1. Folder-based: ``data_dir/train/ClassName/*.png``
+    2. Manifest-based: ``data_dir/splits/{train,val,test}.txt`` + ``data_dir/images/``
+    """
     splits = ["train", "val", "test"]
     stats: dict = {}
+
+    # Try manifest-based layout first (data/processed_384/)
+    splits_dir = data_dir / "splits"
+    images_dir = data_dir / "images"
+    if splits_dir.is_dir() and images_dir.is_dir():
+        for split in splits:
+            split_file = splits_dir / f"{split}.txt"
+            if not split_file.exists():
+                continue
+            try:
+                lines = split_file.read_text().strip().splitlines()
+                stats[split] = {
+                    "path": str(split_file),
+                    "classes": {},
+                    "total": len(lines),
+                }
+            except Exception:
+                continue
+        # Augment with manifest class counts if available
+        manifest = data_dir / "manifest.csv"
+        if manifest.exists():
+            try:
+                import csv
+                with open(manifest, newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        sp = row.get("split", "")
+                        label = row.get("label", row.get("class_name", ""))
+                        if sp in stats and label:
+                            stats[sp]["classes"][label] = stats[sp]["classes"].get(label, 0) + 1
+            except Exception:
+                pass
+        if stats:
+            return stats
+
+    # Fallback: folder-based layout (data_dir/train/ClassName/images)
     for split in splits:
         split_path = data_dir / split
         if not split_path.is_dir():
@@ -254,7 +360,7 @@ def _dataset_stats(data_dir: Path) -> dict:
 async def log_dataset_info() -> None:
     """(Called from the lifespan context manager on server start-up.)"""
     """Log dataset directories and image counts on server startup."""
-    raw_data_dir = os.getenv("XCLINVISION_DATA_DIR", "data/processed")
+    raw_data_dir = os.getenv("XCLINVISION_DATA_DIR", "data/processed_384")
     data_dir = Path(raw_data_dir)
     if not data_dir.is_absolute():
         data_dir = (Path(__file__).parent.parent.parent / data_dir).resolve()
@@ -301,7 +407,7 @@ async def health_check():
 @app.get("/api/v1/dataset/info")
 async def dataset_info():
     """Return dataset directories and image counts for each split."""
-    raw_data_dir = os.getenv("XCLINVISION_DATA_DIR", "data/processed")
+    raw_data_dir = os.getenv("XCLINVISION_DATA_DIR", "data/processed_384")
     data_dir = Path(raw_data_dir)
     if not data_dir.is_absolute():
         data_dir = (Path(__file__).parent.parent.parent / data_dir).resolve()
@@ -320,27 +426,31 @@ async def dataset_info():
 
 @app.get("/api/v1/models")
 async def list_models():
-    """List available model architectures.
+    """List available trained models from the auto-discovered registry."""
+    global _model_registry
+    _model_registry = _discover_models()  # Refresh on each call
 
-    C-2 fix: the previous implementation imported xclinvision.architecture
-    which does not exist.  Model metadata is now read from xclinvision.modeling.
-    """
-    from xclinvision.modeling import TIMM_MODEL_MAP
-
-    models = [
-        {"name": name, "timm_id": timm_id, "type": "cnn" if any(
-            k in name for k in ("resnet", "densenet", "efficientnet", "convnext")
-        ) else "transformer"}
-        for name, timm_id in TIMM_MODEL_MAP.items()
-    ]
-    models.append({"name": "biomedclip", "timm_id": "hf-hub:microsoft/BiomedCLIP-...", "type": "vit"})
+    models = []
+    for arch, meta in _model_registry.items():
+        model_type = "cnn" if any(
+            k in arch for k in ("resnet", "densenet", "efficientnet", "convnext")
+        ) else "transformer"
+        models.append({
+            "name": arch,
+            "type": model_type,
+            "num_classes": meta.get("num_classes", get_num_classes()),
+            "class_names": meta.get("class_names", get_class_names()),
+            "thresholds": meta.get("thresholds"),
+            "best_val_f1": meta.get("best_val_auc"),  # Actually stores F1 macro
+            "loaded": arch in _pipeline_cache,
+        })
     return {"models": models}
 
 
 @app.post("/api/v1/predict", response_model=PredictionResponse)
 async def predict(
     file: UploadFile = File(...),
-    model_name: str = "efficientnet_b2",
+    model_name: str = "convnext_small",
     return_explanation: bool = True,
 ):
     """Predict class for uploaded chest X-ray image."""
@@ -382,15 +492,14 @@ async def predict(
 
     image_np = np.array(image)
 
-    pipeline = get_pipeline()
+    pipeline = get_pipeline(model_name=model_name)
     if pipeline is None:
         raise HTTPException(
             503,
             detail=(
-                "No model is loaded. Set the XCLINVISION_MODEL_PATH environment "
-                "variable to the path of a trained .ckpt checkpoint and restart "
-                "the server.  Optionally set XCLINVISION_ARCHITECTURE and "
-                "XCLINVISION_IMAGE_SIZE to match the checkpoint."
+                "No model is loaded. Ensure trained model checkpoints exist in "
+                "models/best_models/ or set the XCLINVISION_MODEL_PATH environment "
+                "variable and restart the server."
             ),
         )
 
@@ -434,7 +543,7 @@ async def predict(
 @app.post("/api/v1/explain")
 async def explain(
     file: UploadFile = File(...),
-    model_name: str = "efficientnet_b2",
+    model_name: str = "convnext_small",
     target_class: Optional[int] = None,
 ):
     """Generate Grad-CAM++ explanation for image."""
@@ -453,11 +562,11 @@ async def explain(
     except Exception as e:
         raise HTTPException(400, f"Could not process image: {str(e)}")
 
-    pipeline = get_pipeline()
+    pipeline = get_pipeline(model_name=model_name)
     if pipeline is None:
         raise HTTPException(
             503,
-            detail="No model loaded. Set XCLINVISION_MODEL_PATH and restart the server.",
+            detail="No model loaded. Ensure models exist in models/best_models/ and restart the server.",
         )
 
     image_np = np.array(image)
@@ -644,7 +753,7 @@ async def analyze_image(
     modality: str = Form(default="X-ray"),
     body_part: str = Form(default="Chest"),
     clinical_history: str = Form(default=""),
-    model_name: str = Form(default="efficientnet_b2"),
+    model_name: str = Form(default="convnext_small"),
 ):
     """Full analysis with prediction, uncertainty, XAI heatmaps, and LLM summary.
 
@@ -679,11 +788,11 @@ async def analyze_image(
     analysis_id = f"XCL-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
 
     # --- Run inference -------------------------------------------------------
-    pipeline = get_pipeline()
+    pipeline = get_pipeline(model_name=model_name)
     if pipeline is None:
         raise HTTPException(
             503,
-            detail="No model loaded. Set XCLINVISION_MODEL_PATH and restart.",
+            detail="No model loaded. Ensure models exist in models/best_models/ and restart.",
         )
 
     try:
@@ -713,17 +822,10 @@ async def analyze_image(
         overlay_img = _generate_heatmap_overlay(vis_image, grayscale_cam, opacity=0.45)
         overlay_b64 = _img_to_base64(overlay_img)
     else:
-        # Generate a mock heatmap for demo purposes when no real XAI (vectorized)
-        h, w = vis_image.shape[:2]
-        cy, cx = int(h * 0.30), int(w * 0.65)
-        ys = np.arange(h, dtype=np.float32)
-        xs = np.arange(w, dtype=np.float32)
-        yy, xx = np.meshgrid(ys, xs, indexing="ij")
-        d = np.sqrt(((yy - cy) / (h * 0.25)) ** 2 + ((xx - cx) / (w * 0.25)) ** 2)
-        mock = np.exp(-d)
-        heatmap_b64 = _img_to_base64(mock)
-        overlay_img = _generate_heatmap_overlay(vis_image, mock, opacity=0.45)
-        overlay_b64 = _img_to_base64(overlay_img)
+        # No real XAI available — return null heatmaps instead of fake data
+        logger.warning("XAI heatmap unavailable for this analysis — returning null heatmap fields")
+        heatmap_b64 = None
+        overlay_b64 = None
 
     # --- Build top-k predictions ---------------------------------------------
     probs = result.get("probabilities", [])
@@ -822,7 +924,7 @@ async def get_dashboard_explanation(
     if raw_bytes is None:
         raise HTTPException(404, "Original image not found")
 
-    pipeline = get_pipeline()
+    pipeline = get_pipeline(model_name=stored.get("model_version"))
     if pipeline is None:
         raise HTTPException(503, "No model loaded.")
 
@@ -890,6 +992,8 @@ async def get_patient_history(patient_id: str, limit: int = Query(default=50, le
             "confidence": h["confidence"],
             "uncertainty": h.get("uncertainty", {}),
             "uncertainty_level": h.get("uncertainty_level", "unknown"),
+            "top_k_predictions": h.get("top_k_predictions", []),
+            "heatmap_overlay": h.get("heatmap_overlay"),
             "llm_summary": h.get("llm_summary", ""),
             "model_version": h.get("model_version", "unknown"),
             "thumbnail": h.get("heatmap_gradcam"),
@@ -928,63 +1032,58 @@ async def submit_dashboard_feedback(feedback: DashboardFeedbackRequest):
 
 @app.post("/api/v2/chat")
 async def llm_chat(request: ChatRequest):
-    """Context-aware LLM chat about an analysis."""
+    """Context-aware LLM chat powered by the reasoning agent.
+
+    The reasoning agent classifies user intent, selects & executes tools,
+    and synthesises a contextual response — far richer than the old
+    "re-generate full report per message" approach.
+    """
     stored = _analysis_store.get(request.analysis_id)
     if not stored:
         raise HTTPException(404, "Analysis not found")
 
     try:
-        from xclinvision.agent import ClinicalContext, create_agent
+        reasoning_agent = _get_reasoning_agent()
 
-        probs = [p["probability"] for p in stored.get("top_k_predictions", [])]
-        class_names = [p["class_name"] for p in stored.get("top_k_predictions", [])]
-
-        context = ClinicalContext(
-            prediction=stored["prediction"],
-            probabilities=probs,
-            confidence=stored["confidence"],
-            uncertainty_level=stored.get("uncertainty_level", "unknown"),
-            highlighted_regions=list(stored.get("region_scores", {}).keys())[:3],
-            class_names=class_names,
-        )
-
-        agent = _get_agent()
-        history_text = "\n".join(
-            f"{'User' if m.role == 'user' else 'AI'}: {m.content}"
-            for m in request.history[-5:]  # Last 5 messages for context
-        )
-
-        report = agent.generate_report(context)
-        base_text = report.get("findings", "") + " " + report.get("impression", "")
-
-        # For the user's specific question, provide a contextual response
-        response_text = (
-            f"Based on the AI analysis ({stored['prediction']} at "
-            f"{stored['confidence']:.1%} confidence): {base_text}\n\n"
-            f"Regarding your question: '{request.message}' — "
-            f"{report.get('recommendation', 'Clinical correlation recommended.')}"
-        )
-
-        suggested = [
-            "What are the differential diagnoses?",
-            "Explain in simple terms",
-            "Is follow-up imaging needed?",
+        # Build conversation history for context
+        history = [
+            {"role": m.role, "content": m.content}
+            for m in (request.history or [])[-8:]
         ]
 
+        # Extra context the tools may need
+        extra_context = {
+            "analysis_store": _analysis_store,
+            "feedback_store": _feedback_store,
+        }
+
+        agent_response = reasoning_agent.process_message(
+            message=request.message,
+            analysis=stored,
+            history=history,
+            extra_context=extra_context,
+        )
+
+        return agent_response.to_api_dict()
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning("LLM chat error: %s", e)
+        # Graceful fallback — still useful even if reasoning agent fails
         response_text = (
             f"Analysis shows {stored['prediction']} ({stored['confidence']:.1%} confidence). "
             f"Regarding '{request.message}': Clinical correlation is recommended. "
             "Please consult with a specialist for definitive interpretation."
         )
-        suggested = []
-
-    return {
-        "response": response_text,
-        "suggested_followups": suggested,
-        "references": [],
-    }
+        return {
+            "response": response_text,
+            "suggested_followups": [],
+            "references": [],
+            "reasoning_trace": [],
+            "intent": "general_question",
+            "tools_used": [],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1060,6 +1159,84 @@ async def generate_dashboard_report(request: DashboardReportRequest):
 
 
 # ---------------------------------------------------------------------------
+# Dashboard v2: HTML report export (ClinicalReporter)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/v2/export-report")
+async def export_report_html(request: ExportReportRequest):
+    """Generate a self-contained HTML clinical report via ClinicalReporter."""
+    stored = _analysis_store.get(request.analysis_id)
+    if not stored:
+        raise HTTPException(404, "Analysis not found")
+
+    try:
+        from xclinvision.agent import ClinicalContext, create_agent
+        from xclinvision.agent.reporter import ClinicalReporter
+        from xclinvision.agent.xclinvisionagent import ClinicalReport
+        import numpy as np
+
+        probs = [p["probability"] for p in stored.get("top_k_predictions", [])]
+        class_names = [p["class_name"] for p in stored.get("top_k_predictions", [])]
+
+        context = ClinicalContext(
+            prediction=stored["prediction"],
+            probabilities=probs,
+            confidence=stored["confidence"],
+            uncertainty_level=stored.get("uncertainty_level", "unknown"),
+            highlighted_regions=list(stored.get("region_scores", {}).keys())[:3],
+            class_names=class_names,
+        )
+
+        agent = _get_agent()
+        report_data = agent.generate_report(context)
+
+        # Build a proper ClinicalReport from the agent output
+        raw_regions = stored.get("region_scores", {})
+        spatial_evidence = {k: str(v) for k, v in raw_regions.items()}
+        clinical_report = ClinicalReport(
+            findings=report_data.get("key_findings", [stored["prediction"]]),
+            spatial_evidence=spatial_evidence,
+            reasoning_trace=report_data.get("reasoning_trace", ""),
+            differential_diagnosis=report_data.get("differential_diagnosis", []),
+            impression=report_data.get("impression", report_data.get("findings", "")),
+            urgency=report_data.get("urgency", "Medium"),
+            next_steps=report_data.get("next_steps", [report_data.get("recommendation", "Clinical correlation recommended.")]),
+            citations=report_data.get("citations", []),
+        )
+
+        # Vision data for the reporter
+        vision_data = {
+            "class_names": class_names,
+            "probabilities": probs,
+        }
+        # Include XAI explanation if available and requested
+        if request.include_xai and stored.get("explanation"):
+            vision_data["explanation"] = stored["explanation"]
+
+        # Use a placeholder image (grey) if original not in memory
+        image_data = np.full((384, 384, 3), 128, dtype=np.uint8)
+
+        reporter = ClinicalReporter()
+        html = reporter.generate_html(
+            report=clinical_report,
+            vision_data=vision_data,
+            image_data=image_data,
+            patient_meta=stored.get("patient_meta"),
+        )
+
+        return {
+            "html": html,
+            "report_id": f"RPT-{uuid.uuid4().hex[:8]}",
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    except Exception as e:
+        logger.warning("HTML report export error: %s", e)
+        raise HTTPException(500, detail=f"Failed to generate HTML report: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Dashboard v2: Drift metrics
 # ---------------------------------------------------------------------------
 
@@ -1131,18 +1308,40 @@ async def get_model_card():
     if model_card_path.exists():
         model_card_text = model_card_path.read_text()[:2000]
 
+    # Load real performance metrics from evaluation reports if available
+    eval_base = Path(__file__).parent.parent.parent / "outputs"
+    performance = {}
+    for model_key, dir_name in [
+        ("vit_base", "evaluation_384_vit_base"),
+        ("convnext_small", "evaluation_384_convnext_small"),
+        ("efficientnet_b0", "evaluation_384_efficientnet_b0"),
+        ("densenet", "evaluation_384_densenet"),
+    ]:
+        report_dir = eval_base / dir_name
+        if not report_dir.is_dir():
+            continue
+        candidates = sorted(report_dir.glob("*_test_evaluation_report.json"))
+        if not candidates:
+            continue
+        try:
+            import json as _json
+            rpt = _json.loads(candidates[0].read_text())
+            performance[model_key] = {
+                "macro_auc": rpt.get("macro_auc", 0),
+                "macro_f1": rpt.get("macro_f1", 0),
+                "subset_accuracy": rpt.get("subset_accuracy", 0),
+                "ece": rpt.get("calibration", {}).get("expected_calibration_error", 0),
+            }
+        except Exception:
+            pass
+
     return {
         "name": "XClinVision ChestX-ray",
-        "version": "2.3.0",
-        "last_updated": "2026-03-01",
+        "version": "1.0.0",
+        "last_updated": "2026-04-01",
         "intended_use": f"Detection and characterization of thoracic diseases in chest X-rays ({', '.join(get_class_names())})",
-        "performance": {
-            "auc": 0.94,
-            "sensitivity": 0.92,
-            "specificity": 0.89,
-            "ece": 0.05,
-            "training_size": 112120,
-            "validation_size": 25596,
+        "performance": performance if performance else {
+            "note": "No evaluation reports found. Run scripts/evaluate.py",
         },
         "limitations": [
             "Not validated for pediatric populations (<18 years)",
@@ -1151,11 +1350,9 @@ async def get_model_card():
             "May miss subtle interstitial patterns",
             "Performance degrades on images from non-standard equipment",
         ],
-        "training_data": "NIH ChestX-ray14 (2017) — 112,120 frontal chest X-rays from 30,805 unique patients",
+        "training_data": "VinBigData Chest X-ray (2021) — 14,304 frontal radiographs, 5-class multilabel (train 10,020 / val 2,133 / test 2,151)",
         "architectures_available": [
-            "efficientnet_b0", "efficientnet_b2", "efficientnet_b3", "efficientnet_b4",
-            "convnext_small", "swin_t", "swin_s", "swin_b",
-            "vit_tiny", "vit_small", "vit_base", "resnet50", "densenet", "biomedclip",
+            "vit_base", "convnext_small", "efficientnet_b0", "densenet",
         ],
         "certifications": ["Research Use Only — Not FDA cleared"],
         "model_card_md": model_card_text[:500] if model_card_text else "",
@@ -1163,25 +1360,229 @@ async def get_model_card():
 
 
 # ---------------------------------------------------------------------------
-# Dashboard v2: Feedback stats
+# Dashboard v2: Feedback statistics
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v2/feedback-stats")
 async def get_feedback_stats():
-    """Aggregate feedback statistics for the audit page."""
-    from collections import Counter
+    """Return aggregated feedback statistics for the audit dashboard."""
+    total = len(_feedback_store)
+    by_type: Dict[str, int] = {}
+    recent: List[dict] = []
 
-    type_counts = Counter(fb.get("feedback_type", "unknown") for fb in _feedback_store)
-    recent = sorted(_feedback_store, key=lambda x: x.get("timestamp", ""), reverse=True)[:20]
+    for fb in _feedback_store:
+        ft = fb.get("feedback_type", "unknown")
+        by_type[ft] = by_type.get(ft, 0) + 1
+
+    # Most recent 50 entries, newest first
+    for fb in reversed(_feedback_store[-50:]):
+        recent.append({
+            "feedback_id": fb.get("feedback_id", ""),
+            "analysis_id": fb.get("analysis_id", ""),
+            "feedback_type": fb.get("feedback_type", ""),
+            "user_id": fb.get("user_id", "anonymous"),
+            "notes": fb.get("notes"),
+            "timestamp": fb.get("timestamp", ""),
+        })
+
+    correct = by_type.get("correct", 0)
+    incorrect = by_type.get("incorrect", 0)
+    correction_rate = (incorrect / total * 100) if total > 0 else 0.0
 
     return {
-        "total": len(_feedback_store),
-        "by_type": dict(type_counts),
+        "total": total,
+        "by_type": by_type,
+        "correction_rate": round(correction_rate, 1),
         "recent": recent,
-        "correction_rate": (
-            type_counts.get("incorrect", 0) / max(len(_feedback_store), 1) * 100
-        ),
     }
+
+
+# ---------------------------------------------------------------------------
+# LLM Provider Management
+# ---------------------------------------------------------------------------
+
+
+def _get_llm_manager():
+    """Return the module-level LLMManager singleton."""
+    from xclinvision.agent.llm_manager import get_llm_manager
+    return get_llm_manager()
+
+
+@app.get("/api/v2/llm/providers")
+async def list_llm_providers():
+    """List available LLM providers and current active provider."""
+    try:
+        manager = _get_llm_manager()
+        return {
+            "providers": manager.available_providers,
+            "active": manager.active_name,
+        }
+    except Exception as e:
+        logger.warning("Failed to list LLM providers: %s", e)
+        return {"providers": [], "active": None, "error": str(e)}
+
+
+@app.post("/api/v2/llm/switch")
+async def switch_llm_provider(provider: str = Form(...)):
+    """Switch the active LLM provider at runtime."""
+    try:
+        manager = _get_llm_manager()
+        manager.set_active(provider)
+        return {"active": manager.active_name, "status": "switched"}
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
+    except Exception as e:
+        logger.warning("Failed to switch LLM provider: %s", e)
+        raise HTTPException(500, detail=f"Provider switch failed: {e}")
+
+
+@app.get("/api/v2/llm/health")
+async def llm_provider_health():
+    """Health check for all registered LLM providers."""
+    try:
+        manager = _get_llm_manager()
+        return {
+            "active": manager.active_name,
+            "status": manager.provider_status(),
+        }
+    except Exception as e:
+        return {"active": None, "status": {}, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Streaming Chat (Server-Sent Events)
+# ---------------------------------------------------------------------------
+
+
+def _build_sse_event(data: str, event: str = "message") -> str:
+    """Format a single SSE frame."""
+    return f"event: {event}\ndata: {data}\n\n"
+
+
+@app.post("/api/v2/chat/stream")
+async def llm_chat_stream(request: ChatRequest):
+    """Streaming chat endpoint using Server-Sent Events.
+
+    Sends real-time token-by-token responses to the frontend for
+    a typing-indicator UX.  Falls back to a single non-streamed
+    message if streaming is unavailable.
+    """
+    stored = _analysis_store.get(request.analysis_id)
+    if not stored:
+        raise HTTPException(404, "Analysis not found")
+
+    def event_generator():
+        try:
+            from xclinvision.agent.llm_manager import get_llm_manager
+
+            manager = get_llm_manager()
+
+            # Build the prompt from the reasoning agent's synthesis logic
+            reasoning_agent = _get_reasoning_agent()
+
+            # Classify intent & plan tools
+            from xclinvision.agent.reasoning import classify_intent
+            intent = classify_intent(request.message)
+
+            # Build context
+            history = [
+                {"role": m.role, "content": m.content}
+                for m in (request.history or [])[-8:]
+            ]
+
+            extra_context = {
+                "analysis_store": _analysis_store,
+                "feedback_store": _feedback_store,
+            }
+
+            # Execute tools first (non-streamed)
+            from xclinvision.agent.reasoning import _INTENT_TOOL_MAP
+            tool_names = _INTENT_TOOL_MAP.get(intent, ["get_prediction_details"])
+
+            tool_context = {**extra_context}
+            tool_context["analysis"] = stored
+            tool_context["model_name"] = stored.get("model_version", "vit_base")
+
+            tool_results = {}
+            for name in tool_names:
+                result = reasoning_agent.tools.execute(name, tool_context)
+                tool_results[name] = result
+
+            # Build the synthesis prompt
+            tool_block = ""
+            for name, result in tool_results.items():
+                tool_block += f"\n### Tool: {name}\n{result.to_prompt_text()}\n"
+
+            history_block = ""
+            if history:
+                recent = history[-6:]
+                history_block = "\n".join(
+                    f"{'User' if m.get('role') == 'user' else 'AI'}: {m.get('content', '')}"
+                    for m in recent
+                )
+
+            system_prompt = (
+                "You are XClinVision's clinical reasoning assistant. You have just executed "
+                "tools to gather evidence about a chest X-ray analysis. Your task is to "
+                "synthesize the tool outputs into a clear, grounded, professional response.\n\n"
+                "RULES:\n"
+                "- You are an ASSISTIVE tool. You do NOT replace a radiologist.\n"
+                "- Ground every claim in the tool outputs provided. Do NOT invent findings.\n"
+                "- When uncertain, say so explicitly.\n"
+                "- Use evidence-based clinical language.\n"
+                "- Be concise but thorough.\n"
+                "- If tool data is missing or errored, acknowledge it gracefully."
+            )
+
+            user_prompt = (
+                f"### User's Question\n{request.message}\n\n"
+                f"### Detected Intent\n{intent}\n\n"
+                f"### Tool Outputs\n{tool_block}\n\n"
+                f"### Conversation History\n{history_block or 'No prior conversation.'}\n\n"
+                "---\n"
+                "Provide a focused, professional response to the user's question. "
+                "Reference the tool outputs as evidence. Keep it concise."
+            )
+
+            # Send metadata event
+            meta = json.dumps({
+                "intent": intent,
+                "tools_used": list(tool_results.keys()),
+                "provider": manager.active_name,
+            })
+            yield _build_sse_event(meta, event="metadata")
+
+            # Stream LLM response
+            for chunk in manager.stream_llm(system_prompt, user_prompt, temperature=0.25):
+                yield _build_sse_event(json.dumps({"token": chunk}), event="token")
+
+            # Done event
+            yield _build_sse_event(json.dumps({"status": "done"}), event="done")
+
+        except Exception as e:
+            logger.warning("Streaming chat error: %s", e)
+            # Send a fallback non-streamed response as SSE
+            fallback = (
+                f"Analysis shows {stored['prediction']} "
+                f"({stored['confidence']:.1%} confidence). "
+                f"Regarding '{request.message}': Clinical correlation is recommended."
+            )
+            yield _build_sse_event(
+                json.dumps({"token": fallback}), event="token",
+            )
+            yield _build_sse_event(
+                json.dumps({"status": "done", "fallback": True}), event="done",
+            )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 if __name__ == "__main__":

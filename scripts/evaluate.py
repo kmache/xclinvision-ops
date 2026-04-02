@@ -7,8 +7,8 @@ evaluation report (JSON + text classification report + per-sample CSV).
 Usage
 -----
 python scripts/evaluate.py \
-    --checkpoint-path models/efficientnet_b2_best.ckpt \
-    --model-name efficientnet_b2 \
+    --checkpoint-path models/convnext_small_YYYYMMDD_HHMMSS/best.ckpt \
+    --model-name convnext_small \
     --manifest data/processed/manifest.csv \
     --output-dir outputs/evaluation \
     --calibrate
@@ -85,8 +85,8 @@ def parse_args() -> argparse.Namespace:
         help="Path to the Lightning .ckpt checkpoint file."
     )
     parser.add_argument(
-        "--model-name", type=str, default="efficientnet_b2",
-        help="Architecture name (must match the checkpoint). Default: efficientnet_b2."
+        "--model-name", type=str, default="convnext_small",
+        help="Architecture name (must match the checkpoint). Default: convnext_small."
     )
     parser.add_argument(
         "--manifest", type=str, default=None,
@@ -125,8 +125,8 @@ def parse_args() -> argparse.Namespace:
         help="Enable test-time augmentation (horizontal flip + multi-scale averaging)."
     )
     parser.add_argument(
-        "--pooling", type=str, choices=["avg", "gem"], default="avg",
-        help="Pooling type used during training. Default: avg."
+        "--pooling", type=str, choices=["avg", "gem"], default="gem",
+        help="Pooling type used during training. Default: gem (Focal+GeM v2 best config)."
     )
     parser.add_argument(
         "--optimize-thresholds", action="store_true",
@@ -297,37 +297,7 @@ def main() -> None:
         y_pred = np.argmax(y_probs, axis=1)
 
     # ------------------------------------------------------------------
-    # 3b. Optional: Per-class threshold optimization (multilabel)
-    # ------------------------------------------------------------------
-    threshold_optimizer: ThresholdOptimizer | None = None
-
-    if args.optimize_thresholds:
-        if not _multilabel:
-            logger.warning("--optimize-thresholds is only supported for multilabel. Skipping.")
-        else:
-            logger.info("Tuning per-class thresholds on validation set …")
-            data_module.setup(stage="fit")
-            val_loader = data_module.val_dataloader()
-
-            y_val, _, y_val_probs = collect_predictions(
-                model, val_loader, device, desc="Threshold tuning (val)",
-                norm_mean=norm_stats["mean"], norm_std=norm_stats["std"],
-            )
-
-            threshold_optimizer = ThresholdOptimizer(class_names=get_class_names())
-            optimal_thresholds = threshold_optimizer.fit(y_val, y_val_probs)
-            logger.info(f"Optimal thresholds: {optimal_thresholds}")
-
-            # Re-apply optimised thresholds to test predictions
-            y_pred_default = y_pred.copy()
-            y_pred = threshold_optimizer.apply(y_probs)
-
-            # Save thresholds
-            thresh_path = output_dir / f"{args.model_name}_thresholds.json"
-            threshold_optimizer.save(str(thresh_path))
-
-    # ------------------------------------------------------------------
-    # 4. Optional: Temperature Scaling (calibration)
+    # 3b. Optional: Temperature Scaling (calibration)
     # ------------------------------------------------------------------
     temperature_scaler: TemperatureScaler | None = None
     learned_temperature: float = 1.0
@@ -344,33 +314,63 @@ def main() -> None:
             data_module.setup(stage="fit")
         val_loader = data_module.val_dataloader()
 
-        y_val, logits_val, _ = collect_predictions(
+        y_val_cal, logits_val, _ = collect_predictions(
             model, val_loader, device, desc="Calibration (val)",
             norm_mean=norm_stats["mean"], norm_std=norm_stats["std"],
         )
 
         temperature_scaler = TemperatureScaler()
-        if _multilabel:
-            logger.warning(
-                "Temperature scaling is designed for multiclass (softmax). "
-                "Skipping calibration for multilabel mode."
-            )
-            temperature_scaler = None
-        else:
-            learned_temperature = temperature_scaler.fit(logits_val, y_val)
-            logger.info(f"Optimal temperature: T = {learned_temperature:.4f}")
+        learned_temperature = temperature_scaler.fit(
+            logits_val, y_val_cal, multilabel=_multilabel,
+        )
+        logger.info(f"Optimal temperature: T = {learned_temperature:.4f}")
 
         # Re-calibrate eval predictions
-        if temperature_scaler is not None:
-            y_probs = temperature_scaler.predict_proba(logits_eval)
-            if _multilabel:
-                y_pred = (y_probs > 0.5).astype(int)
-            else:
-                y_pred  = np.argmax(y_probs, axis=1)
+        y_probs = temperature_scaler.predict_proba(logits_eval, multilabel=_multilabel)
+        if _multilabel:
+            y_pred = (y_probs > 0.5).astype(int)
+        else:
+            y_pred  = np.argmax(y_probs, axis=1)
 
-            # Persist scaler
-            temp_path = output_dir / f"{args.model_name}_temperature.json"
-            temperature_scaler.save(str(temp_path))
+        # Persist scaler
+        temp_path = output_dir / f"{args.model_name}_temperature.json"
+        temperature_scaler.save(str(temp_path))
+
+    # ------------------------------------------------------------------
+    # 3c. Optional: Per-class threshold optimization (multilabel)
+    # ------------------------------------------------------------------
+    threshold_optimizer: ThresholdOptimizer | None = None
+
+    if args.optimize_thresholds:
+        if not _multilabel:
+            logger.warning("--optimize-thresholds is only supported for multilabel. Skipping.")
+        else:
+            logger.info("Tuning per-class thresholds on validation set …")
+            data_module.setup(stage="fit")
+            val_loader = data_module.val_dataloader()
+
+            y_val, logits_val_thresh, y_val_probs = collect_predictions(
+                model, val_loader, device, desc="Threshold tuning (val)",
+                norm_mean=norm_stats["mean"], norm_std=norm_stats["std"],
+            )
+
+            # If calibration was applied, tune thresholds on calibrated probs
+            if temperature_scaler is not None:
+                y_val_probs = temperature_scaler.predict_proba(
+                    logits_val_thresh, multilabel=_multilabel,
+                )
+
+            threshold_optimizer = ThresholdOptimizer(class_names=get_class_names())
+            optimal_thresholds = threshold_optimizer.fit(y_val, y_val_probs)
+            logger.info(f"Optimal thresholds: {optimal_thresholds}")
+
+            # Re-apply optimised thresholds to test predictions
+            y_pred_default = y_pred.copy()
+            y_pred = threshold_optimizer.apply(y_probs)
+
+            # Save thresholds
+            thresh_path = output_dir / f"{args.model_name}_thresholds.json"
+            threshold_optimizer.save(str(thresh_path))
 
     # ------------------------------------------------------------------
     # 5. Metrics
@@ -396,13 +396,10 @@ def main() -> None:
     logger.info("Computing calibration metrics …")
     calibrator = CalibrationAnalyzer(num_bins=15)
     if _multilabel:
-        # CalibrationAnalyzer uses argmax internally — not meaningful for multilabel.
-        # Skip ECE / calibration curve for now.
-        ece = 0.0
-        bin_centers = np.linspace(0, 1, 15)
-        bin_accs = np.zeros(15)
-        bin_counts = np.zeros(15, dtype=int)
-        logger.info("Skipping ECE / calibration curve (not defined for multilabel).")
+        ece = calibrator.compute_ece(y_true, y_probs, multilabel=True)
+        bin_centers, bin_accs, bin_counts = calibrator.compute_calibration_curve(
+            y_true, y_probs, multilabel=True,
+        )
     else:
         ece = calibrator.compute_ece(y_true, y_probs)
         bin_centers, bin_accs, bin_counts = calibrator.compute_calibration_curve(

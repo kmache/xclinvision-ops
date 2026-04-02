@@ -44,7 +44,7 @@ except ImportError:
 
 from xclinvision.dataset import ChestXrayDataModule
 from xclinvision.modeling import build_model, get_model_normalization
-from xclinvision.processing import run_processing_pipeline, PROCESSING_VERSION, get_processed_dir_for_size
+from xclinvision.processing import run_processing_pipeline, get_processed_dir_for_size
 from xclinvision.trainer import (
     XClinVisionModel,
     MetricsCallback,
@@ -54,7 +54,6 @@ from xclinvision.trainer import (
 from xclinvision.config import get_class_names, is_multilabel, PipelineConfig
 
 SYSTEM_CONFIG = Path(__file__).parent.parent / "configs" / "system.yaml"
-
 
 # ---------------------------------------------------------------------------
 # Dynamic processed data caching
@@ -211,17 +210,21 @@ def parse_args():
         description="Train XClinVision model",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", type=str, default="configs/efficientnet_b2.yaml", help="Path to config")
-    parser.add_argument("--model", type=str, default="efficientnet_b2", help="Model architecture")
+    parser.add_argument("--config", type=str, default="configs/convnext_small.yaml", help="Path to config")
+    parser.add_argument("--model", type=str, default="convnext_small", help="Model architecture")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--image-size", type=int, default=None, help="Override config image size")
-    parser.add_argument("--process-size", type=int, default=1024, help="Resolution for storing processed images on disk")
+    parser.add_argument("--process-size", type=int, default=None,
+                            help="Resolution for storing processed images on disk. "
+                            "Default: read from config training.process_size, or 1024.")
     parser.add_argument("--manifest", type=str, default=None,
                         help="Path to pre-processed manifest CSV (skips auto-processing)")
-    parser.add_argument("--loss", type=str, choices=["focal", "ce", "asl"], default="ce")
-    parser.add_argument("--pooling", type=str, choices=["avg", "gem"], default="gem", help="Global pooling type")
+    parser.add_argument("--loss", type=str, choices=["focal", "ce", "asl"], default=None,
+                        help="Loss function. Default: read from config training.loss (focal recommended).")
+    parser.add_argument("--pooling", type=str, choices=["avg", "gem"], default=None,
+                        help="Global pooling type. Default: read from config training.pooling (gem recommended).")
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--label-smoothing", type=float, default=None)
     parser.add_argument("--output-dir", type=str, default="models")
@@ -264,17 +267,30 @@ def main():
         raw_size = config.get("input", {}).get("size", [384, 384])
         image_size = raw_size[0] if isinstance(raw_size, list) else int(raw_size)
 
-    process_size = args.process_size
+    # Process size: CLI > config > default 1024
+    if args.process_size is not None:
+        process_size = args.process_size
+    else:
+        process_size = train_cfg.get("process_size", 1024)
+
+    # Loss: CLI > config > default focal  (Focal+GeM v2 = best empirical results)
+    if args.loss is not None:
+        loss_type = args.loss
+    else:
+        loss_type = train_cfg.get("loss", "focal")
+
+    # Pooling: CLI > config > default gem  (Focal+GeM v2 = best empirical results)
+    if args.pooling is not None:
+        pooling = args.pooling
+    else:
+        pooling = train_cfg.get("pooling", "gem")
         
     class_names = get_class_names()
     num_classes = len(class_names)
     weight_decay = args.weight_decay if args.weight_decay is not None else opt_cfg.get("weight_decay", 1e-4)
     label_smoothing = args.label_smoothing if args.label_smoothing is not None else train_cfg.get("label_smoothing", 0.1)
 
-    # Read loss type from model config if not overridden via CLI
-    loss_type = args.loss if args.loss != "ce" else train_cfg.get("loss", "ce")
-
-    # Read differential LR factor from config
+    # Differential LR factor from config
     head_lr_cfg = diff_lr_cfg.get("head_lr")
     backbone_lr_cfg = diff_lr_cfg.get("backbone_lr")
     if head_lr_cfg and backbone_lr_cfg and float(head_lr_cfg) > 0:
@@ -318,7 +334,7 @@ def main():
         pretrained=not args.no_pretrained,
         img_size=image_size,
         dropout=dropout_rate,
-        pooling=args.pooling,
+        pooling=pooling,
     )
     norm_stats = get_model_normalization(base_model, args.model)
 
@@ -468,8 +484,8 @@ def main():
         "batch_size": args.batch_size,
         "epochs": args.epochs,
         "lr": pl_module.learning_rate,
-        "loss": args.loss,
-        "pooling": args.pooling,
+        "loss": loss_type,
+        "pooling": pooling,
         "seed": args.seed,
         "pretrained": not args.no_pretrained,
         "computed_class_weights": str(class_weights),

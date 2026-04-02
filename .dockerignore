@@ -1,0 +1,33 @@
+# Large data directories — mounted as volumes at runtime, not baked into images
+data/
+models/
+archive/
+mlruns/
+logs/
+NLMCXR_reports/
+notebooks/
+backup/
+scripts/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+*.env
+venv/
+.venv/

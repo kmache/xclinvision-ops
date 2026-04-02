@@ -24,7 +24,7 @@ def _load_class_names() -> List[str]:
                 return names
     except Exception:
         pass
-    return ["Normal", "Pneumonia", "Cardiomegaly"]
+    return ["No finding", "Cardiomegaly", "Aortic enlargement", "Pleural thickening", "Pulmonary fibrosis"]
 
 
 # ==============================================================================
@@ -45,6 +45,7 @@ HISTORY_TIMEOUT: Final = 30.0
 DRIFT_TIMEOUT: Final = 15.0
 MODEL_CARD_TIMEOUT: Final = 10.0
 FEEDBACK_STATS_TIMEOUT: Final = 10.0
+EXPORT_REPORT_TIMEOUT: Final = 30.0
 
 # ==============================================================================
 # 2. CLASS LABELS & COLOURS
@@ -106,10 +107,15 @@ class Endpoints:
     HISTORY = "/api/v2/history/{patient_id}"
     FEEDBACK = "/api/v2/feedback"
     CHAT = "/api/v2/chat"
+    CHAT_STREAM = "/api/v2/chat/stream"
+    LLM_PROVIDERS = "/api/v2/llm/providers"
+    LLM_SWITCH = "/api/v2/llm/switch"
+    LLM_HEALTH = "/api/v2/llm/health"
     GENERATE_REPORT = "/api/v2/generate-report"
     DRIFT_METRICS = "/api/v2/drift-metrics"
     MODEL_CARD = "/api/v2/model-card"
     FEEDBACK_STATS = "/api/v2/feedback-stats"
+    EXPORT_REPORT = "/api/v2/export-report"
 
     @classmethod
     def url(cls, endpoint: str, **params) -> str:

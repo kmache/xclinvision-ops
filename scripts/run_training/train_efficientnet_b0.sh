@@ -20,9 +20,10 @@ python3 scripts/train.py \
   --epochs  50 \
   --batch-size 32 \
   --image-size  384 \
-  --process-size 1024 \
+  --process-size 384 \
   --lr      5e-4 \
-  --loss    ce \
+  --loss    focal \
+  --pooling gem \
   --weight-decay 1e-4 \
   --accumulate-grad-batches 2 \
   --output-dir models \

@@ -123,15 +123,19 @@ def _read_bytes_grayscale(data: bytes) -> Optional[np.ndarray]:
 DEFAULT_MIN_AREA_RATIO = 0.15
 MIN_ASPECT_RATIO = 0.35
 MAX_ASPECT_RATIO = 3.0
+
+# Metadata-only version tag — written into processing_metadata.json
+# for reproducibility but NOT used in directory naming.
 PROCESSING_VERSION = "v2"
 
 # ---------------------------------------------------------------------------
 # Shared processed-data directory resolution
 # ---------------------------------------------------------------------------
-
-def _class_names_hash(class_names: list) -> str:
-    key = ",".join(sorted(str(c).lower() for c in class_names))
-    return hashlib.sha1(key.encode()).hexdigest()[:6]
+# Directory naming convention: processed_{target_size}
+# e.g. data/processed_1024/ for images processed at 1024px.
+# No version or hash suffixes — one directory per resolution, period.
+# If class names change, use --force-reprocess to regenerate.
+# ---------------------------------------------------------------------------
 
 def compute_pixel_hash(image_path: Path) -> str:
     img = read_image_grayscale(image_path)
@@ -143,9 +147,16 @@ def get_processed_dir_for_size(
     image_size: int,
     class_names: list | None = None,
 ) -> Path:
+    """Return the processed data directory for a given resolution.
+
+    Convention: ``{base_parent}/processed_{image_size}``
+    e.g. ``data/processed_1024`` when *base_processed_dir* is ``data/processed``.
+
+    The *class_names* parameter is accepted for backward-compatibility but
+    is no longer encoded into the directory name.
+    """
     base = Path(base_processed_dir)
-    cls_hash = _class_names_hash(class_names) if class_names else "default"
-    return base.parent / f"{base.name}_{image_size}_{PROCESSING_VERSION}_{cls_hash}"
+    return base.parent / f"{base.name}_{image_size}"
 
 def compute_image_hash(image_path: Path) -> str:
     """Compute SHA-256 hash of image file bytes in chunks to cap memory footprint."""

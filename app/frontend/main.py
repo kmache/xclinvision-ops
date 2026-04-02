@@ -137,7 +137,7 @@ def _render_nav_buttons(current_idx: int) -> None:
         if current_idx > 0:
             label = "← " + PAGES[current_idx - 1].split(" ", 1)[1]
             st.markdown('<div class="nav-btn-prev">', unsafe_allow_html=True)
-            if st.button(label, key="nav_btn_prev", use_container_width=True):
+            if st.button(label, key="nav_btn_prev", width='stretch'):
                 st.session_state["_page_idx"] = current_idx - 1
                 st.session_state["_nav_btn_triggered"] = True
                 st.query_params["page"] = str(current_idx - 1)
@@ -147,7 +147,7 @@ def _render_nav_buttons(current_idx: int) -> None:
         if current_idx < len(PAGES) - 1:
             label = "→ " + PAGES[current_idx + 1].split(" ", 1)[1]
             st.markdown('<div class="nav-btn-next">', unsafe_allow_html=True)
-            if st.button(label, key="nav_btn_next", use_container_width=True):
+            if st.button(label, key="nav_btn_next", width='stretch'):
                 st.session_state["_page_idx"] = current_idx + 1
                 st.session_state["_nav_btn_triggered"] = True
                 st.query_params["page"] = str(current_idx + 1)

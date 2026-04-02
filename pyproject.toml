@@ -27,7 +27,6 @@ dependencies = [
     "torchvision>=0.15.0",
     "pytorch-lightning>=2.0.0",
     "timm>=0.9.0",
-    "transformers>=4.30.0",
     
     # Data Processing
     "numpy>=1.24.0",
@@ -36,10 +35,9 @@ dependencies = [
     "opencv-python>=4.8.0",
     "albumentations>=1.3.0",
     
-    # LLM & RAG (langchain-openai pulls openai transitively;
-    # HuggingFaceEmbeddings pulls sentence-transformers transitively)
-    "langchain-openai>=0.0.5",
-    "langchain-community>=0.0.10",
+    # LLM & RAG (langchain-text-splitters is the only direct import;
+    # chromadb + sentence-transformers for vector store)
+    "langchain-text-splitters>=0.0.1",
     
     # Backend & API
     "fastapi>=0.103.0",
@@ -57,7 +55,6 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0.0",
     "tqdm>=4.66.0",
-    "rich>=13.5.0",
     
     # Metrics & Analysis
     "scikit-learn>=1.3.0",

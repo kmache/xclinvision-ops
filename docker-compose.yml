@@ -1,0 +1,35 @@
+# Local development compose — runs backend + frontend without nginx
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: app/backend/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - XCLINVISION_MODELS_DIR=/app/models/best_models
+      - XCLINVISION_DATA_DIR=/app/data/processed_384
+      - XCLINVISION_CORS_ORIGINS=http://localhost:8501,http://frontend:8501
+    volumes:
+      - ./models/best_models:/app/models/best_models:ro
+      - ./data/processed_384:/app/data/processed_384:ro
+      - ./outputs:/app/outputs
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: app/frontend/Dockerfile
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy

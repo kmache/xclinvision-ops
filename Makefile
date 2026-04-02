@@ -34,19 +34,20 @@ download-data:
 
 preprocess:
 	@echo "Running preprocessing pipeline..."
-	python scripts/preprocess_data.py
+	python scripts/organize_data.py
 
 train:
-	@echo "Starting model training..."
-	python scripts/train.py
+	@echo "Starting model training (Focal+GeM v2 from config)..."
+	python scripts/train.py --config configs/convnext_small.yaml
 
 evaluate:
 	@echo "Running evaluation..."
-	python scripts/evaluate.py
+	@echo "Usage: python scripts/evaluate.py --checkpoint-path <path> --model-name <name> --image-size 384"
+	@echo "Example: python scripts/evaluate.py --checkpoint-path models/convnext_small_.../best.ckpt --model-name convnext_small --image-size 384 --pooling gem --output-dir outputs/evaluation"
 
 tune:
-	@echo "Starting hyperparameter tuning..."
-	python scripts/hyperparam_search.py
+	@echo "Hyperparameter tuning is not yet implemented as a standalone script."
+	@echo "Use train.py with different configs: python scripts/train.py --config configs/<model>.yaml"
 
 test:
 	pytest tests/ -v --cov=xclinvision --cov-report=term-missing

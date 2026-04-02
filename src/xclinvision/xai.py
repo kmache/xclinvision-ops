@@ -1,10 +1,15 @@
 """Explainability (XAI) module for generating clinical-grade heatmaps.
 
-Provides Grad-CAM++ and Score-CAM visualizations, anatomical region scoring,
+Provides three visualisation methods:
+
+- **Grad-CAM++** and **Score-CAM** for CNN / Swin architectures.
+- **Attention Rollout** (Abnar & Zuidema, 2020) for Vision Transformers.
+
+Also includes anatomical region scoring, clinical plausibility checks,
 and a ``ValidationXAI`` harness consumed by training callbacks.
 
-No external ``pytorch-grad-cam`` dependency — both Grad-CAM++ and Score-CAM
-are implemented from scratch so the package stays lightweight in production.
+No external ``pytorch-grad-cam`` dependency — all methods are implemented
+from scratch so the package stays lightweight in production.
 """
 
 from __future__ import annotations
@@ -325,6 +330,149 @@ class ScoreCAM:
 
 
 # =========================================================================
+# Attention Rollout (Abnar & Zuidema, 2020) — for Vision Transformers
+# =========================================================================
+
+class AttentionRollout:
+    """Attention Rollout for Vision Transformers.
+
+    Aggregates multi-head self-attention across all transformer layers to
+    produce a single spatial map showing where the [CLS] token attends.
+    This is the standard XAI method for ViTs — Grad-CAM++ was designed for
+    convolutional architectures and produces noisy, less meaningful results
+    when applied to linear (QKV) layers in transformers.
+
+    Reference: Abnar & Zuidema, "Quantifying Attention Flow in Transformers", 2020.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        head_fusion: str = "mean",
+        discard_ratio: float = 0.9,
+    ) -> None:
+        self.model = model
+        self.head_fusion = head_fusion
+        self.discard_ratio = discard_ratio
+        self._blocks = self._find_blocks()
+
+    def _find_blocks(self) -> nn.Module:
+        """Locate the ``blocks`` sequential container in a ViT model."""
+        if hasattr(self.model, "blocks"):
+            return self.model.blocks
+        for name, module in self.model.named_modules():
+            if name == "blocks" and hasattr(module, "__len__"):
+                return module
+        raise RuntimeError(
+            "Cannot find transformer blocks. "
+            "AttentionRollout requires a ViT-style model with a 'blocks' attribute."
+        )
+
+    def remove_hooks(self) -> None:
+        """No persistent hooks — attention weights are captured per generate() call."""
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_tensor: torch.Tensor,
+        target_class: Optional[int] = None,
+    ) -> Tuple[np.ndarray, int]:
+        """Generate an attention rollout map.
+
+        Returns ``(cam, target_class)`` matching the Grad-CAM++ / Score-CAM API
+        so the caller can use any method interchangeably.
+        """
+        self.model.eval()
+
+        # --- Collect attention weights via one-shot hooks ---
+        attentions: List[torch.Tensor] = []
+        hooks: List[torch.utils.hooks.RemovableHandle] = []
+
+        for block in self._blocks:
+            attn_mod = block.attn
+
+            def _make_hook(am: nn.Module):
+                def _hook(_module: nn.Module, inp: Any, _out: Any) -> None:
+                    x = inp[0]                          # (B, N, C)
+                    B, N, C = x.shape
+                    head_dim = getattr(am, "head_dim", C // am.num_heads)
+                    qkv = am.qkv(x).reshape(B, N, 3, am.num_heads, head_dim)
+                    qkv = qkv.permute(2, 0, 3, 1, 4)   # (3, B, heads, N, head_dim)
+                    q, k = qkv[0], qkv[1]
+                    scale = head_dim ** -0.5
+                    attn_weights = (q @ k.transpose(-2, -1)) * scale
+                    attn_weights = attn_weights.softmax(dim=-1)
+                    attentions.append(attn_weights)
+                return _hook
+
+            hooks.append(attn_mod.register_forward_hook(_make_hook(attn_mod)))
+
+        output = self.model(input_tensor)
+
+        for h in hooks:
+            h.remove()
+
+        if target_class is None:
+            target_class = int(output.argmax(dim=1).item())
+
+        if not attentions:
+            raise RuntimeError("No attention weights captured. Is this a ViT model?")
+
+        # --- Rollout: multiply fused attention matrices across layers ---
+        result = None
+        for attn in attentions:
+            # attn: (B, num_heads, N, N)
+            if self.head_fusion == "mean":
+                attn_fused = attn.mean(dim=1)
+            elif self.head_fusion == "max":
+                attn_fused = attn.max(dim=1).values
+            elif self.head_fusion == "min":
+                attn_fused = attn.min(dim=1).values
+            else:
+                raise ValueError(f"Unknown head_fusion: {self.head_fusion}")
+
+            # Discard low-attention values for cleaner maps
+            if self.discard_ratio > 0:
+                flat = attn_fused.view(attn_fused.size(0), -1)
+                thresh = torch.quantile(flat, self.discard_ratio, dim=1, keepdim=True)
+                attn_fused = attn_fused * (attn_fused > thresh.unsqueeze(-1)).float()
+                attn_fused = attn_fused / (attn_fused.sum(dim=-1, keepdim=True) + 1e-8)
+
+            # Add residual connection (identity) and re-normalise
+            I = torch.eye(attn_fused.size(-1), device=attn_fused.device).unsqueeze(0)
+            attn_fused = 0.5 * attn_fused + 0.5 * I
+            attn_fused = attn_fused / (attn_fused.sum(dim=-1, keepdim=True) + 1e-8)
+
+            result = attn_fused if result is None else (result @ attn_fused)
+
+        # --- Extract [CLS] → patch attention and reshape to spatial grid ---
+        mask = result[0, 0, 1:]           # skip CLS self-attention
+        num_patches = mask.shape[0]
+        H = W = int(num_patches ** 0.5)
+        if H * W != num_patches:
+            H_sq = int(num_patches ** 0.5)
+            for f in range(H_sq, 0, -1):
+                if num_patches % f == 0:
+                    H, W = f, num_patches // f
+                    break
+        if H * W != num_patches:
+            raise RuntimeError(
+                f"Cannot reshape {num_patches} patches into a rectangular grid."
+            )
+
+        mask = mask.reshape(H, W)
+        mask = (mask - mask.min()) / (mask.max() - mask.min() + 1e-8)
+
+        cam = F.interpolate(
+            mask.unsqueeze(0).unsqueeze(0).float(),
+            size=input_tensor.shape[2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        return cam.squeeze().cpu().numpy(), target_class
+
+
+# =========================================================================
 # Overlay & Region Scoring
 # =========================================================================
 
@@ -611,7 +759,8 @@ class ExplainabilityEngine:
         """Generate heatmap. Accepts preprocessed Tensor or raw Numpy array.
 
         Args:
-            method: ``"gradcam++"`` (default) or ``"scorecam"``.
+            method: ``"gradcam++"`` (default), ``"scorecam"``, or
+                ``"attention_rollout"`` (recommended for ViT models).
         """
         
         # Look up expected anatomical regions based on the target class' clinical rules
@@ -668,7 +817,9 @@ class ExplainabilityEngine:
             elif vis_image.ndim == 3 and vis_image.shape[2] == 1:
                 vis_image = np.concatenate([vis_image, vis_image, vis_image], axis=-1)
 
-        if method == "scorecam":
+        if method == "attention_rollout":
+            cam_gen = AttentionRollout(self.model)
+        elif method == "scorecam":
             cam_gen = ScoreCAM(self.model, self._target_layer)
         else:
             cam_gen = GradCAMPlusPlus(self.model, self._target_layer)

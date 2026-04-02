@@ -18,6 +18,12 @@ transfer_learning:
 input:
   size: [384, 384]
 
+# Focal+GeM v2 — best empirical results (see convnext_small.yaml for rationale)
+training:
+  loss: focal
+  pooling: gem
+  process_size: 1024
+
 explainability:
   method: gradcam++
   target_layer: features.denseblock4

@@ -187,9 +187,11 @@ class ClinicalDialogueManager:
         *,
         call_llm: Optional[Callable[..., str]] = None,
         rag_top_k: int = 5,
+        audit_trail: Optional[Any] = None,
     ) -> None:
         self.retriever = retriever
         self.rag_top_k = rag_top_k
+        self.audit_trail = audit_trail
 
         if call_llm is not None:
             self.call_llm = call_llm
@@ -264,6 +266,22 @@ class ClinicalDialogueManager:
         # 5. Store the exchange
         session.add_turn("user", question)
         session.add_turn("assistant", response)
+
+        # 6. Audit trail
+        if self.audit_trail is not None:
+            try:
+                rag_sources = [
+                    r.get("metadata", {}).get("source", "")
+                    for r in rag_results
+                ]
+                self.audit_trail.log_interaction(
+                    question=question,
+                    response=response,
+                    context_summary=session.get_context_summary(),
+                    rag_sources=rag_sources,
+                )
+            except Exception:
+                logger.warning("Failed to log follow-up interaction to audit trail.", exc_info=True)
 
         logger.info(
             "Follow-up answered | temporal=%s | rag_hits=%d | history_len=%d",

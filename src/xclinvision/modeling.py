@@ -26,17 +26,26 @@ class GeM(nn.Module):
     pleural thickening) that occupy <5 % of the feature map.
     """
 
-    def __init__(self, p: float = 3.0, eps: float = 1e-6):
+    def __init__(self, p: float = 3.0, eps: float = 1e-6, flatten: bool = False,
+                 channels_last: bool = False):
         super().__init__()
         self.p = nn.Parameter(torch.ones(1) * p)
         self.eps = eps
+        self.flatten = flatten
+        self.channels_last = channels_last
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, H, W)  →  (B, C, 1, 1)
-        return F.adaptive_avg_pool2d(
+        # Handle channels-last input (B, H, W, C) from Swin
+        if self.channels_last and x.ndim == 4:
+            x = x.permute(0, 3, 1, 2)  # → (B, C, H, W)
+        # x: (B, C, H, W)  →  (B, C, 1, 1)  or  (B, C) if flatten=True
+        out = F.adaptive_avg_pool2d(
             x.clamp(min=self.eps).pow(self.p),
             output_size=1,
         ).pow(1.0 / self.p)
+        if self.flatten:
+            out = out.flatten(1)
+        return out
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(p={self.p.data.item():.2f})"
@@ -146,7 +155,7 @@ MODEL_REGISTRY = {
 
 # Future-proofing: per-architecture normalization overrides
 CUSTOM_NORMS = {
-    "cxr_custom": {"mean": (0.505,), "std": (0.252,)}  # Example for 1-channel CXR
+    "cxr_custom": {"mean": (0.505,), "std": (0.252,)}
 }
 
 class EnsembleClassifier(nn.Module):
@@ -250,11 +259,6 @@ def build_model(
     try:
         model = timm.create_model(timm_name, **model_kwargs)
 
-        # Build a custom multi-layer classifier and swap it into the
-        # existing head structure.  This preserves any pooling / norm
-        # layers that timm wraps around the final Linear (critical for
-        # ConvNeXt, Swin, etc. whose ClassifierHead does global-pool
-        # before the fc layer).
         in_features = model.num_features
         custom_fc = nn.Sequential(
             nn.Linear(in_features, 512),
@@ -334,23 +338,37 @@ def _replace_global_pool(model: nn.Module) -> None:
     """Replace the global average pool in a timm model's head with GeM.
 
     Works with:
-      - NormMlpClassifierHead (ConvNeXt, Swin) → ``head.global_pool``
-      - ClassifierHead (EfficientNet) → ``head.global_pool``
-      - ResNet → ``global_pool``
-      - DenseNet → ``global_pool``
+      - NormMlpClassifierHead (ConvNeXt) → ``head.global_pool``
+      - ClassifierHead (Swin) → ``head.global_pool``  (channels-last input)
+      - ResNet / DenseNet / EfficientNet → ``global_pool``  (flatten=True)
     """
-    gem = GeM(p=3.0)
+    # Detect channels-last architectures (Swin outputs (B, H, W, C))
+    model_cls = type(model).__name__.lower()
+    is_channels_last = "swin" in model_cls
 
-    # Timm head-based models (ConvNeXt, Swin, EfficientNet)
+    # Timm head-based models (ConvNeXt, Swin)
     if hasattr(model, 'head') and hasattr(model.head, 'global_pool'):
-        model.head.global_pool = gem
-        logger.info("Replaced head.global_pool with GeM")
+        # ConvNeXt's NormMlpClassifierHead has Flatten after pool → no flatten needed.
+        # Swin's ClassifierHead has Identity() as flatten → GeM must flatten itself.
+        needs_flatten = is_channels_last  # Swin = True, ConvNeXt = False
+        model.head.global_pool = GeM(
+            p=3.0, channels_last=is_channels_last, flatten=needs_flatten,
+        )
+        tag = f" (channels_last={is_channels_last}, flatten={needs_flatten})"
+        logger.info(f"Replaced head.global_pool with GeM{tag}")
         return
 
-    # ResNet / DenseNet style
+    # ResNet / DenseNet / EfficientNet — SelectAdaptivePool2d both pools
+    # AND flattens to (B, C).  GeM must also flatten to preserve the shape.
     if hasattr(model, 'global_pool'):
-        model.global_pool = gem
-        logger.info("Replaced model.global_pool with GeM")
+        # ViT (and similar) stores global_pool as a plain string (e.g. "token"),
+        # not an nn.Module.  Replacing it with a GeM module would break the
+        # ViT forward path which calls global_pool_nlc(pool_type=self.global_pool).
+        if isinstance(model.global_pool, str):
+            logger.info("Skipping GeM for ViT-family model (global_pool is str '%s')", model.global_pool)
+            return
+        model.global_pool = GeM(p=3.0, flatten=True)
+        logger.info("Replaced model.global_pool with GeM (flatten=True)")
         return
 
     logger.warning("Could not find global_pool to replace with GeM — using default pooling.")
@@ -440,9 +458,6 @@ def freeze_backbone(model: nn.Module, unfreeze_head: bool = True) -> None:
     
     unfrozen = False
 
-    # Unfreeze the entire head module (pooling + norm + classifier).
-    # Walk the standard timm attribute names; the first one that carries
-    # parameters is the head we want.
     for attr in ('head', 'fc', 'classifier'):
         head_module = getattr(model, attr, None)
         if head_module is not None and any(True for _ in head_module.parameters()):

@@ -10,8 +10,20 @@ architecture:
 input:
   size: [384, 384]
 
+# --------------------------------------------------------------------------
+# Training — Focal + GeM v2 (best empirical results)
+# --------------------------------------------------------------------------
+# Focal loss handles class imbalance better than CE for medical imaging.
+# GeM (Generalized Mean) pooling amplifies strong local activations,
+# critical for detecting small pathologies (fibrosis, pleural thickening)
+# that occupy <5% of the feature map.
+# This Focal+GeM combination consistently outperforms CE+AvgPool across
+# all architectures on this dataset.
+# --------------------------------------------------------------------------
 training:
-  loss: ce
+  loss: focal        # focal | ce | asl — focal recommended for medical imaging
+  pooling: gem       # gem | avg — gem recommended for small-lesion detection
+  process_size: 1024 # resolution for stored processed images (resized at train time)
 
 transfer_learning:
   freeze_backbone: false

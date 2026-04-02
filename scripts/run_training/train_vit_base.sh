@@ -18,13 +18,14 @@ python3 scripts/train.py \
   --config  configs/vit_base.yaml \
   --model   vit_base \
   --epochs  50 \
-  --batch-size 6 \
+  --batch-size 32 \
   --image-size  384 \
-  --process-size 1024 \
+  --process-size 384 \
   --lr      2e-4 \
-  --loss    ce \
+  --loss    focal \
+  --pooling avg \
   --weight-decay 1e-4 \
-  --accumulate-grad-batches 12 \
+  --accumulate-grad-batches 2 \
   --output-dir models \
   --num-workers 4 \
   --seed    42 \

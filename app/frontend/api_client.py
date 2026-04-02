@@ -23,6 +23,8 @@ from config import (
     DRIFT_TIMEOUT,
     MODEL_CARD_TIMEOUT,
     FEEDBACK_STATS_TIMEOUT,
+    EXPORT_REPORT_TIMEOUT,
+    API_BASE_URL,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -142,7 +144,7 @@ class XClinVisionClient:
         modality: str = "X-ray",
         body_part: str = "Chest",
         clinical_history: str = "",
-        model_name: str = "efficientnet_b2",
+        model_name: str = "convnext_small",
     ) -> Optional[Dict[str, Any]]:
         """Upload an image and run full AI analysis.
 
@@ -277,3 +279,121 @@ class XClinVisionClient:
         """
         url = Endpoints.url(Endpoints.FEEDBACK_STATS)
         return self._get(url, timeout=FEEDBACK_STATS_TIMEOUT)
+
+    def export_report_html(
+        self,
+        analysis_id: str,
+        include_xai: bool = True,
+        include_uncertainty: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Export a self-contained HTML clinical report.
+
+        Endpoint: POST /api/v2/export-report
+        """
+        url = Endpoints.url(Endpoints.EXPORT_REPORT)
+        payload = {
+            "analysis_id": analysis_id,
+            "include_xai": include_xai,
+            "include_uncertainty": include_uncertainty,
+        }
+        return self._post_json(url, json_data=payload, timeout=EXPORT_REPORT_TIMEOUT)
+
+    # ==================================================================
+    # 6. LLM PROVIDER MANAGEMENT
+    # ==================================================================
+    def get_llm_providers(self) -> Optional[Dict[str, Any]]:
+        """List available LLM providers and current active provider.
+
+        Endpoint: GET /api/v2/llm/providers
+        """
+        url = Endpoints.url(Endpoints.LLM_PROVIDERS)
+        return self._get(url, timeout=HEALTH_CHECK_TIMEOUT)
+
+    def switch_llm_provider(self, provider: str) -> Optional[Dict[str, Any]]:
+        """Switch the active LLM provider.
+
+        Endpoint: POST /api/v2/llm/switch
+        """
+        url = Endpoints.url(Endpoints.LLM_SWITCH)
+        try:
+            response = self.session.post(
+                url, data={"provider": provider}, timeout=HEALTH_CHECK_TIMEOUT,
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error("Failed to switch LLM provider: %s", e)
+            return None
+
+    def get_llm_health(self) -> Optional[Dict[str, Any]]:
+        """Health check for all LLM providers.
+
+        Endpoint: GET /api/v2/llm/health
+        """
+        url = Endpoints.url(Endpoints.LLM_HEALTH)
+        return self._get(url, timeout=HEALTH_CHECK_TIMEOUT)
+
+    # ==================================================================
+    # 7. STREAMING CHAT
+    # ==================================================================
+    def stream_chat_message(
+        self,
+        analysis_id: str,
+        message: str,
+        history: List[Dict[str, str]],
+        context_type: str = "clinical",
+    ):
+        """Stream a chat response via Server-Sent Events.
+
+        Endpoint: POST /api/v2/chat/stream
+
+        Yields parsed SSE events as dicts with keys:
+        - ``event``: event type ("metadata", "token", "done")
+        - ``data``: parsed JSON data
+
+        Falls back to non-streaming :meth:`send_chat_message` on error.
+        """
+        import json
+
+        url = Endpoints.url(Endpoints.CHAT_STREAM)
+        payload = {
+            "analysis_id": analysis_id,
+            "message": message,
+            "history": history,
+            "context_type": context_type,
+        }
+
+        try:
+            response = self.session.post(
+                url, json=payload, timeout=CHAT_TIMEOUT, stream=True,
+            )
+            response.raise_for_status()
+
+            event_type = "message"
+            for line in response.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if line.startswith("event: "):
+                    event_type = line[7:].strip()
+                elif line.startswith("data: "):
+                    data_str = line[6:]
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        data = {"raw": data_str}
+                    yield {"event": event_type, "data": data}
+                    event_type = "message"
+        except Exception as e:
+            logger.warning("Streaming chat failed (%s), falling back to sync", e)
+            result = self.send_chat_message(
+                analysis_id=analysis_id,
+                message=message,
+                history=history,
+                context_type=context_type,
+            )
+            if result:
+                yield {
+                    "event": "token",
+                    "data": {"token": result.get("response", "")},
+                }
+                yield {"event": "done", "data": {"status": "done", "fallback": True}}

@@ -1,71 +1,104 @@
-"""Page 4: Audit & Transparency — Model card, drift monitoring, and audit log."""
+"""Page 4: Audit & Transparency — Model card, drift monitoring, and audit log.
 
-from datetime import datetime, date, timedelta
+Fetches real metrics from evaluation reports and the backend API
+instead of using hardcoded placeholder data.
+"""
+
+import json
+from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as _components
 
-from styles import COLORS
 from config import CLASS_NAMES
+from styles import COLORS
+
+# --- Paths to real evaluation artefacts ------------------------------------
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+_EVAL_DIR = _PROJECT_ROOT / "outputs"
+_DOCS_DIR = _PROJECT_ROOT / "docs"
+
+# Model name → eval directory stem
+_EVAL_MODELS = {
+    "vit_base":         "evaluation_384_vit_base",
+    "convnext_small":   "evaluation_384_convnext_small",
+    "efficientnet_b0":  "evaluation_384_efficientnet_b0",
+    "densenet":         "evaluation_384_densenet",
+}
 
 
 # ---------------------------------------------------------------------------
-# Dummy / static data
+# Load real evaluation data
 # ---------------------------------------------------------------------------
 
-_PERF_DATA = pd.DataFrame(
-    {
-        "Finding":     CLASS_NAMES,
-        "Probability": ["0.92",      "0.59",     "0.89"],
-        "Sensitivity": ["0.88",      "—",        "—"],
-        "Specificity": ["89",        "76",        "70"],
-        "F1 Score":    ["0.81",      "0.75",      "—"],
-    }
-)
-
-_SITES = ["All sites", "General Hospital A", "City Clinic B", "Regional Center C"]
-_USERS = ["All users", "radiologist_001", "radiologist_002", "resident_003"]
-_MODEL_VERSIONS = ["v1.2.0 (current)", "v1.1.3", "v1.0.8", "v0.9.5"]
-
-
-def _make_error_rate_series(n: int = 30) -> pd.DataFrame:
-    """Generate a fake increasing error-rate time series."""
-    rng = np.random.default_rng(42)
-    dates = pd.date_range(end=datetime.today(), periods=n, freq="D")
-    base = np.linspace(2, 18, n)
-    noise = rng.normal(0, 1.5, n)
-    values = np.clip(base + noise, 0, None)
-    return pd.DataFrame({"Disagreement / error rate": values}, index=dates)
+def _load_evaluation_report(model_key: str) -> dict:
+    """Load the evaluation report JSON for a given model."""
+    stem = _EVAL_MODELS.get(model_key, "")
+    report_dir = _EVAL_DIR / stem
+    if not report_dir.is_dir():
+        return {}
+    candidates = sorted(report_dir.glob("*_test_evaluation_report.json"))
+    if not candidates:
+        return {}
+    try:
+        with open(candidates[0]) as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
-def _make_drift_series(n: int = 30) -> pd.DataFrame:
-    """Generate a fake drift score time series (rising at the end)."""
-    rng = np.random.default_rng(7)
-    dates = pd.date_range(end=datetime.today(), periods=n, freq="D")
-    base = np.linspace(0, 40, n)
-    noise = rng.normal(0, 3, n)
-    values = np.clip(base + noise, 0, None)
-    return pd.DataFrame({"Drift score": values}, index=dates)
+def _load_all_model_reports() -> dict:
+    """Return {model_key: report_dict} for all trained models."""
+    return {k: _load_evaluation_report(k) for k in _EVAL_MODELS}
 
 
-def _make_audit_log(n: int = 15) -> pd.DataFrame:
-    now = datetime.now()
-    actions = ["Analysis", "Feedback", "Report Export", "Threshold change", "Login"]
-    users = ["radiologist_001", "radiologist_002", "resident_003", "admin"]
-    rows = [
-        {
-            "Timestamp": (now - timedelta(hours=i * 3)).strftime("%Y-%m-%d %H:%M"),
-            "User": users[i % len(users)],
-            "Action": actions[i % len(actions)],
-            "Patient / Case": f"P-{1200 - i:04d}",
-            "Model version": "v1.2.0",
-            "Status": "✅ OK" if i % 5 != 0 else "⚠️ Review",
-        }
-        for i in range(n)
-    ]
+def _build_performance_table() -> pd.DataFrame:
+    """Build a performance DataFrame from real evaluation reports."""
+    reports = _load_all_model_reports()
+    rows = []
+    for model_key, rpt in reports.items():
+        if not rpt:
+            continue
+        row = {"Model": model_key}
+        row["Macro F1"] = f"{rpt.get('macro_f1', 0):.4f}"
+        row["Macro AUC"] = f"{rpt.get('macro_auc', 0):.4f}"
+        row["Accuracy"] = f"{rpt.get('subset_accuracy', 0):.4f}"
+        cal = rpt.get("calibration", {})
+        row["ECE"] = f"{cal.get('expected_calibration_error', 0):.4f}"
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame({"Info": ["No evaluation reports found. Run scripts/evaluate.py"]})
     return pd.DataFrame(rows)
+
+
+def _build_per_class_table(model_key: str = "vit_base") -> pd.DataFrame:
+    """Build per-class metrics table for the selected model."""
+    rpt = _load_evaluation_report(model_key)
+    if not rpt:
+        return pd.DataFrame()
+    pathology_names = [c for c in CLASS_NAMES if c != "No finding"]
+    rows = []
+    for name in pathology_names:
+        rows.append({
+            "Finding": name,
+            "AUC": f"{rpt.get(f'{name}_auc', 0):.3f}",
+            "Sensitivity": f"{rpt.get(f'{name}_sensitivity', 0):.3f}",
+            "Specificity": f"{rpt.get(f'{name}_specificity', 0):.3f}",
+            "F1 Score": f"{rpt.get(f'{name}_f1', 0):.3f}",
+            "PPV": f"{rpt.get(f'{name}_ppv', 0):.3f}",
+        })
+    return pd.DataFrame(rows)
+
+
+def _load_model_card_text() -> str:
+    """Load model_card.md if it exists."""
+    path = _DOCS_DIR / "model_card.md"
+    if path.exists():
+        return path.read_text()[:3000]
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -73,115 +106,129 @@ def _make_audit_log(n: int = 15) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def render():
-    # ── Auto-activate "Drift & Monitoring" tab on first load ─────────────────
-    # Uses a session-state guard so the JS only fires once per page visit
-    # (i.e. on load / refresh) and not on every widget interaction.
     if "_audit_tab_init" not in st.session_state:
         st.session_state["_audit_tab_init"] = True
         _components.html(
-            """
-            <script>
-            setTimeout(function() {
-                var tabs = window.parent.document.querySelectorAll(
-                    'button[data-baseweb="tab"]'
-                );
-                if (tabs && tabs.length > 1) { tabs[1].click(); }
-            }, 350);
-            </script>
-            """,
+            '<script>setTimeout(function(){var t=window.parent.document.querySelectorAll('
+            '\'button[data-baseweb="tab"]\');if(t&&t.length>1){t[1].click();}},350);</script>',
             height=0,
         )
 
-    # ── Page header ──────────────────────────────────────────────────────────
     st.markdown(
-        f"""
-        <div style="text-align:center;margin-bottom:28px;">
-            <h1 style="
-                color:{COLORS['highlight']};
-                font-size:2.2rem;
-                font-weight:800;
-                margin-bottom:4px;
-                text-shadow:0 0 10px rgba(0,204,150,0.25);
-            ">Audit & Transparency</h1>
-            <p style="color:{COLORS['neutral']};font-size:15px;margin:0;">
-                Upload current image, previous exams, and manage assessments.
-            </p>
-        </div>
-        """,
+        f'<div style="text-align:center;margin-bottom:28px;">'
+        f'<h1 style="color:{COLORS["highlight"]};font-size:2.2rem;font-weight:800;'
+        f'margin-bottom:4px;text-shadow:0 0 10px rgba(0,204,150,0.25);">'
+        f'Audit & Transparency</h1>'
+        f'<p style="color:{COLORS["neutral"]};font-size:15px;margin:0;">'
+        f'Model performance, drift monitoring, and audit logs.</p></div>',
         unsafe_allow_html=True,
     )
 
     tab_model, tab_drift, tab_log = st.tabs(
-        ["Model Card", "Drift & Monitoring", "Audit Log"]
+        ["Model Card", "Drift & Monitoring", "Audit Log"],
     )
 
-    # =========================================================================
-    # TAB 1 — Model Card
-    # =========================================================================
     with tab_model:
         _render_model_card_tab()
-
-    # =========================================================================
-    # TAB 2 — Drift & Monitoring  (active in the screenshot)
-    # =========================================================================
     with tab_drift:
         _render_drift_tab()
-
-    # =========================================================================
-    # TAB 3 — Audit Log
-    # =========================================================================
     with tab_log:
         _render_audit_log_tab()
 
 
 # ---------------------------------------------------------------------------
-# Tab renderers
+# Tab: Model Card
 # ---------------------------------------------------------------------------
 
 def _render_model_card_tab():
-    """Full model-card information."""
     left, right = st.columns([1, 1])
 
     with left:
         with st.container(border=True):
-            st.markdown("#### Model overview")
-            st.markdown("**Name:** CXR-Sense")
-            st.markdown("**Version:** AI Health Labs")
-            st.markdown("**Model type:** Convolutional Neural Network")
-            st.markdown("**Training data summary:** diverse patient population")
-            st.markdown("**Intended use:** Frontline pneumonia & effusion detection")
-            st.markdown("**Population:** pediatric patients, portable AP exams")
+            st.markdown("#### Model Overview")
+            st.markdown("**Name:** XClinVision ChestX-ray")
+            st.markdown("**Organisation:** NounCode AI")
+            st.markdown("**Architecture:** Multi-model (ViT-Base, ConvNeXt-Small, EfficientNet-B0, DenseNet-121)")
+            st.markdown("**Training data:** VinBigData Chest X-ray — 14,304 frontal radiographs, 5-class multilabel")
+            st.markdown("**Input size:** 384 × 384 px")
+            st.markdown(f"**Classes:** {', '.join(CLASS_NAMES)}")
+            st.markdown("**Intended use:** Research-only decision support for thoracic disease detection")
+            st.markdown("**Certification:** Research Use Only — Not FDA cleared")
+
+        # Model card markdown
+        md_text = _load_model_card_text()
+        if md_text:
+            with st.expander("📄 Full Model Card (docs/model_card.md)"):
+                st.markdown(md_text)
 
     with right:
         with st.container(border=True):
-            st.markdown("#### Performance")
-            st.dataframe(_PERF_DATA, hide_index=True, width='stretch')
-            st.caption("Datasets: Internal Test (n=10k), External (n=5k)")
+            st.markdown("#### Cross-Model Performance")
+            perf_df = _build_performance_table()
+            st.dataframe(perf_df, hide_index=True, width='stretch')
+            st.caption("Metrics from test set evaluation (n=2,151)")
+
+        model_for_detail = st.selectbox(
+            "Per-class detail for:", list(_EVAL_MODELS.keys()), index=0,
+            key="audit_detail_model",
+        )
+        with st.container(border=True):
+            st.markdown(f"#### Per-Class Metrics — {model_for_detail}")
+            cls_df = _build_per_class_table(model_for_detail)
+            if not cls_df.empty:
+                st.dataframe(cls_df, hide_index=True, width='stretch')
+            else:
+                st.info("No evaluation report found for this model.")
 
         with st.container(border=True):
-            st.markdown("#### Limitations & risks")
-            st.success("**Supported** ✅")
+            st.markdown("#### Limitations & Risks")
             st.markdown(
-                "- Non-supported groups: Pregnant individuals\n"
-                "- Pediatric edge cases\n"
-                "- Suboptimal imaging devices"
+                "- Trained on **frontal views only** (PA / AP)\n"
+                "- **Not validated** for pediatric populations (<18 years)\n"
+                "- Performance may degrade on images from non-standard equipment\n"
+                "- Reduced sensitivity for subtle findings <5 mm\n"
+                "- Research use only — always correlate with clinical judgement"
             )
 
 
+# ---------------------------------------------------------------------------
+# Tab: Drift & Monitoring
+# ---------------------------------------------------------------------------
+
 def _render_drift_tab():
-    """Drift & Monitoring — matches the screenshot layout."""
+    client = st.session_state.get("api_client")
+
     left_col, right_col = st.columns([1, 1], gap="medium")
 
-    # ── LEFT: Model overview + filters + error-rate chart ─────────────────
     with left_col:
         with st.container(border=True):
-            st.markdown("#### Model overview")
-            st.markdown("**Name:** CXR-Sense")
-            st.markdown("**Version:** AI Health Labs")
-            st.markdown("**Model type:** Convolutional Neural Network")
-            st.markdown("**Training data summary:** diverse patient population")
-            st.markdown("**Intended use:** Frontline pneumonia & effusion detection")
-            st.markdown("**Population:** pediatric patients, portable AP exams")
+            st.markdown("#### Live System Status")
+            # Fetch drift metrics from backend
+            drift_data = None
+            if client:
+                drift_data = client.get_drift_metrics(days=30)
+
+            if drift_data:
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Total Analyses", drift_data.get("total_predictions", 0))
+                m2.metric("Avg Confidence", f"{drift_data.get('avg_confidence', 0):.1%}")
+                m3.metric("Drift Score", f"{drift_data.get('drift_score', 0):.4f}")
+
+                if drift_data.get("drift_detected"):
+                    st.error("⚠️ **Drift detected** — model performance may have degraded.")
+                else:
+                    st.success("✅ No significant drift detected.")
+
+                # Prediction distribution
+                pred_dist = drift_data.get("prediction_distribution", {})
+                if pred_dist:
+                    st.markdown("**Prediction Distribution**")
+                    dist_df = pd.DataFrame(
+                        {"Class": list(pred_dist.keys()), "Count": list(pred_dist.values())},
+                    )
+                    st.bar_chart(dist_df.set_index("Class"))
+            else:
+                st.info("Start the backend and run analyses to see live metrics.")
 
         # Filters
         f1, f2 = st.columns(2)
@@ -192,94 +239,78 @@ def _render_drift_tab():
                 key="audit_date_range",
             )
         with f2:
-            st.selectbox("Site / Hospital", _SITES, key="audit_site")
+            st.selectbox("Model", list(_EVAL_MODELS.keys()), key="audit_model_filter")
 
-        f3, f4 = st.columns(2)
-        with f3:
-            st.selectbox(
-                "Volume view",
-                ["Patients over time (cases/day)", "Studies per week"],
-                key="audit_volume_view",
-            )
-        with f4:
-            st.selectbox(
-                "Exam context",
-                ["Current exam", "Previous exams", "All exams"],
-                key="audit_exam_ctx",
-            )
-
-        # Error-rate chart
-        with st.container(border=True):
-            st.markdown("**Disagreement / error rate**")
-            st.line_chart(_make_error_rate_series(), width='stretch', height=200)
-
-        # Download button
-        csv_bytes = _make_error_rate_series().to_csv().encode()
-        st.download_button(
-            "Download CSV (filtered)",
-            data=csv_bytes,
-            file_name="error_rate_filtered.csv",
-            mime="text/csv",
-            width='stretch',
-        )
-
-    # ── RIGHT: Performance + Limitations + Drift chart ────────────────────
     with right_col:
         with st.container(border=True):
             st.markdown("#### Performance")
-            st.dataframe(_PERF_DATA, hide_index=True, width='stretch')
-            st.caption("Datasets: Internal Test (n=10k), External (n=5k)")
+            perf_df = _build_performance_table()
+            st.dataframe(perf_df, hide_index=True, width='stretch')
+            st.caption("Test set evaluation (n=2,151)")
 
         with st.container(border=True):
-            st.markdown("#### Limitations & risks")
-            st.success("**Supported** ✅")
-            st.markdown(
-                "- Non-supported groups: Pregnant individuals\n"
-                "- Pediatric edge cases\n"
-                "- Suboptimal imaging devices"
-            )
-            st.line_chart(_make_drift_series(), width='stretch', height=180)
+            st.markdown("#### Feedback Statistics")
+            fb_data = None
+            if client:
+                fb_data = client.get_feedback_stats()
+            if fb_data and fb_data.get("total", 0) > 0:
+                fb1, fb2, fb3 = st.columns(3)
+                fb1.metric("Total Feedback", fb_data["total"])
+                by_type = fb_data.get("by_type", {})
+                fb2.metric("Correct", by_type.get("correct", 0))
+                fb3.metric("Incorrect", by_type.get("incorrect", 0))
+                correction_rate = fb_data.get("correction_rate", 0)
+                st.progress(min(correction_rate / 100, 1.0),
+                            text=f"Correction rate: {correction_rate:.1f}%")
+            else:
+                st.info("No feedback submitted yet. Use the Inference page to provide feedback.")
 
-    # ── BOTTOM: Audit / Discard tools ─────────────────────────────────────
+        with st.container(border=True):
+            st.markdown("#### Limitations & Risks")
+            st.markdown(
+                "- Trained on frontal views only (PA / AP)\n"
+                "- Not validated for pediatric populations\n"
+                "- Performance degrades on non-standard equipment\n"
+                "- Research use only"
+            )
+
+    # Bottom: audit tools
     st.markdown("---")
     with st.container(border=True):
-        st.markdown("#### Discard / Audit tools")
+        st.markdown("#### Audit Tools")
         b1, b2, b3, b4 = st.columns(4)
         with b1:
             st.text_input("Patient ID", placeholder="P-XXXX-XXXXXX", key="aud_patient_id")
         with b2:
             st.text_input("Study ID", placeholder="STU-XXXXXXXX", key="aud_study_id")
         with b3:
-            st.selectbox("Model version", _MODEL_VERSIONS, key="aud_model_ver")
+            st.selectbox("Model", list(_EVAL_MODELS.keys()), key="aud_model_ver")
         with b4:
             st.slider("Threshold", 0.0, 1.0, 0.5, 0.01, key="aud_threshold")
 
         b5, b6 = st.columns(2)
         with b5:
-            st.selectbox("User", _USERS, key="aud_user")
+            st.text_input("User", placeholder="radiologist_001", key="aud_user")
         with b6:
             st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
-            report_col, csv_col = st.columns(2)
-            with report_col:
-                if st.button("Generate Report", width='stretch', key="aud_gen_report"):
-                    st.toast("Report generated ✅")
-            with csv_col:
-                audit_csv = _make_audit_log().to_csv(index=False).encode()
+            if st.button("Export Performance CSV", width='stretch', key="aud_export_csv"):
+                csv_bytes = _build_performance_table().to_csv(index=False).encode()
                 st.download_button(
-                    "Download CSV (filtered)",
-                    data=audit_csv,
-                    file_name="audit_log_filtered.csv",
-                    mime="text/csv",
-                    width='stretch',
-                    key="aud_dl_csv",
+                    "Download CSV", data=csv_bytes,
+                    file_name="xclinvision_performance.csv", mime="text/csv",
                 )
 
 
+# ---------------------------------------------------------------------------
+# Tab: Audit Log
+# ---------------------------------------------------------------------------
+
 def _render_audit_log_tab():
-    """Audit log with filters and downloadable table."""
+    client = st.session_state.get("api_client")
+
     st.markdown("#### Audit Log")
 
-    fc1, fc2, fc3 = st.columns([1, 1, 1])
+    fc1, fc2 = st.columns([1, 1])
     with fc1:
         st.date_input(
             "Date range",
@@ -287,20 +318,38 @@ def _render_audit_log_tab():
             key="log_date_range",
         )
     with fc2:
-        st.selectbox("User filter", _USERS, key="log_user_filter")
-    with fc3:
         st.selectbox(
-            "Action filter",
-            ["All actions", "Analysis", "Feedback", "Report Export", "Threshold change"],
-            key="log_action_filter",
+            "Type filter",
+            ["All", "correct", "incorrect", "uncertain"],
+            key="log_type_filter",
         )
 
-    log_df = _make_audit_log()
-    st.dataframe(log_df, hide_index=True, width='stretch')
+    # Fetch real feedback from backend
+    fb_data = None
+    if client:
+        fb_data = client.get_feedback_stats()
 
-    st.download_button(
-        "Download full audit log (CSV)",
-        data=log_df.to_csv(index=False).encode(),
-        file_name="audit_log_full.csv",
-        mime="text/csv",
-    )
+    if fb_data and fb_data.get("recent"):
+        recent = fb_data["recent"]
+        log_rows = []
+        for entry in recent:
+            log_rows.append({
+                "Timestamp": entry.get("timestamp", "—")[:19],
+                "Analysis ID": entry.get("analysis_id", "—"),
+                "Type": entry.get("feedback_type", "—"),
+                "User": entry.get("user_id", "anonymous"),
+                "Notes": entry.get("notes", "")[:80] if entry.get("notes") else "—",
+            })
+        log_df = pd.DataFrame(log_rows)
+        st.dataframe(log_df, hide_index=True, width='stretch')
+
+        csv_data = log_df.to_csv(index=False).encode()
+        st.download_button(
+            "Download audit log (CSV)", data=csv_data,
+            file_name="audit_log.csv", mime="text/csv",
+        )
+    else:
+        st.info(
+            "No audit log entries yet. Feedback submitted on the Inference page "
+            "will appear here."
+        )

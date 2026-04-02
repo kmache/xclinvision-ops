@@ -43,34 +43,32 @@ ENV/
 .env
 .env.*
 
-# Data files
+# Data files (large — not tracked)
 data/raw/*
 data/processed/*
-output/
-data/vector_db/*   
-data/NIH-ChestX-ray3
-data/processed_* 
-data/ambiguous_img/ 
+data/processed_*
+data/vector_db/*
 data/vinbigdata-chest-xray-abnormalities-detection/
-NIH_ChestX-ray14/
-data/duplicate/
-data/quarantine/
-data/test_sample/
-new_data/
-
 !data/raw/.gitkeep
 !data/processed/.manifest.csv
 !data/vector_db/.gitkeep
 
+# External report corpus (31 MB, downloaded separately)
+NLMCXR_reports/
 
 # Model artifacts
 models/
+archive/
 *.pt
 *.pth
 *.onnx
 *.h5
 *.pkl
 *.joblib
+
+# Generated outputs (evaluation results, XAI heatmaps, training logs)
+outputs/
+!outputs/.gitkeep
 
 # MLflow
 mlruns/*

@@ -6,17 +6,28 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx \
     libglib2.0-0 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies
+COPY app/frontend/requirements.txt /app/frontend-requirements.txt
+RUN pip install --no-cache-dir -r /app/frontend-requirements.txt
+RUN pip install --no-cache-dir pyyaml
 
-# Copy applications
-COPY . .
+# Copy configs (needed by frontend config.py to load class names)
+COPY configs/ /app/configs/
 
-# Expose port
+# Copy docs and evaluation outputs (needed by audit page for model card and metrics)
+COPY docs/ /app/docs/
+COPY outputs/ /app/outputs/
+
+# Copy the frontend application code
+COPY app/frontend/ /app/app/frontend/
+
+WORKDIR /app/app/frontend
+
 EXPOSE 8501
 
-# Run Streamlit
+HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health || exit 1
+
 CMD ["streamlit", "run", "main.py", "--server.port=8501", "--server.address=0.0.0.0"]

@@ -21,6 +21,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import cv2
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
@@ -143,8 +146,7 @@ def generate_radar_chart(
     ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.10), fontsize=8)
 
     b64 = _fig_to_base64(fig)
-    fig.clf()
-    fig.clear()
+    plt.close(fig)
     return b64
 
 

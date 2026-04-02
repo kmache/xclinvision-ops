@@ -1,8 +1,11 @@
 #!/usr/bin/env python
-"""Generate Grad-CAM++ and Score-CAM heatmaps for XClinVision models.
+"""Generate XAI heatmaps for XClinVision models.
 
 Selects random test-set samples (stratified by class) and produces
-side-by-side visualisations: original | Grad-CAM++ | Score-CAM.
+side-by-side visualisations.
+
+- **CNN / Swin models**: Original | Grad-CAM++ | Score-CAM
+- **ViT models**: Original | Attention Rollout | Grad-CAM++
 
 Usage
 -----
@@ -49,7 +52,7 @@ logger = logging.getLogger("xclinvision.generate_xai")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate Grad-CAM++ & Score-CAM heatmaps")
+    parser = argparse.ArgumentParser(description="Generate XAI heatmaps (Attention Rollout for ViTs, Grad-CAM++/Score-CAM for CNNs)")
     parser.add_argument("--checkpoint-path", type=str, required=True)
     parser.add_argument("--model-name", type=str, default="convnext_small")
     parser.add_argument("--image-size", type=int, default=384)
@@ -78,8 +81,10 @@ def save_comparison(
     scorecam_overlay: np.ndarray,
     title: str,
     output_path: Path,
+    primary_label: str = "Grad-CAM++",
+    secondary_label: str = "Score-CAM",
 ) -> None:
-    """Save a side-by-side comparison: original | Grad-CAM++ | Score-CAM."""
+    """Save a side-by-side comparison: original | primary | secondary."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -92,11 +97,11 @@ def save_comparison(
         axes[0].axis("off")
 
         axes[1].imshow(gradcam_overlay)
-        axes[1].set_title("Grad-CAM++", fontsize=12)
+        axes[1].set_title(primary_label, fontsize=12)
         axes[1].axis("off")
 
         axes[2].imshow(scorecam_overlay)
-        axes[2].set_title("Score-CAM", fontsize=12)
+        axes[2].set_title(secondary_label, fontsize=12)
         axes[2].axis("off")
 
         fig.suptitle(title, fontsize=14, fontweight="bold")
@@ -168,10 +173,16 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 2. Resolve Grad-CAM target layer
     # ------------------------------------------------------------------
+    # Detect ViT models — use Attention Rollout instead of Score-CAM
+    is_vit = args.model_name.startswith("vit")
+
     target_layer = get_target_layer(model)
-    if target_layer is None:
+    if target_layer is None and not is_vit:
         raise RuntimeError("Could not resolve Grad-CAM target layer for this model.")
-    logger.info(f"Grad-CAM target layer: {target_layer.__class__.__name__}")
+    if is_vit:
+        logger.info("ViT detected — using Attention Rollout (primary) + Grad-CAM++ (secondary)")
+    else:
+        logger.info(f"Grad-CAM target layer: {target_layer.__class__.__name__}")
 
     # ------------------------------------------------------------------
     # 3. Build ExplainabilityEngine
@@ -246,34 +257,48 @@ def main() -> None:
                 f"(GT=positive, pred={prob:.3f}) — {img_path.name}"
             )
 
-            # Grad-CAM++
-            gradcam_result = engine.generate_heatmap(
-                raw_image, target_class=cls_idx, method="gradcam++",
-            )
-
-            # Score-CAM (may OOM at high resolutions like 1024)
-            try:
-                scorecam_result = engine.generate_heatmap(
-                    raw_image, target_class=cls_idx, method="scorecam",
+            if is_vit:
+                # ViT: Attention Rollout (primary) + Grad-CAM++ (secondary)
+                primary_result = engine.generate_heatmap(
+                    raw_image, target_class=cls_idx, method="attention_rollout",
                 )
-                scorecam_overlay = scorecam_result["heatmap"]
-            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-                logger.warning(f"  Score-CAM skipped (OOM at {args.image_size}px): {e}")
-                torch.cuda.empty_cache()
-                scorecam_overlay = gradcam_result["heatmap"]  # fallback to Grad-CAM++
+                secondary_result = engine.generate_heatmap(
+                    raw_image, target_class=cls_idx, method="gradcam++",
+                )
+                primary_label = "Attention Rollout"
+                secondary_label = "Grad-CAM++"
+                qc_result = primary_result
+            else:
+                # CNN / Swin: Grad-CAM++ (primary) + Score-CAM (secondary)
+                primary_result = engine.generate_heatmap(
+                    raw_image, target_class=cls_idx, method="gradcam++",
+                )
+                try:
+                    secondary_result = engine.generate_heatmap(
+                        raw_image, target_class=cls_idx, method="scorecam",
+                    )
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                    logger.warning(f"  Score-CAM skipped (OOM at {args.image_size}px): {e}")
+                    torch.cuda.empty_cache()
+                    secondary_result = primary_result  # fallback
+                primary_label = "Grad-CAM++"
+                secondary_label = "Score-CAM"
+                qc_result = primary_result
 
             title = (
                 f"{cls_name} | GT=positive | Prob={prob:.3f} | "
-                f"QC={'PASS' if gradcam_result['quality'].passes_qc else 'FAIL'}"
+                f"QC={'PASS' if qc_result['quality'].passes_qc else 'FAIL'}"
             )
 
             fname = f"{img_path.stem}_{cls_name.replace(' ', '_')}.png"
             save_comparison(
                 original=raw_image,
-                gradcam_overlay=gradcam_result["heatmap"],
-                scorecam_overlay=scorecam_overlay,
+                gradcam_overlay=primary_result["heatmap"],
+                scorecam_overlay=secondary_result["heatmap"],
                 title=title,
                 output_path=output_dir / fname,
+                primary_label=primary_label,
+                secondary_label=secondary_label,
             )
 
     # ------------------------------------------------------------------

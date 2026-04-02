@@ -1,7 +1,8 @@
 """Page: Report Generation — Structured clinical AI reporting interface.
 
 Review AI output, compose structured findings, and export finalized
-radiology reports to PDF, JSON, or HIS.
+radiology reports to PDF, JSON, or HIS.  Populates from real analysis
+results when available via ``st.session_state["current_analysis"]``.
 """
 
 import json
@@ -9,35 +10,12 @@ from datetime import datetime
 
 import streamlit as st
 
+from config import CLASS_NAMES
 from styles import COLORS
 
 # ==============================================================================
-# Mock / default content
+# Helpers
 # ==============================================================================
-
-_DEFAULT_INDICATION = (
-    "Patient presents with persistent cough and fever for 5 days. "
-    "Clinical suspicion for lower respiratory tract infection. "
-    "AI-assisted imaging requested for diagnostic support."
-)
-
-_DEFAULT_IMPRESSION = (
-    "Findings suggest progressive consolidation in the right middle lobe consistent "
-    "with community-acquired pneumonia. Subtle blunting of the right costophrenic angle "
-    "may indicate a small pleural effusion. The cardiac silhouette appears at the upper "
-    "limit of normal size. No pneumothorax identified. Osseous structures appear intact. "
-    "Soft tissues are unremarkable. AI model confidence exceeds threshold for all flagged "
-    "findings. Clinical correlation with laboratory results and patient history is advised. "
-    "Follow-up imaging in 4–6 weeks recommended to confirm resolution."
-)
-
-_DEFAULT_PREVIEW = (
-    "This report was generated with AI assistance and reviewed by the attending radiologist. "
-    "Findings include consolidation in the right middle lobe, minor pleural effusion, and "
-    "mild cardiomegaly. Antibiotic therapy is suggested pending culture results. Follow-up "
-    "imaging in 4–6 weeks is recommended to confirm resolution of the identified pathology. "
-    "The patient's overall cardiopulmonary status warrants close monitoring."
-)
 
 _SEVERITY_COLORS = {
     "Moderate": COLORS["warning"],
@@ -51,56 +29,15 @@ _LOCATIONS = [
     "Right middle lobe", "Bilateral",
 ]
 
-# ==============================================================================
-# Section renderers
-# ==============================================================================
+_PATHOLOGY_CLASSES = [c for c in CLASS_NAMES if c != "No finding"]
 
-def render_header() -> tuple[str, str, str]:
-    """Render the page title, subtitle, and info bar. Returns (patient_id, study, version)."""
-    st.markdown(
-        f"""
-        <div style="text-align:center;margin-bottom:28px;">
-            <h1 style="
-                color:{COLORS['highlight']};
-                font-size:2.2rem;
-                font-weight:800;
-                margin-bottom:4px;
-                text-shadow:0 0 10px rgba(0,204,150,0.25);
-            ">Report Generation</h1>
-            <p style="color:{COLORS['neutral']};font-size:15px;margin:0;">
-                Review AI output, finalize previous exams, and patient report.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
-    # Info bar
-    bar1, bar2, bar3, bar4 = st.columns([2, 2, 1.5, 1.5])
-    with bar1:
-        patient_id = st.text_input("Patient ID", value="P-1224-333845", label_visibility="visible")
-    with bar2:
-        study = st.text_input("Current study", value="2023-15-26, PA", label_visibility="visible")
-    with bar3:
-        st.markdown("<div style='height:27px'></div>", unsafe_allow_html=True)
-        st.markdown(
-            f"<div style='padding:8px 0;font-size:13px;color:{COLORS['neutral']};'>"
-            f"Finding version: <b style='color:{COLORS['text']};'>v0.33</b></div>",
-            unsafe_allow_html=True,
-        )
-    with bar4:
-        st.markdown("<div style='height:27px'></div>", unsafe_allow_html=True)
-        if st.button("View prediction →", type="primary", use_container_width=True):
-            st.session_state["_page_idx"] = 0
-            st.session_state["_nav_btn_triggered"] = True
-            st.query_params["page"] = "0"
-            st.rerun()
-
-    st.markdown(
-        f"<div style='border-top:1px solid {COLORS['border']};margin:10px 0 22px 0;'></div>",
-        unsafe_allow_html=True,
-    )
-    return patient_id, study, "v0.33"
+def _severity_from_prob(prob: float) -> str:
+    if prob >= 0.8:
+        return "Severe"
+    if prob >= 0.5:
+        return "Moderate"
+    return "Mild"
 
 
 def _severity_badge(label: str) -> str:
@@ -119,13 +56,141 @@ def _score_badge(score: float) -> str:
     )
 
 
+# ==============================================================================
+# Build dynamic text from current analysis
+# ==============================================================================
+
+def _get_analysis() -> dict:
+    """Return the most recent analysis result from session state, or {}."""
+    return st.session_state.get("current_analysis") or {}
+
+
+def _build_indication() -> str:
+    """Build indication text from the current analysis."""
+    analysis = _get_analysis()
+    if not analysis:
+        return ""
+    patient_id = analysis.get("patient_id", "Unknown")
+    return (
+        f"AI-assisted chest X-ray analysis for patient {patient_id}. "
+        "Automated pathology screening with multilabel classification."
+    )
+
+
+def _build_impression() -> str:
+    """Build impression text from real predictions."""
+    analysis = _get_analysis()
+    predictions = analysis.get("top_k_predictions", [])
+    if not predictions:
+        return ""
+
+    positive = [p for p in predictions if p.get("probability", 0) >= 0.5 and p.get("class_name") != "No finding"]
+    if not positive:
+        return (
+            "No significant pathological findings detected above the decision threshold. "
+            "All classes below 0.5 confidence. Clinical correlation recommended."
+        )
+
+    parts = []
+    for p in sorted(positive, key=lambda x: x.get("probability", 0), reverse=True):
+        name = p.get("class_name", "Unknown")
+        prob = p.get("probability", 0)
+        parts.append(f"{name} (confidence {prob:.1%})")
+
+    findings_str = "; ".join(parts)
+    return (
+        f"AI model detected: {findings_str}. "
+        "Findings should be correlated with clinical presentation. "
+        "Follow-up imaging may be warranted for confirmed findings."
+    )
+
+
+def _build_predictions_list() -> list[dict]:
+    """Return list of {class_name, probability, severity} from current analysis."""
+    analysis = _get_analysis()
+    predictions = analysis.get("top_k_predictions", [])
+    if predictions:
+        return [
+            {
+                "class_name": p.get("class_name", ""),
+                "probability": p.get("probability", 0),
+                "severity": _severity_from_prob(p.get("probability", 0)),
+            }
+            for p in predictions
+            if p.get("class_name", "") != "No finding"
+        ]
+    # Fallback: show all pathology classes with empty values
+    return [
+        {"class_name": c, "probability": 0.0, "severity": "Mild"}
+        for c in _PATHOLOGY_CLASSES
+    ]
+
+
+# ==============================================================================
+# Section renderers
+# ==============================================================================
+
+def render_header() -> tuple[str, str]:
+    """Render the page title and info bar. Returns (patient_id, study)."""
+    st.markdown(
+        f"""
+        <div style="text-align:center;margin-bottom:28px;">
+            <h1 style="
+                color:{COLORS['highlight']};
+                font-size:2.2rem;
+                font-weight:800;
+                margin-bottom:4px;
+                text-shadow:0 0 10px rgba(0,204,150,0.25);
+            ">Report Generation</h1>
+            <p style="color:{COLORS['neutral']};font-size:15px;margin:0;">
+                Review AI output, finalize findings, and export patient report.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    analysis = _get_analysis()
+    default_pid = analysis.get("patient_id", "")
+    default_study = f"{datetime.now().strftime('%Y-%m-%d')}, PA" if analysis else ""
+    model_name = analysis.get("model_version", "—")
+
+    bar1, bar2, bar3, bar4 = st.columns([2, 2, 1.5, 1.5])
+    with bar1:
+        patient_id = st.text_input("Patient ID", value=default_pid, placeholder="P-XXXX-XXXXXX")
+    with bar2:
+        study = st.text_input("Current study", value=default_study, placeholder="YYYY-MM-DD, PA")
+    with bar3:
+        st.markdown("<div style='height:27px'></div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='padding:8px 0;font-size:13px;color:{COLORS['neutral']};'>"
+            f"Model: <b style='color:{COLORS['text']};'>{model_name}</b></div>",
+            unsafe_allow_html=True,
+        )
+    with bar4:
+        st.markdown("<div style='height:27px'></div>", unsafe_allow_html=True)
+        if st.button("← Back to inference", type="primary", width='stretch'):
+            st.session_state["_page_idx"] = 0
+            st.session_state["_nav_btn_triggered"] = True
+            st.query_params["page"] = "0"
+            st.rerun()
+
+    st.markdown(
+        f"<div style='border-top:1px solid {COLORS['border']};margin:10px 0 22px 0;'></div>",
+        unsafe_allow_html=True,
+    )
+    return patient_id, study
+
+
 def render_structured_editor() -> str:
-    """Render the left-column structured editor. Returns indication text."""
+    """Render the left-column structured editor from real predictions. Returns indication text."""
     st.markdown(
         f"<span style='font-size:16px;font-weight:700;color:{COLORS['text']};'>"
         f"Structured editor</span>",
         unsafe_allow_html=True,
     )
+
+    preds = _build_predictions_list()
 
     with st.container(border=True):
         st.markdown(
@@ -136,106 +201,49 @@ def render_structured_editor() -> str:
 
         # Table header
         hdr_c0, hdr_c1, hdr_c2, hdr_c3 = st.columns([0.6, 2.5, 1.8, 2.2])
-        for col, txt in [(hdr_c0, ""), (hdr_c1, "Structured findings"), (hdr_c2, "Severity"), (hdr_c3, "")]:
+        for col, txt in [(hdr_c0, ""), (hdr_c1, "Finding"), (hdr_c2, "Confidence"), (hdr_c3, "Severity")]:
             col.markdown(
                 f"<span style='font-size:11px;font-weight:600;color:{COLORS['neutral']};'>{txt}</span>",
                 unsafe_allow_html=True,
             )
-
         st.markdown(
             f"<div style='border-top:1px solid {COLORS['border']};margin:4px 0 6px 0;'></div>",
             unsafe_allow_html=True,
         )
 
-        # ── Row 1: Pneumonia with numeric score ─────────────────────
-        r1c1, r1c2, r1c3, r1c4 = st.columns([0.6, 2.5, 1.2, 2.6])
-        with r1c1:
-            pneu_checked = st.checkbox("Pneumonia", value=True, key="chk_pneu", label_visibility="collapsed")
-        with r1c2:
-            st.markdown(
-                f"<div style='padding-top:6px;color:{COLORS['text']};font-size:13px;'>Pneumonia</div>",
-                unsafe_allow_html=True,
-            )
-        with r1c3:
-            st.markdown(
-                f"<div style='padding-top:4px;'>{_score_badge(8.85)}</div>",
-                unsafe_allow_html=True,
-            )
-        with r1c4:
-            st.markdown(
-                f"<div style='padding-top:4px;'>{_severity_badge('Moderate')}</div>",
-                unsafe_allow_html=True,
-            )
+        # Dynamic rows from predictions
+        for i, pred in enumerate(preds):
+            name = pred["class_name"]
+            prob = pred["probability"]
+            sev = pred["severity"]
+            is_positive = prob >= 0.5
 
-        # ── Row 2: Effusion — text severity ─────────────────────────
-        r2c1, r2c2, r2c3, r2c4 = st.columns([0.6, 2.5, 1.2, 2.6])
-        with r2c1:
-            st.checkbox("Effusion", value=True, key="chk_eff1", label_visibility="collapsed")
-        with r2c2:
-            st.markdown(
-                f"<div style='padding-top:6px;color:{COLORS['text']};font-size:13px;'>Effusion</div>",
-                unsafe_allow_html=True,
-            )
-        with r2c3:
-            st.markdown(
-                f"<div style='padding-top:6px;color:{COLORS['neutral']};font-size:13px;'>Moderate</div>",
-                unsafe_allow_html=True,
-            )
-        with r2c4:
-            st.markdown("", unsafe_allow_html=True)
-
-        # ── Row 3: Effusion — location dropdown ─────────────────────
-        r3c1, r3c2, r3c3 = st.columns([0.6, 2.5, 4.0])
-        with r3c1:
-            st.checkbox("Effusion location", value=True, key="chk_eff2", label_visibility="collapsed")
-        with r3c2:
-            st.markdown(
-                f"<div style='padding-top:6px;color:{COLORS['text']};font-size:13px;'>Effusion</div>",
-                unsafe_allow_html=True,
-            )
-        with r3c3:
-            st.selectbox(
-                "Location", _LOCATIONS, index=0,
-                key="loc_eff2", label_visibility="collapsed",
-            )
-
-        # ── Row 4: Cardiomegaly — unchecked ─────────────────────────
-        r4c1, r4c2, r4c3 = st.columns([0.6, 2.5, 4.0])
-        with r4c1:
-            st.checkbox("Cardiomegaly", value=False, key="chk_card1", label_visibility="collapsed")
-        with r4c2:
-            st.markdown(
-                f"<div style='padding-top:6px;color:{COLORS['neutral']};font-size:13px;'>Cardiomegaly</div>",
-                unsafe_allow_html=True,
-            )
-        with r4c3:
-            st.markdown(
-                f"<div style='padding-top:6px;color:{COLORS['neutral']};font-size:13px;'>"
-                f"Right lower lobe</div>",
-                unsafe_allow_html=True,
-            )
-
-        # ── Row 5: Cardiomegaly — numeric 0 ─────────────────────────
-        r5c1, r5c2, r5c3, r5c4 = st.columns([0.6, 2.5, 1.2, 2.6])
-        with r5c1:
-            st.checkbox("Cardiomegaly severity", value=False, key="chk_card2", label_visibility="collapsed")
-        with r5c2:
-            st.markdown(
-                f"<div style='padding-top:6px;color:{COLORS['neutral']};font-size:13px;'>Cardiomegaly</div>",
-                unsafe_allow_html=True,
-            )
-        with r5c3:
-            st.selectbox(
-                "Severity", ["0", "1", "2", "3"], index=0,
-                key="sev_card2", label_visibility="collapsed",
-            )
+            rc0, rc1, rc2, rc3 = st.columns([0.6, 2.5, 1.2, 2.6])
+            with rc0:
+                st.checkbox(name, value=is_positive, key=f"chk_{i}", label_visibility="collapsed")
+            with rc1:
+                color = COLORS["text"] if is_positive else COLORS["neutral"]
+                st.markdown(
+                    f"<div style='padding-top:6px;color:{color};font-size:13px;'>{name}</div>",
+                    unsafe_allow_html=True,
+                )
+            with rc2:
+                st.markdown(
+                    f"<div style='padding-top:4px;'>{_score_badge(prob)}</div>",
+                    unsafe_allow_html=True,
+                )
+            with rc3:
+                st.markdown(
+                    f"<div style='padding-top:4px;'>{_severity_badge(sev)}</div>",
+                    unsafe_allow_html=True,
+                )
 
     st.markdown(
         f"<div style='border-top:1px solid {COLORS['border']};margin:14px 0 10px 0;'></div>",
         unsafe_allow_html=True,
     )
 
-    # ── Indication ───────────────────────────────────────────────────
+    # Indication
     st.markdown(
         f"<span style='font-size:14px;font-weight:600;color:{COLORS['neutral']};'>"
         f"Indication</span>",
@@ -243,7 +251,7 @@ def render_structured_editor() -> str:
     )
     indication = st.text_area(
         "Indication text",
-        value=st.session_state.get("report_indication", _DEFAULT_INDICATION),
+        value=st.session_state.get("report_indication", _build_indication()),
         height=110,
         key="report_indication",
         label_visibility="collapsed",
@@ -267,7 +275,7 @@ def render_impression_section() -> tuple[str, str]:
         )
         impression = st.text_area(
             "Impression text",
-            value=st.session_state.get("report_impression", _DEFAULT_IMPRESSION),
+            value=st.session_state.get("report_impression", _build_impression()),
             height=260,
             key="report_impression",
             label_visibility="collapsed",
@@ -294,7 +302,9 @@ def render_impression_section() -> tuple[str, str]:
     return impression, comments
 
 
-def render_report_preview(indication: str, impression: str, comments: str) -> None:
+def render_report_preview(
+    patient_id: str, study: str, indication: str, impression: str, comments: str,
+) -> None:
     """Render the full-width report preview and action buttons."""
     st.markdown(
         f"<div style='border-top:1px solid {COLORS['border']};margin:18px 0 16px 0;'></div>",
@@ -308,11 +318,22 @@ def render_report_preview(indication: str, impression: str, comments: str) -> No
             unsafe_allow_html=True,
         )
 
-        # Assemble combined preview text
-        preview_parts = [_DEFAULT_PREVIEW]
+        # Build dynamic preview from real fields
+        preview_parts = []
+        if indication.strip():
+            preview_parts.append(f"**Indication:** {indication.strip()}")
+        if impression.strip():
+            preview_parts.append(f"**Impression:** {impression.strip()}")
         if comments.strip():
-            preview_parts.append(f"Additional notes: {comments.strip()}")
-        preview_text = "  ".join(preview_parts)
+            preview_parts.append(f"**Additional notes:** {comments.strip()}")
+
+        analysis = _get_analysis()
+        if analysis.get("analysis_id"):
+            preview_parts.append(f"**Analysis ID:** {analysis['analysis_id']}")
+
+        preview_text = "<br><br>".join(preview_parts) if preview_parts else (
+            "<em>Run an analysis on the Inference page to populate this report.</em>"
+        )
 
         st.markdown(
             f"""
@@ -329,45 +350,89 @@ def render_report_preview(indication: str, impression: str, comments: str) -> No
             unsafe_allow_html=True,
         )
 
-    # ── Action buttons ───────────────────────────────────────────────
+    # Action buttons
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     _gap, btn1, btn2, btn3, _gap2 = st.columns([1, 2, 2.5, 2.5, 1])
 
     with btn1:
-        if st.button("Feedback", use_container_width=True):
-            st.toast("Feedback submitted.", icon="✅")
-    with btn2:
-        if st.button("Save draft", use_container_width=True):
+        if st.button("Save draft", width='stretch'):
             st.session_state["saved_draft"] = {
+                "patient_id": patient_id,
+                "study": study,
                 "indication": indication,
                 "impression": impression,
                 "comments": comments,
                 "saved_at": datetime.now().isoformat(),
             }
             st.toast("Draft saved.", icon="💾")
+    with btn2:
+        # Try to generate report via backend
+        analysis = _get_analysis()
+        analysis_id = analysis.get("analysis_id")
+        if st.button("Generate AI Report", width='stretch',
+                      disabled=not analysis_id):
+            client = st.session_state.get("api_client")
+            if client and analysis_id:
+                with st.spinner("Generating report…"):
+                    result = client.generate_report(analysis_ids=[analysis_id])
+                if result and result.get("content"):
+                    content = result["content"]
+                    st.session_state["_pending_report_impression"] = content.get(
+                        "impressions", impression
+                    )
+                    if content.get("findings"):
+                        st.session_state["_pending_report_indication"] = content["findings"]
+                    st.toast("Report generated from AI analysis.", icon="✅")
+                    st.rerun()
+                else:
+                    st.toast("Report generation failed — using manual text.", icon="⚠️")
+            else:
+                st.toast("No API connection. Using manual text.", icon="⚠️")
     with btn3:
-        export_col1, export_col2 = st.columns(2)
+        export_col1, export_col2, export_col3 = st.columns(3)
         with export_col1:
-            if st.button("Finalize and export PDF", use_container_width=True):
-                st.toast("PDF export triggered. Use your browser's print dialog.", icon="📄")
+            if st.button("Export HTML", width='stretch'):
+                client = st.session_state.get("api_client")
+                if client and analysis_id:
+                    with st.spinner("Generating HTML report…"):
+                        result = client.export_report_html(analysis_id=analysis_id)
+                    if result and result.get("html"):
+                        st.download_button(
+                            "⬇ Download HTML",
+                            data=result["html"],
+                            file_name=f"clinical_report_{analysis_id[:8]}.html",
+                            mime="text/html",
+                            key="download_html_report",
+                        )
+                        st.toast("HTML report generated.", icon="✅")
+                    else:
+                        st.toast("HTML export failed.", icon="⚠️")
+                else:
+                    st.toast("No API connection.", icon="⚠️")
         with export_col2:
+            if st.button("Export PDF", width='stretch'):
+                st.toast("PDF export triggered. Use your browser's print dialog.", icon="📄")
+        with export_col3:
             payload = json.dumps(
                 {
-                    "patient_id": st.session_state.get("report_patient_id", "P-1224-333845"),
-                    "study": st.session_state.get("report_study", "2023-15-26, PA"),
+                    "patient_id": patient_id,
+                    "study": study,
+                    "analysis_id": analysis.get("analysis_id", ""),
+                    "model": analysis.get("model_version", ""),
                     "indication": indication,
                     "impression": impression,
                     "comments": comments,
+                    "predictions": analysis.get("top_k_predictions", []),
                     "generated_at": datetime.now().isoformat(),
                 },
                 indent=2,
             )
             st.download_button(
-                "Export JSON / send to HIS",
+                "Export JSON",
                 data=payload,
                 file_name="report_export.json",
                 mime="application/json",
-                use_container_width=True,
+                width='stretch',
             )
 
     # Footer disclaimer
@@ -390,23 +455,29 @@ def render_report_preview(indication: str, impression: str, comments: str) -> No
 
 
 # ==============================================================================
-# Main entry point (called by the app router)
+# Main entry point
 # ==============================================================================
 
 def render() -> None:
-    # Header + info bar
-    patient_id, study, version = render_header()
+    # ── Apply any pending AI-generated content BEFORE widgets render ──
+    # Streamlit does not allow setting a widget-bound key after the widget
+    # has been instantiated.  We stage values in _pending_* keys and apply
+    # them here, before the widgets are created on this rerun.
+    for field in ("report_impression", "report_indication"):
+        pending_key = f"_pending_{field}"
+        if pending_key in st.session_state:
+            st.session_state[field] = st.session_state.pop(pending_key)
+
+    patient_id, study = render_header()
     st.session_state["report_patient_id"] = patient_id
     st.session_state["report_study"] = study
 
-    # Main two-column layout  (45 / 55)
+    # Main two-column layout
     col_left, col_right = st.columns([45, 55])
 
     with col_left:
         indication = render_structured_editor()
-
     with col_right:
         impression, comments = render_impression_section()
 
-    # Full-width preview + actions
-    render_report_preview(indication, impression, comments)
+    render_report_preview(patient_id, study, indication, impression, comments)
