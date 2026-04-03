@@ -16,6 +16,17 @@ from typing import Any, Dict, Generator, Iterator, Optional
 logger = logging.getLogger(__name__)
 
 
+def _completion_tokens_kwarg(model: str, value: int = 700) -> Dict[str, int]:
+    """Return the correct token-limit parameter for the given model.
+
+    OpenAI's newer *o-* and *gpt-5* family models require
+    ``max_completion_tokens`` instead of the legacy ``max_tokens``.
+    """
+    if "gpt-5" in model or model.startswith("o"):
+        return {"max_completion_tokens": value}
+    return {"max_tokens": value}
+
+
 class LLMProvider(ABC):
     """Base interface for all LLM providers.
 
@@ -72,9 +83,11 @@ class OpenAIProvider(LLMProvider):
 
     Configuration via environment variables:
     - ``OPENAI_API_KEY``  — required
-    - ``OPENAI_MODEL``    — defaults to ``gpt-4o-mini``
+    - ``OPENAI_MODEL``    — defaults to ``gpt-5.4-nano``
     - ``OPENAI_API_BASE`` — optional custom base URL
     """
+
+    _FALLBACK_MODEL = "gpt-4o-mini"
 
     def __init__(
         self,
@@ -83,9 +96,11 @@ class OpenAIProvider(LLMProvider):
         base_url: Optional[str] = None,
     ) -> None:
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
-        self._model = model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        self._model = model or os.environ.get("OPENAI_MODEL", "gpt-5.4-nano")
         self._base_url = base_url or os.environ.get("OPENAI_API_BASE")
         self._client: Any = None
+        logger.info("OpenAIProvider: model=%s, base_url=%s, key_set=%s",
+                    self._model, self._base_url or "(default)", bool(self._api_key))
 
     @property
     def name(self) -> str:
@@ -124,8 +139,15 @@ class OpenAIProvider(LLMProvider):
                 model=self._model,
                 messages=messages,
                 temperature=temperature,
+                **_completion_tokens_kwarg(self._model),
                 response_format={"type": "json_object"},
             )
+            if response.usage:
+                logger.info(
+                    "OpenAI usage [%s] prompt=%d completion=%d total=%d",
+                    self._model, response.usage.prompt_tokens,
+                    response.usage.completion_tokens, response.usage.total_tokens,
+                )
             return response.choices[0].message.content or ""
         except Exception as exc:
             logger.warning(
@@ -133,18 +155,32 @@ class OpenAIProvider(LLMProvider):
                 exc,
             )
 
-        # Fallback: plain completion
-        response = client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            temperature=temperature,
-        )
-        raw = response.choices[0].message.content or ""
-
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
-            return match.group()
-        return raw
+        # Fallback: plain completion (try primary model, then fallback model)
+        for model in (self._model, self._FALLBACK_MODEL):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    **_completion_tokens_kwarg(model),
+                )
+                raw = response.choices[0].message.content or ""
+                if response.usage:
+                    logger.info(
+                        "OpenAI usage [%s] prompt=%d completion=%d total=%d",
+                        model, response.usage.prompt_tokens,
+                        response.usage.completion_tokens, response.usage.total_tokens,
+                    )
+                if model != self._model:
+                    logger.info("OpenAI call succeeded with fallback model '%s'", model)
+                match = re.search(r"\{.*\}", raw, re.DOTALL)
+                return match.group() if match else raw
+            except Exception as exc:
+                if model == self._model:
+                    logger.warning("Primary model '%s' failed: %s. Trying fallback '%s'.",
+                                   model, exc, self._FALLBACK_MODEL)
+                else:
+                    raise
 
     def stream(
         self,
@@ -159,16 +195,32 @@ class OpenAIProvider(LLMProvider):
             {"role": "user", "content": user},
         ]
 
-        response = client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            temperature=temperature,
-            stream=True,
-        )
-
-        for chunk in response:
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+        try:
+            response = client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                temperature=temperature,
+                **_completion_tokens_kwarg(self._model),
+                stream=True,
+            )
+            for chunk in response:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+        except Exception as exc:
+            logger.warning(
+                "OpenAI stream with '%s' failed: %s. Trying fallback '%s'.",
+                self._model, exc, self._FALLBACK_MODEL,
+            )
+            response = client.chat.completions.create(
+                model=self._FALLBACK_MODEL,
+                messages=messages,
+                temperature=temperature,
+                **_completion_tokens_kwarg(self._FALLBACK_MODEL),
+                stream=True,
+            )
+            for chunk in response:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
 
     def health_check(self) -> bool:
         if not self._api_key:
@@ -205,12 +257,36 @@ class LocalProvider(LLMProvider):
         self._model = model or os.environ.get("LOCAL_LLM_MODEL", "llama3.2")
         self._api_key = api_key or os.environ.get("LOCAL_LLM_API_KEY", "ollama")
         self._client: Any = None
+        self._reachable: Optional[bool] = None
 
     @property
     def name(self) -> str:
         return "local"
 
+    def _is_reachable(self) -> bool:
+        """Quick TCP-level check to avoid long timeouts when server is down."""
+        if self._reachable is not None:
+            return self._reachable
+        import socket
+        try:
+            # Parse host:port from base_url
+            from urllib.parse import urlparse
+            parsed = urlparse(self._base_url)
+            host = parsed.hostname or "localhost"
+            port = parsed.port or 11434
+            sock = socket.create_connection((host, port), timeout=2)
+            sock.close()
+            self._reachable = True
+        except (OSError, socket.timeout):
+            self._reachable = False
+            logger.info("LocalProvider: server at %s not reachable — disabled.", self._base_url)
+        return self._reachable
+
     def _get_client(self) -> Any:
+        if not self._is_reachable():
+            raise ConnectionError(
+                f"Local LLM server at {self._base_url} is not reachable"
+            )
         if self._client is None:
             try:
                 from openai import OpenAI
@@ -221,6 +297,7 @@ class LocalProvider(LLMProvider):
             self._client = OpenAI(
                 api_key=self._api_key,
                 base_url=self._base_url,
+                timeout=15.0,
             )
         return self._client
 
@@ -275,13 +352,9 @@ class LocalProvider(LLMProvider):
                 yield chunk.choices[0].delta.content
 
     def health_check(self) -> bool:
+        if not self._is_reachable():
+            return False
         try:
-            import requests
-            resp = requests.get(
-                self._base_url.rstrip("/").rsplit("/v1", 1)[0] + "/api/tags",
-                timeout=3,
-            )
-            return resp.status_code == 200
-        except Exception:
-            # Fallback: try via the OpenAI client
             return super().health_check()
+        except Exception:
+            return False

@@ -852,8 +852,9 @@ class ExplainabilityEngine:
         image: np.ndarray,
         prediction: int,
         confidence: float,
+        method: str = "gradcam++",
     ) -> Dict[str, Any]:
-        heatmap_result = self.generate_heatmap(image, target_class=prediction)
+        heatmap_result = self.generate_heatmap(image, target_class=prediction, method=method)
         
         class_name = (
             self.class_names[prediction] 
@@ -1154,6 +1155,7 @@ def generate_explanation(
     img_size: int = 1024,
     dataset_mean: Optional[Union[np.ndarray, List[float]]] = None,
     dataset_std: Optional[Union[np.ndarray, List[float]]] = None,
+    method: str = "gradcam++",
 ) -> Dict[str, Any]:
     engine = ExplainabilityEngine(
         model,
@@ -1164,6 +1166,6 @@ def generate_explanation(
         dataset_mean=dataset_mean,
         dataset_std=dataset_std,
     )
-    return engine.explain_prediction(image, prediction, confidence)
+    return engine.explain_prediction(image, prediction, confidence, method=method)
 
 

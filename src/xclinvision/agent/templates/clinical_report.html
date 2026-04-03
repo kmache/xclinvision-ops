@@ -98,6 +98,11 @@
   /* ── Visuals ───────────────────────────────────────── */
   .visuals { display: flex; flex-wrap: wrap; gap: 20px; justify-content: center; }
   .visuals img { max-width: 420px; width: 100%; border-radius: 4px; border: 1px solid #e5e7eb; }
+  .visuals-grid { display: flex; flex-wrap: nowrap; gap: 12px; justify-content: center; align-items: flex-start; }
+  .visuals-grid .vis-card { text-align: center; flex: 1 1 0; min-width: 0; max-width: 220px; }
+  .visuals-grid .vis-card img { width: 100%; border-radius: 4px; border: 1px solid #e5e7eb; }
+  .visuals-grid .vis-card p { font-size: 11px; color: #666; margin-top: 4px; }
+
 
   /* ── Footer ────────────────────────────────────────── */
   .footer {
@@ -157,13 +162,23 @@
   <div class="section">
     <h2>Patient Information</h2>
     <div class="meta-grid">
-      {% for key, val in patient_meta.items() %}
-      <div class="meta-item"><span class="label">{{ key | replace("_"," ") | title }}:</span> {{ val }}</div>
-      {% endfor %}
-      {% if not patient_meta %}
-      <div class="meta-item" style="color:#999;">No patient metadata provided.</div>
+      {% if patient_meta %}
+        {% for key, val in patient_meta.items() %}
+        <div class="meta-item"><span class="label">{{ key | replace("_"," ") | title }}:</span> {{ val if val else 'N/A' }}</div>
+        {% endfor %}
+      {% else %}
+      <div class="meta-item"><span class="label">Patient ID:</span> N/A</div>
+      <div class="meta-item"><span class="label">Modality:</span> N/A</div>
+      <div class="meta-item"><span class="label">Body Part:</span> N/A</div>
+      <div class="meta-item"><span class="label">Clinical History:</span> N/A</div>
       {% endif %}
     </div>
+  </div>
+
+  <!-- Indication -->
+  <div class="section">
+    <h2>Indication</h2>
+    <p>{{ indication if indication else 'N/A' }}</p>
   </div>
 
   <!-- AI Findings with Calibrated Confidence -->
@@ -200,15 +215,24 @@
   {% endif %}
 
   <!-- Visual Dashboard -->
-  {% if gradcam_b64 or radar_b64 %}
+  {% if original_b64 or gradcam_b64 or scorecam_b64 or attention_b64 or radar_b64 %}
   <div class="section">
     <h2>Visual Dashboard</h2>
-    <div class="visuals">
+    <div class="visuals-grid">
+      {% if original_b64 %}
+      <div class="vis-card"><img src="data:image/png;base64,{{ original_b64 }}" alt="Original Input Image"><p>Original Input Image</p></div>
+      {% endif %}
       {% if gradcam_b64 %}
-      <div><img src="data:image/png;base64,{{ gradcam_b64 }}" alt="Grad-CAM++ Overlay"><p style="text-align:center;font-size:12px;color:#666;margin-top:4px;">Grad-CAM++ Activation Overlay</p></div>
+      <div class="vis-card"><img src="data:image/png;base64,{{ gradcam_b64 }}" alt="Grad-CAM++ Overlay"><p>Grad-CAM++ Activation Overlay</p></div>
+      {% endif %}
+      {% if scorecam_b64 %}
+      <div class="vis-card"><img src="data:image/png;base64,{{ scorecam_b64 }}" alt="Score-CAM Overlay"><p>Score-CAM Activation Overlay</p></div>
+      {% endif %}
+      {% if attention_b64 %}
+      <div class="vis-card"><img src="data:image/png;base64,{{ attention_b64 }}" alt="Attention Map"><p>Attention Map Visualization</p></div>
       {% endif %}
       {% if radar_b64 %}
-      <div><img src="data:image/png;base64,{{ radar_b64 }}" alt="Prediction Radar Chart"><p style="text-align:center;font-size:12px;color:#666;margin-top:4px;">Prediction Profile</p></div>
+      <div class="vis-card"><img src="data:image/png;base64,{{ radar_b64 }}" alt="Prediction Radar Chart"><p>Prediction Profile</p></div>
       {% endif %}
     </div>
   </div>
@@ -217,7 +241,7 @@
   <!-- Reasoning Trace -->
   <div class="section">
     <h2>Reasoning Trace</h2>
-    <div class="trace">{{ report.reasoning_trace }}</div>
+    <div class="trace">{{ report.reasoning_trace if report.reasoning_trace else 'N/A' }}</div>
   </div>
 
   <!-- Differential Diagnosis -->
@@ -235,7 +259,7 @@
   <!-- Impression & Urgency -->
   <div class="section">
     <h2>Impression</h2>
-    <p>{{ report.impression }}</p>
+    <p>{{ report.impression if report.impression else 'N/A' }}</p>
     <p style="margin-top:10px;">
       <strong>Urgency:</strong>
       {% set urg = (report.urgency | default('unknown')) | string | lower | trim %}
@@ -268,6 +292,31 @@
       <li>{{ step }}</li>
       {% endfor %}
     </ul>
+  </div>
+  {% endif %}
+
+  <!-- Additional Comments -->
+  {% if comments %}
+  <div class="section">
+    <h2>Additional Comments</h2>
+    <p style="white-space: pre-wrap;">{{ comments }}</p>
+  </div>
+  {% endif %}
+
+  <!-- Conversation Log -->
+  {% if conversation_log %}
+  <div class="section">
+    <h2>AI Conversation Log</h2>
+    {% for msg in conversation_log %}
+    <div style="margin-bottom: 10px; padding: 8px 14px; border-radius: 6px;
+      {% if msg.role|lower == 'user' %}background: #eef3f8; border-left: 3px solid #3b82f6;
+      {% else %}background: #f0fdf4; border-left: 3px solid #16a34a;{% endif %}">
+      <div style="font-size: 11px; font-weight: 700; color: #6b7280; text-transform: uppercase; margin-bottom: 2px;">
+        {{ msg.role | default('Unknown') }}
+      </div>
+      <div style="font-size: 13px; color: #1a1a1a;">{{ msg.content }}</div>
+    </div>
+    {% endfor %}
   </div>
   {% endif %}
 

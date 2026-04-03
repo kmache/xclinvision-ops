@@ -284,25 +284,55 @@ def render_llm_agent(analysis: dict):
             )
         st.session_state.llm_messages.append({"role": "user", "content": msg_text})
         st.session_state.llm_messages.append({"role": "assistant", "content": reply_text})
+        # Cap conversation history to prevent unbounded session memory growth
+        _MAX_CHAT_MESSAGES = 100
+        if len(st.session_state.llm_messages) > _MAX_CHAT_MESSAGES:
+            st.session_state.llm_messages = st.session_state.llm_messages[-_MAX_CHAT_MESSAGES:]
         if suggested_followups:
             st.session_state["_suggested_followups"] = suggested_followups
         st.rerun()
 
-    # Quick-action buttons (functional — inject into chat)
-    chip_labels = [
-        ("🔍 Explain the heatmap", "Explain the heatmap"),
-        ("📋 Proposed next steps", "What are the proposed next steps?"),
-        ("⚠️ Is this urgent?", "Is this urgent? Assess the clinical urgency."),
-        ("🤔 What could this mean?", "Explain this prediction in detail."),
+    chips = [
+        ("Explain the heatmap",  "#2563eb"),
+        ("Proposed next steps",  "#16a34a"),
+        ("Is this urgent?",       "#ea580c"),
+        ("What could this mean?", "#7c3aed"),
     ]
-    cols = st.columns(len(chip_labels))
-    for col, (label, msg) in zip(cols, chip_labels):
-        with col:
-            if st.button(label, key=f"chip_{label}", use_container_width=True):
-                st.session_state["_pending_chat_msg"] = msg
-                st.rerun()
 
-    # Show suggested follow-ups from last response
+    chip_css_rules = ""
+    for i, (label, color) in enumerate(chips):
+        btn_key = f"chip_{i}"
+        chip_css_rules += (
+            f'div[data-testid="stHorizontalBlock"] button[kind="secondary"]:has(p:is(:only-child)) '
+            f'{{ /* fallback */ }}\n'
+        )
+
+        chip_css_rules += (
+            f'div.chip-row > div:nth-child({i + 1}) button {{'
+            f'  background: {color} !important;'
+            f'  color: white !important;'
+            f'  border: none !important;'
+            f'  border-radius: 14px !important;'
+            f'  padding: 5px 10px !important;'
+            f'  font-size: 11px !important;'
+            f'  font-weight: 600 !important;'
+            f'  height: auto !important;'
+            f'  min-height: 0 !important;'
+            f'}}\n'
+        )
+
+    st.markdown(f"<style>{chip_css_rules}</style>", unsafe_allow_html=True)
+
+    st.markdown('<div class="chip-row">', unsafe_allow_html=True)
+    chip_cols = st.columns(len(chips))
+    for i, (label, color) in enumerate(chips):
+        with chip_cols[i]:
+            if st.button(label, key=f"chip_{i}", use_container_width=True):
+                st.session_state["_pending_chat_msg"] = label
+                st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.caption("Click a chip to ask the AI assistant.")
+
     followups = st.session_state.get("_suggested_followups", [])
     if followups:
         st.markdown(
@@ -316,6 +346,43 @@ def render_llm_agent(analysis: dict):
                     st.session_state["_pending_chat_msg"] = ftext
                     st.session_state.pop("_suggested_followups", None)
                     st.rerun()
+
+    # ── Conversation export actions ───────────────────────────────────
+    if st.session_state.llm_messages:
+        st.markdown(
+            f'<div style="border-top:1px solid #333;margin:8px 0 6px 0;"></div>',
+            unsafe_allow_html=True,
+        )
+        conv_col1, conv_col2 = st.columns(2)
+        with conv_col1:
+            if st.button("📋 Copy Conversation", key="btn_copy_conv", use_container_width=True):
+                conv_text = _format_conversation_text(st.session_state.llm_messages)
+                st.session_state["_clipboard_conversation"] = conv_text
+                st.toast("Conversation copied to clipboard!", icon="📋")
+        with conv_col2:
+            if st.button("📝 Send to Report", key="btn_send_to_report", use_container_width=True):
+                conv_text = _format_conversation_text(st.session_state.llm_messages)
+                st.session_state["_conversation_for_report"] = conv_text
+                st.toast("Conversation sent to Report page!", icon="📝")
+
+        # Show copyable text area if clipboard was triggered
+        if st.session_state.get("_clipboard_conversation"):
+            st.text_area(
+                "Conversation text (select all & copy)",
+                value=st.session_state["_clipboard_conversation"],
+                height=120,
+                key="conv_clipboard_area",
+            )
+
+
+def _format_conversation_text(messages: list) -> str:
+    """Format chat messages into a clean text block for export."""
+    lines = []
+    for msg in messages:
+        role = msg.get("role", "unknown").capitalize()
+        content = msg.get("content", "")
+        lines.append(f"[{role}]: {content}")
+    return "\n\n".join(lines)
 
 
 def _submit_feedback(analysis: dict, feedback_type: str):
@@ -360,14 +427,14 @@ def render():
         st.subheader("Input")
         with st.container(border=True):
             uploaded_file = st.file_uploader(
-                "Upload DICOM/PNG/JPG", type=["png", "jpg", "jpeg", "dcm"],
+                "Upload DICOM/PNG/JPG", type=["png", "jpg", "jpeg", "dcm", "dicom"],
             )
             c1, c2 = st.columns(2)
             pt_id = c1.text_input("Patient ID", value="", placeholder="P-XXXX-XXXX")
             age = c2.number_input("Age", value=0, min_value=0, max_value=120)
 
             c3, c4 = st.columns(2)
-            sex = c3.selectbox("Sex", ["M", "F", "Other"])
+            sex = c3.selectbox("Sex", ["Male", "Female", "Other"])
             study_date = c4.date_input("Study date", value=datetime.date.today())
 
             c5, c6 = st.columns(2)
@@ -518,7 +585,9 @@ def render():
                     with ec1b:
                         heatmap_threshold = st.slider("Threshold", 0.0, 1.0, 0.5, 0.05, key="xai_threshold")
                 with ec2:
-                    xai_method = st.selectbox("XAI Method", ["gradcam++", "attention_rollout"], key="xai_method")
+                    xai_method = st.selectbox("XAI Method", ["gradcam++", "scorecam", "attention_rollout"], key="xai_method")
+                    if xai_method == "scorecam":
+                        st.caption("⏳ Score-CAM is gradient-free but slower — may take a few seconds.")
                     colormap = st.selectbox("Colormap", ["jet", "viridis", "plasma", "hot"], key="xai_colormap")
                     regenerate = st.button("🔄 Regenerate Heatmap", width='stretch')
 
@@ -530,10 +599,12 @@ def render():
                     t2.image(_b64_to_image(analysis["heatmap_gradcam"]), caption="Heatmap", width='stretch')
 
                 if regenerate and client and analysis_id:
+                    selected_finding = st.session_state.get("xai_finding")
                     with st.spinner("Regenerating heatmap..."):
                         resp = client.get_explanation(
                             analysis_id=analysis_id, method=xai_method,
                             threshold=heatmap_threshold, opacity=heatmap_opacity,
+                            colormap=colormap, finding=selected_finding,
                         )
                         if resp:
                             if resp.get("overlay"):

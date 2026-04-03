@@ -127,7 +127,7 @@ class AnalysisResponse(BaseModel):
 class ExplanationParams(BaseModel):
     """Parameters for regenerating XAI heatmaps with adjustable settings."""
     analysis_id: str
-    method: Literal["gradcam++", "lime", "integrated_gradients", "attention_rollout"] = "gradcam++"
+    method: Literal["gradcam++", "scorecam", "lime", "integrated_gradients", "attention_rollout"] = "gradcam++"
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     opacity: float = Field(default=0.6, ge=0.0, le=1.0)
     colormap: str = "jet"
@@ -193,7 +193,11 @@ class PatientHistoryEntry(BaseModel):
 
 
 class ExportReportRequest(BaseModel):
-    """Request to export a self-contained HTML clinical report."""
+    """Request to export a clinical report in HTML, PDF, or JSON format."""
     analysis_id: str
+    format: Literal["html", "pdf", "json"] = "html"
     include_xai: bool = True
     include_uncertainty: bool = True
+    indication: str = ""
+    comments: str = ""
+    conversation_log: Optional[List[Dict[str, str]]] = None

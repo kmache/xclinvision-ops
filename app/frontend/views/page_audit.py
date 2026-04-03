@@ -8,10 +8,8 @@ import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as _components
 
 from config import CLASS_NAMES
 from styles import COLORS
@@ -106,14 +104,6 @@ def _load_model_card_text() -> str:
 # ---------------------------------------------------------------------------
 
 def render():
-    if "_audit_tab_init" not in st.session_state:
-        st.session_state["_audit_tab_init"] = True
-        _components.html(
-            '<script>setTimeout(function(){var t=window.parent.document.querySelectorAll('
-            '\'button[data-baseweb="tab"]\');if(t&&t.length>1){t[1].click();}},350);</script>',
-            height=0,
-        )
-
     st.markdown(
         f'<div style="text-align:center;margin-bottom:28px;">'
         f'<h1 style="color:{COLORS["highlight"]};font-size:2.2rem;font-weight:800;'

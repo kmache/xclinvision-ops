@@ -46,6 +46,7 @@ DRIFT_TIMEOUT: Final = 15.0
 MODEL_CARD_TIMEOUT: Final = 10.0
 FEEDBACK_STATS_TIMEOUT: Final = 10.0
 EXPORT_REPORT_TIMEOUT: Final = 30.0
+COMPARE_TIMEOUT: Final = 240.0         # two images analysed sequentially
 
 # ==============================================================================
 # 2. CLASS LABELS & COLOURS
@@ -116,6 +117,7 @@ class Endpoints:
     MODEL_CARD = "/api/v2/model-card"
     FEEDBACK_STATS = "/api/v2/feedback-stats"
     EXPORT_REPORT = "/api/v2/export-report"
+    COMPARE = "/api/v2/compare"
 
     @classmethod
     def url(cls, endpoint: str, **params) -> str:

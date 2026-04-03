@@ -21,6 +21,16 @@ from styles import COLORS
 FINDINGS = [c for c in CLASS_NAMES if c != "No finding"]
 THRESHOLD = 0.50
 
+# Available models — same as page_inference
+_MODELS = {
+    "ViT-Base (best — F1 0.59, AUC 0.925)": "vit_base",
+    "ConvNeXt-Small (F1 0.55, AUC 0.901)": "convnext_small",
+    "EfficientNet-B0 (F1 0.54, AUC 0.902)": "efficientnet_b0",
+    "DenseNet-121 (F1 0.52, AUC 0.890)": "densenet",
+}
+
+_XAI_METHODS = ["gradcam++", "scorecam", "attention_rollout"]
+
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
@@ -179,6 +189,21 @@ def render() -> None:
         f'Compare current exam with previous exams for the same patient.</p></div>',
         unsafe_allow_html=True,
     )
+
+    tab_history, tab_manual = st.tabs(["📊 Patient History", "📤 Manual Comparison"])
+
+    with tab_history:
+        _render_patient_history(client)
+
+    with tab_manual:
+        _render_manual_comparison(client)
+
+
+# ---------------------------------------------------------------------------
+# Tab 1: Patient History (existing functionality)
+# ---------------------------------------------------------------------------
+
+def _render_patient_history(client) -> None:
 
     # --- Study selection bar --------------------------------------------------
     sel1, sel2 = st.columns([2, 1])
@@ -361,6 +386,177 @@ def render() -> None:
             unsafe_allow_html=True,
         )
         _card_end()
+
+    # Footer
+    st.markdown(
+        f'<div style="margin-top:20px;padding:10px 16px;border-top:1px solid {COLORS["border"]};'
+        f'font-size:11px;color:{COLORS["neutral"]};text-align:center;">'
+        f'These AI-generated findings are intended to assist — not replace — clinical judgement. '
+        f'Always correlate with clinical presentation and consult a qualified radiologist.</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tab 2: Manual Comparison — upload two images directly
+# ---------------------------------------------------------------------------
+
+def _render_manual_comparison(client) -> None:
+    st.markdown(
+        f'<p style="color:{COLORS["neutral"]};font-size:14px;margin-bottom:16px;">'
+        f'Upload two chest X-ray images to run a side-by-side AI comparison with '
+        f'XAI heatmaps and a pixel-level difference map.</p>',
+        unsafe_allow_html=True,
+    )
+
+    # --- Upload row -----------------------------------------------------------
+    up_a, up_b = st.columns(2)
+    with up_a:
+        _card_start("Image A")
+        file_a = st.file_uploader(
+            "Upload Image A", type=["jpg", "jpeg", "png", "bmp", "tiff"],
+            key="manual_cmp_file_a", label_visibility="collapsed",
+        )
+        if file_a:
+            st.image(file_a, caption=file_a.name, width='stretch')
+        _card_end()
+
+    with up_b:
+        _card_start("Image B")
+        file_b = st.file_uploader(
+            "Upload Image B", type=["jpg", "jpeg", "png", "bmp", "tiff"],
+            key="manual_cmp_file_b", label_visibility="collapsed",
+        )
+        if file_b:
+            st.image(file_b, caption=file_b.name, width='stretch')
+        _card_end()
+
+    # --- Options row ----------------------------------------------------------
+    opt1, opt2, opt3 = st.columns([3, 3, 2])
+    with opt1:
+        model_label = st.selectbox("Model", list(_MODELS.keys()), index=0,
+                                   key="manual_cmp_model")
+        model_name = _MODELS[model_label]
+    with opt2:
+        xai_method = st.selectbox("XAI Method", _XAI_METHODS, index=0,
+                                  key="manual_cmp_xai")
+    with opt3:
+        st.markdown("<div style='height:27px'></div>", unsafe_allow_html=True)
+        both_uploaded = file_a is not None and file_b is not None
+        compare_btn = st.button(
+            "🔬 Compare", type="primary", width='stretch',
+            disabled=(not both_uploaded or client is None),
+            key="manual_cmp_btn",
+        )
+
+    if not both_uploaded:
+        st.info("Upload both images above, then click **Compare** to run the analysis.")
+
+    # --- Run comparison -------------------------------------------------------
+    if compare_btn and both_uploaded and client:
+        file_a.seek(0)
+        file_b.seek(0)
+        bytes_a = file_a.read()
+        bytes_b = file_b.read()
+
+        with st.spinner("Running AI analysis on both images — this may take a moment..."):
+            result = client.compare_images(
+                file_a_bytes=bytes_a, filename_a=file_a.name,
+                file_b_bytes=bytes_b, filename_b=file_b.name,
+                model_name=model_name, xai_method=xai_method,
+            )
+
+        if not result:
+            st.error("Comparison failed. Check backend connectivity and try again.")
+            return
+
+        st.session_state["manual_cmp_result"] = result
+
+    # --- Display results ------------------------------------------------------
+    result = st.session_state.get("manual_cmp_result")
+    if result is None:
+        return
+
+    analysis_a = result["image_a"]
+    analysis_b = result["image_b"]
+
+    st.markdown(
+        f"<div style='border-top:1px solid {COLORS['border']};margin:16px 0;'></div>",
+        unsafe_allow_html=True,
+    )
+
+    df_a = _predictions_from_analysis(analysis_a)
+    df_b = _predictions_from_analysis(analysis_b)
+
+    img_a_b64 = analysis_a.get("heatmap_overlay") or analysis_a.get("thumbnail")
+    img_b_b64 = analysis_b.get("heatmap_overlay") or analysis_b.get("thumbnail")
+    img_a = _b64_to_image(img_a_b64) if img_a_b64 else None
+    img_b = _b64_to_image(img_b_b64) if img_b_b64 else None
+
+    col_a, col_b, col_d = st.columns(3)
+
+    with col_a:
+        _card_start("Image A — Analysis")
+        if img_a is not None:
+            st.image(img_a, width='stretch')
+        else:
+            st.info("No heatmap available")
+        st.markdown(
+            f'<div style="font-size:13px;color:{COLORS["text"]};margin:6px 0 4px 0;">'
+            f'<b>Prediction:</b> {analysis_a["prediction"]} '
+            f'({analysis_a["confidence"]:.1%})</div>',
+            unsafe_allow_html=True,
+        )
+        _render_prediction_table(df_a)
+        _card_end()
+
+    with col_b:
+        _card_start("Image B — Analysis")
+        if img_b is not None:
+            st.image(img_b, width='stretch')
+        else:
+            st.info("No heatmap available")
+        st.markdown(
+            f'<div style="font-size:13px;color:{COLORS["text"]};margin:6px 0 4px 0;">'
+            f'<b>Prediction:</b> {analysis_b["prediction"]} '
+            f'({analysis_b["confidence"]:.1%})</div>',
+            unsafe_allow_html=True,
+        )
+        _render_prediction_table(df_b)
+        _card_end()
+
+    with col_d:
+        _card_start("Difference Map")
+        if img_a is not None and img_b is not None:
+            sl1, sl2 = st.columns(2)
+            with sl1:
+                dt = st.slider("Diff Threshold", 0.0, 1.0, 0.1, 0.05,
+                               key="manual_diff_threshold")
+            with sl2:
+                do = st.slider("Diff Opacity", 0.0, 1.0, 0.6, 0.05,
+                               key="manual_diff_opacity")
+            diff_map = compute_difference_map(img_a, img_b, dt, do)
+            st.image(diff_map, width='stretch')
+            st.markdown(
+                f'<div style="display:flex;gap:18px;margin-top:8px;font-size:13px;'
+                f'color:{COLORS["neutral"]};">'
+                f'<span><span style="color:{COLORS["danger"]};font-weight:700;">■ Red</span>'
+                f' = Increase</span>'
+                f'<span><span style="color:#4a90d9;font-weight:700;">■ Blue</span>'
+                f' = Decrease</span></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info("Heatmaps unavailable for difference map.")
+        _card_end()
+
+    # --- Timing info ----------------------------------------------------------
+    st.markdown(
+        f'<div style="margin-top:8px;font-size:12px;color:{COLORS["neutral"]};text-align:center;">'
+        f'Image A: {analysis_a.get("inference_time_ms", 0):.0f} ms &nbsp;|&nbsp; '
+        f'Image B: {analysis_b.get("inference_time_ms", 0):.0f} ms</div>',
+        unsafe_allow_html=True,
+    )
 
     # Footer
     st.markdown(

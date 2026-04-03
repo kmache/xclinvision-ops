@@ -223,6 +223,8 @@ class InferencePipeline:
         image: Union[np.ndarray, str, Image.Image],
         return_uncertainty: bool = True,
         return_explanation: bool = True,
+        xai_method: str = "gradcam++",
+        target_class: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Run full inference on a single image.
 
@@ -278,15 +280,17 @@ class InferencePipeline:
             result["uncertainty_level"] = self._get_uncertainty_level(uncertainty)
 
         if return_explanation:
+            xai_target = target_class if target_class is not None else pred_class
             exp_res = generate_explanation(
                 model=self.model,
                 image=vis_image,
-                prediction=pred_class,
+                prediction=xai_target,
                 confidence=confidence,
                 class_names=self.class_names,
                 architecture=self.architecture,
                 device=str(self.device),
                 img_size=self.image_size,
+                method=xai_method,
             )
             result["explanation"] = exp_res
 
@@ -468,6 +472,7 @@ def predict(
     temperature_scaler: Optional[TemperatureScaler] = None,
     return_uncertainty: bool = True,
     return_explanation: bool = True,
+    xai_method: str = "gradcam++",
 ) -> Dict[str, Any]:
     """Stateless convenience wrapper around InferencePipeline.
 
@@ -500,4 +505,5 @@ def predict(
         image,
         return_uncertainty=return_uncertainty,
         return_explanation=return_explanation,
+        xai_method=xai_method,
     )

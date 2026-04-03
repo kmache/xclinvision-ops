@@ -168,13 +168,20 @@ class XClinVisionClient:
         method: str = "gradcam++",
         threshold: float = 0.5,
         opacity: float = 0.6,
+        colormap: str = "jet",
+        finding: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Regenerate XAI heatmap with adjustable parameters.
 
         Endpoint: GET /api/v2/explain/{analysis_id}
         """
         url = Endpoints.url(Endpoints.EXPLAIN, analysis_id=analysis_id)
-        params = {"method": method, "threshold": threshold, "opacity": opacity}
+        params: Dict[str, Any] = {
+            "method": method, "threshold": threshold,
+            "opacity": opacity, "colormap": colormap,
+        }
+        if finding:
+            params["finding"] = finding
         return self._get(url, params=params, timeout=EXPLAIN_TIMEOUT)
 
     def send_chat_message(
@@ -220,6 +227,28 @@ class XClinVisionClient:
     # ==================================================================
     # 3. HISTORICAL COMPARISON  (page_history)
     # ==================================================================
+    def compare_images(
+        self,
+        file_a_bytes: bytes,
+        filename_a: str,
+        file_b_bytes: bytes,
+        filename_b: str,
+        model_name: str = "convnext_small",
+        xai_method: str = "gradcam++",
+    ) -> Optional[Dict[str, Any]]:
+        """Upload two images and return side-by-side analysis.
+
+        Endpoint: POST /api/v2/compare
+        """
+        from config import COMPARE_TIMEOUT
+        url = Endpoints.url(Endpoints.COMPARE)
+        files = {
+            "file_a": (filename_a, file_a_bytes, "image/jpeg"),
+            "file_b": (filename_b, file_b_bytes, "image/jpeg"),
+        }
+        data = {"model_name": model_name, "xai_method": xai_method}
+        return self._post_multipart(url, files=files, data=data, timeout=COMPARE_TIMEOUT)
+
     def get_patient_history(self, patient_id: str) -> Optional[List[Dict[str, Any]]]:
         """Fetch a patient's historical analysis timeline.
 
@@ -285,6 +314,9 @@ class XClinVisionClient:
         analysis_id: str,
         include_xai: bool = True,
         include_uncertainty: bool = True,
+        indication: str = "",
+        comments: str = "",
+        conversation_log: list | None = None,
     ) -> Optional[Dict[str, Any]]:
         """Export a self-contained HTML clinical report.
 
@@ -293,6 +325,54 @@ class XClinVisionClient:
         url = Endpoints.url(Endpoints.EXPORT_REPORT)
         payload = {
             "analysis_id": analysis_id,
+            "format": "html",
+            "include_xai": include_xai,
+            "include_uncertainty": include_uncertainty,
+            "indication": indication,
+            "comments": comments,
+            "conversation_log": conversation_log or [],
+        }
+        return self._post_json(url, json_data=payload, timeout=EXPORT_REPORT_TIMEOUT)
+
+    def export_report_pdf(
+        self,
+        analysis_id: str,
+        include_xai: bool = True,
+        include_uncertainty: bool = True,
+        indication: str = "",
+        comments: str = "",
+        conversation_log: list | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Export a clinical report as PDF (base64-encoded).
+
+        Endpoint: POST /api/v2/export-report
+        """
+        url = Endpoints.url(Endpoints.EXPORT_REPORT)
+        payload = {
+            "analysis_id": analysis_id,
+            "format": "pdf",
+            "include_xai": include_xai,
+            "include_uncertainty": include_uncertainty,
+            "indication": indication,
+            "comments": comments,
+            "conversation_log": conversation_log or [],
+        }
+        return self._post_json(url, json_data=payload, timeout=EXPORT_REPORT_TIMEOUT)
+
+    def export_report_json(
+        self,
+        analysis_id: str,
+        include_xai: bool = True,
+        include_uncertainty: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Export a structured JSON clinical report.
+
+        Endpoint: POST /api/v2/export-report
+        """
+        url = Endpoints.url(Endpoints.EXPORT_REPORT)
+        payload = {
+            "analysis_id": analysis_id,
+            "format": "json",
             "include_xai": include_xai,
             "include_uncertainty": include_uncertainty,
         }
@@ -370,19 +450,26 @@ class XClinVisionClient:
             response.raise_for_status()
 
             event_type = "message"
+            data_lines: list[str] = []
             for line in response.iter_lines(decode_unicode=True):
-                if not line:
+                if line == "":
+                    # Empty line = end of SSE frame → dispatch accumulated data
+                    if data_lines:
+                        data_str = "\n".join(data_lines)
+                        data_lines = []
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            data = {"raw": data_str}
+                        yield {"event": event_type, "data": data}
+                        event_type = "message"
                     continue
                 if line.startswith("event: "):
                     event_type = line[7:].strip()
                 elif line.startswith("data: "):
-                    data_str = line[6:]
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        data = {"raw": data_str}
-                    yield {"event": event_type, "data": data}
-                    event_type = "message"
+                    data_lines.append(line[6:])
+                elif line.startswith("data:"):
+                    data_lines.append(line[5:])
         except Exception as e:
             logger.warning("Streaming chat failed (%s), falling back to sync", e)
             result = self.send_chat_message(

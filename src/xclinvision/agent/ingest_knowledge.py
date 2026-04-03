@@ -50,7 +50,11 @@ import tiktoken
 import pandas as pd
 import pydicom
 from PIL import Image
-import pytesseract
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None  # OCR optional; only needed for image-based ingestion
 
 # ── Optional PDF backends (lazy) ──
 # Primary: unstructured (hi-res, handles tables).  Fallback: pypdf / pdfplumber.
@@ -82,7 +86,7 @@ except ImportError:
     BeautifulSoup = None  # type: ignore[assignment,misc]
     BS4_AVAILABLE = False
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 logging.basicConfig(
     level=logging.INFO,
@@ -521,6 +525,9 @@ def load_dicom(file_path: Path) -> List[ClinicalDocument]:
 
 def load_image(file_path: Path) -> List[ClinicalDocument]:
     try:
+        if pytesseract is None:
+            logger.debug("pytesseract not installed — skipping OCR for %s", file_path)
+            return []
         img = Image.open(file_path)
         text = pytesseract.image_to_string(img).strip()
         if len(text) > 20:
@@ -876,7 +883,7 @@ def run_validation(retriever: HybridRetriever) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build clinical KB.")
     parser.add_argument("--reports-dir", type=Path, default=PROJECT_ROOT / "NLMCXR_reports/ecgen-radiology")
-    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "data/vectorstore")
+    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "data/vector_db")
     parser.add_argument("--embedding-model", type=str, default="BAAI/bge-m3")
     parser.add_argument("--collection-name", type=str, default="clinical_knowledge")
     parser.add_argument("--data-dirs", type=Path, nargs="*", default=[])

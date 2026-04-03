@@ -206,7 +206,8 @@ def _default_call_llm(system: str, user: str, *, temperature: float = 0.2) -> st
     """Call an OpenAI-compatible chat model.
 
     Uses ``OPENAI_API_KEY`` and optionally ``OPENAI_MODEL`` / ``OPENAI_API_BASE``
-    from environment variables.
+    from environment variables.  Falls back to ``gpt-4o-mini`` if the primary
+    model is unavailable.
 
     Attempts ``response_format={"type": "json_object"}`` first (supported by
     OpenAI / compatible providers).  If the provider rejects it, falls back
@@ -217,11 +218,14 @@ def _default_call_llm(system: str, user: str, *, temperature: float = 0.2) -> st
     except ImportError as exc:
         raise ImportError("Install the 'openai' package: pip install openai") from exc
 
+    from xclinvision.agent.llm_provider import _completion_tokens_kwarg
+
     client = OpenAI(
         api_key=os.environ.get("OPENAI_API_KEY", ""),
         base_url=os.environ.get("OPENAI_API_BASE"),
     )
-    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    model = os.environ.get("OPENAI_MODEL", "gpt-5.4-nano")
+    fallback_model = "gpt-4o-mini"
 
     messages = [
         {"role": "system", "content": system},
@@ -234,6 +238,7 @@ def _default_call_llm(system: str, user: str, *, temperature: float = 0.2) -> st
             model=model,
             messages=messages,
             temperature=temperature,
+            **_completion_tokens_kwarg(model),
             response_format={"type": "json_object"},
         )
         return response.choices[0].message.content or ""
@@ -247,20 +252,26 @@ def _default_call_llm(system: str, user: str, *, temperature: float = 0.2) -> st
         )
 
     # Fallback: plain completion → regex-extract the first JSON object.
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-    )
-    raw = response.choices[0].message.content or ""
-
-    # Try to extract a JSON object from the free-form response.
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
-        return match.group()
-    # If no JSON found, return the raw text and let the caller handle parsing.
-    logger.warning("No JSON object found in fallback LLM response; returning raw text.")
-    return raw
+    # Try primary model first, then fallback model.
+    for m in (model, fallback_model):
+        try:
+            response = client.chat.completions.create(
+                model=m,
+                messages=messages,
+                temperature=temperature,
+                **_completion_tokens_kwarg(m),
+            )
+            raw = response.choices[0].message.content or ""
+            if m != model:
+                logger.info("_default_call_llm succeeded with fallback model '%s'", m)
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            return match.group() if match else raw
+        except Exception as exc:
+            if m == model:
+                logger.warning("Primary model '%s' failed: %s. Trying fallback '%s'.", m, exc, fallback_model)
+            else:
+                logger.warning("No JSON object found in fallback LLM response; returning raw text.")
+                raise
 
 
 # ════════════════════════════════════════════════════════════════════════════════

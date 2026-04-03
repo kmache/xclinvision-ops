@@ -126,6 +126,15 @@ def _build_predictions_list() -> list[dict]:
     ]
 
 
+def _build_conversation_log() -> list[dict]:
+    """Build a structured conversation log from LLM chat messages in session state."""
+    messages = st.session_state.get("llm_messages", [])
+    return [
+        {"role": msg.get("role", "unknown").capitalize(), "content": msg.get("content", "")}
+        for msg in messages
+    ]
+
+
 # ==============================================================================
 # Section renderers
 # ==============================================================================
@@ -249,9 +258,14 @@ def render_structured_editor() -> str:
         f"Indication</span>",
         unsafe_allow_html=True,
     )
+    if "report_indication" not in st.session_state:
+        st.session_state["report_indication"] = _build_indication()
+    # Apply pending AI-generated indication if available
+    pending_ind = st.session_state.pop("_pending_report_indication", None)
+    if pending_ind:
+        st.session_state["report_indication"] = pending_ind
     indication = st.text_area(
         "Indication text",
-        value=st.session_state.get("report_indication", _build_indication()),
         height=110,
         key="report_indication",
         label_visibility="collapsed",
@@ -273,9 +287,14 @@ def render_impression_section() -> tuple[str, str]:
             f"Current exam</span>",
             unsafe_allow_html=True,
         )
+        if "report_impression" not in st.session_state:
+            st.session_state["report_impression"] = _build_impression()
+        # Apply pending AI-generated impression if available
+        pending_imp = st.session_state.pop("_pending_report_impression", None)
+        if pending_imp:
+            st.session_state["report_impression"] = pending_imp
         impression = st.text_area(
             "Impression text",
-            value=st.session_state.get("report_impression", _build_impression()),
             height=260,
             key="report_impression",
             label_visibility="collapsed",
@@ -291,9 +310,10 @@ def render_impression_section() -> tuple[str, str]:
         f"Additional comments</span>",
         unsafe_allow_html=True,
     )
+    if "report_comments" not in st.session_state:
+        st.session_state["report_comments"] = ""
     comments = st.text_area(
         "Additional comments",
-        value=st.session_state.get("report_comments", ""),
         height=80,
         placeholder="Additional comments",
         key="report_comments",
@@ -390,29 +410,58 @@ def render_report_preview(
                 st.toast("No API connection. Using manual text.", icon="⚠️")
     with btn3:
         export_col1, export_col2, export_col3 = st.columns(3)
+
+        # ── Trigger generation on button press, stash in session state ──
         with export_col1:
-            if st.button("Export HTML", width='stretch'):
+            if st.button("Export HTML", width='stretch', disabled=not analysis_id):
                 client = st.session_state.get("api_client")
                 if client and analysis_id:
-                    with st.spinner("Generating HTML report…"):
-                        result = client.export_report_html(analysis_id=analysis_id)
-                    if result and result.get("html"):
-                        st.download_button(
-                            "⬇ Download HTML",
-                            data=result["html"],
-                            file_name=f"clinical_report_{analysis_id[:8]}.html",
-                            mime="text/html",
-                            key="download_html_report",
+                    conv_log = _build_conversation_log()
+                    with st.spinner("Generating HTML…"):
+                        result = client.export_report_html(
+                            analysis_id=analysis_id,
+                            indication=indication,
+                            comments=comments,
+                            conversation_log=conv_log,
                         )
-                        st.toast("HTML report generated.", icon="✅")
+                    if result and result.get("html"):
+                        st.session_state["_export_html"] = result["html"]
+                        st.session_state["_export_html_fname"] = (
+                            f"clinical_report_{analysis_id[:8]}.html"
+                        )
+                        st.toast("HTML report ready — click download.", icon="✅")
+                        st.rerun()
                     else:
                         st.toast("HTML export failed.", icon="⚠️")
-                else:
-                    st.toast("No API connection.", icon="⚠️")
+
         with export_col2:
-            if st.button("Export PDF", width='stretch'):
-                st.toast("PDF export triggered. Use your browser's print dialog.", icon="📄")
+            if st.button("Export PDF", width='stretch', disabled=not analysis_id):
+                client = st.session_state.get("api_client")
+                if client and analysis_id:
+                    conv_log = _build_conversation_log()
+                    with st.spinner("Generating PDF…"):
+                        result = client.export_report_pdf(
+                            analysis_id=analysis_id,
+                            indication=indication,
+                            comments=comments,
+                            conversation_log=conv_log,
+                        )
+                    if result and result.get("pdf_base64"):
+                        import base64 as b64mod
+                        st.session_state["_export_pdf"] = b64mod.b64decode(
+                            result["pdf_base64"]
+                        )
+                        st.session_state["_export_pdf_fname"] = (
+                            f"clinical_report_{analysis_id[:8]}.pdf"
+                        )
+                        st.toast("PDF report ready — click download.", icon="✅")
+                        st.rerun()
+                    else:
+                        st.toast("PDF export failed.", icon="⚠️")
+
         with export_col3:
+            # Build JSON payload from local fields + analysis data
+            conv_log = _build_conversation_log()
             payload = json.dumps(
                 {
                     "patient_id": patient_id,
@@ -423,6 +472,7 @@ def render_report_preview(
                     "impression": impression,
                     "comments": comments,
                     "predictions": analysis.get("top_k_predictions", []),
+                    "conversation_log": conv_log,
                     "generated_at": datetime.now().isoformat(),
                 },
                 indent=2,
@@ -434,6 +484,45 @@ def render_report_preview(
                 mime="application/json",
                 width='stretch',
             )
+
+    # ── Persistent download buttons for stashed exports ──────────────
+    _show_downloads = []
+    if st.session_state.get("_export_html"):
+        _show_downloads.append("html")
+    if st.session_state.get("_export_pdf"):
+        _show_downloads.append("pdf")
+
+    if _show_downloads:
+        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+        dl_cols = st.columns(len(_show_downloads))
+        col_idx = 0
+        if "html" in _show_downloads:
+            with dl_cols[col_idx]:
+                st.download_button(
+                    "⬇ Download HTML Report",
+                    data=st.session_state["_export_html"],
+                    file_name=st.session_state.get(
+                        "_export_html_fname", "clinical_report.html"
+                    ),
+                    mime="text/html",
+                    key="dl_html_report",
+                    type="primary",
+                    width="stretch",
+                )
+            col_idx += 1
+        if "pdf" in _show_downloads:
+            with dl_cols[col_idx]:
+                st.download_button(
+                    "⬇ Download PDF Report",
+                    data=st.session_state["_export_pdf"],
+                    file_name=st.session_state.get(
+                        "_export_pdf_fname", "clinical_report.pdf"
+                    ),
+                    mime="application/pdf",
+                    key="dl_pdf_report",
+                    type="primary",
+                    width="stretch",
+                )
 
     # Footer disclaimer
     st.markdown(
@@ -467,6 +556,13 @@ def render() -> None:
         pending_key = f"_pending_{field}"
         if pending_key in st.session_state:
             st.session_state[field] = st.session_state.pop(pending_key)
+
+    # ── Inject conversation from Inference page if sent ───────────────
+    if "_conversation_for_report" in st.session_state:
+        conv = st.session_state.pop("_conversation_for_report")
+        existing = st.session_state.get("report_comments", "")
+        separator = "\n\n--- AI Conversation ---\n" if existing.strip() else ""
+        st.session_state["report_comments"] = existing + separator + conv
 
     patient_id, study = render_header()
     st.session_state["report_patient_id"] = patient_id

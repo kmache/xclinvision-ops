@@ -9,6 +9,13 @@ import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load .env before anything reads environment variables.
+# In Docker the env vars come from docker-compose; .env acts as local fallback.
+_env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+load_dotenv(_env_path, override=False)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -244,8 +251,7 @@ _agent_lock = threading.Lock()
 _reasoning_agent_instance = None
 _reasoning_agent_lock = threading.Lock()
 
-# Per-analysis session memory for the dialogue manager
-_session_memory_store: Dict[str, Any] = {}
+
 
 
 def _get_agent():
@@ -278,7 +284,6 @@ def _get_reasoning_agent():
                 logger.warning("Failed to initialise reasoning agent: %s", exc)
                 raise HTTPException(503, detail=f"Reasoning agent unavailable: {exc}")
     return _reasoning_agent_instance
-    return _agent_instance
 
 # ---------------------------------------------------------------------------
 
@@ -627,7 +632,7 @@ async def submit_feedback(feedback: FeedbackRequest):
         "timestamp": datetime.now().isoformat(),
         **feedback.dict(),
     }
-    _feedback_store.append(feedback_entry)
+    _feedback_store_append(feedback_entry)
     logger.info(
         "Feedback received: id=%s, type=%s, prediction=%s, correct=%s",
         feedback_entry["feedback_id"],
@@ -690,9 +695,27 @@ async def get_metrics():
 # Dashboard v2: In-memory storage (replace with SQLite/Postgres in prod)
 # ---------------------------------------------------------------------------
 
+_ANALYSIS_STORE_MAX = 5000
+_FEEDBACK_STORE_MAX = 10000
+
 _analysis_store: Dict[str, dict] = {}   
 _feedback_store: List[dict] = []         
 _image_store: Dict[str, bytes] = {}    
+
+
+def _analysis_store_put(analysis_id: str, data: dict) -> None:
+    """Insert into _analysis_store with FIFO eviction capped at _ANALYSIS_STORE_MAX."""
+    if len(_analysis_store) >= _ANALYSIS_STORE_MAX:
+        oldest_key = next(iter(_analysis_store))
+        del _analysis_store[oldest_key]
+    _analysis_store[analysis_id] = data
+
+
+def _feedback_store_append(entry: dict) -> None:
+    """Append to _feedback_store, trimming oldest when over _FEEDBACK_STORE_MAX."""
+    _feedback_store.append(entry)
+    while len(_feedback_store) > _FEEDBACK_STORE_MAX:
+        _feedback_store.pop(0)
 
 def _image_store_put(analysis_id: str, data: bytes) -> None:
     """Insert into _image_store with FIFO eviction capped at _IMAGE_STORE_MAX.
@@ -754,6 +777,7 @@ async def analyze_image(
     body_part: str = Form(default="Chest"),
     clinical_history: str = Form(default=""),
     model_name: str = Form(default="convnext_small"),
+    xai_method: str = Form(default="gradcam++"),
 ):
     """Full analysis with prediction, uncertainty, XAI heatmaps, and LLM summary.
 
@@ -800,6 +824,7 @@ async def analyze_image(
             image_np,
             return_uncertainty=True,
             return_explanation=True,
+            xai_method=xai_method,
         )
     except Exception as e:
         raise HTTPException(500, f"Inference failed: {e}")
@@ -886,10 +911,16 @@ async def analyze_image(
         "inference_time_ms": round(inference_ms, 1),
         "model_version": model_name,
         "image_hash": image_hash,
+        "patient_meta": {
+            "Patient ID": patient_id or "N/A",
+            "Modality": modality or "N/A",
+            "Body Part": body_part or "N/A",
+            "Clinical History": clinical_history or "N/A",
+        },
     }
 
     # Store for later retrieval (compress stored image to save memory)
-    _analysis_store[analysis_id] = analysis_data
+    _analysis_store_put(analysis_id, analysis_data)
     try:
         _store_img = Image.open(io.BytesIO(contents)).convert("RGB")
         _buf = io.BytesIO()
@@ -903,6 +934,119 @@ async def analyze_image(
 
 
 # ---------------------------------------------------------------------------
+# Dashboard v2: Compare two uploaded images
+# ---------------------------------------------------------------------------
+
+async def _run_single_analysis(
+    contents: bytes, model_name: str, xai_method: str,
+) -> dict:
+    """Run inference + XAI on raw image bytes and return an analysis dict.
+
+    Shared helper used by the /api/v2/compare endpoint so that we
+    don't duplicate the full analysis pipeline.
+    """
+    image_hash = hashlib.sha256(contents).hexdigest()
+    try:
+        from xclinvision.processing import read_image_grayscale
+        gray = read_image_grayscale(contents)
+        if gray is not None:
+            image_np = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+        else:
+            image_np = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
+    except Exception as e:
+        raise HTTPException(400, f"Could not process image: {e}")
+
+    pipeline = get_pipeline(model_name=model_name)
+    if pipeline is None:
+        raise HTTPException(503, "No model loaded.")
+
+    start = time.time()
+    result = pipeline.predict(
+        image_np, return_uncertainty=True, return_explanation=True,
+        xai_method=xai_method,
+    )
+    inference_ms = (time.time() - start) * 1000
+
+    explanation = result.get("explanation") or {}
+    vis = explanation.get("visualization") or {}
+    grayscale_cam = vis.get("grayscale_cam")
+    _, vis_image = pipeline.preprocess(image_np)
+
+    heatmap_b64 = None
+    overlay_b64 = None
+    if grayscale_cam is not None:
+        heatmap_b64 = _img_to_base64(grayscale_cam)
+        overlay_img = _generate_heatmap_overlay(vis_image, grayscale_cam, opacity=0.45)
+        overlay_b64 = _img_to_base64(overlay_img)
+
+    # Encode the original uploaded image as a thumbnail
+    thumbnail_b64 = _img_to_base64(image_np)
+
+    probs = result.get("probabilities", [])
+    class_names = result.get("class_names", get_class_names())
+    top_k = sorted(
+        [{"class_name": cn, "probability": float(p)} for cn, p in zip(class_names, probs)],
+        key=lambda x: x["probability"], reverse=True,
+    )
+
+    analysis_id = f"XCL-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
+    analysis_data = {
+        "analysis_id": analysis_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "prediction": result["class_name"],
+        "confidence": result["confidence"],
+        "uncertainty_level": result.get("uncertainty_level", "unknown"),
+        "top_k_predictions": top_k,
+        "heatmap_gradcam": heatmap_b64,
+        "heatmap_overlay": overlay_b64,
+        "thumbnail": thumbnail_b64,
+        "region_scores": (vis.get("region_scores") or {}),
+        "key_findings": explanation.get("key_findings", []),
+        "inference_time_ms": round(inference_ms, 1),
+        "model_version": model_name,
+        "image_hash": image_hash,
+    }
+
+    # Store so the analysis can be retrieved later (e.g. for XAI, chat, report)
+    _analysis_store_put(analysis_id, analysis_data)
+    try:
+        _image_store_put(analysis_id, contents)
+    except Exception:
+        logger.debug("Could not cache image for compare analysis %s", analysis_id)
+
+    return analysis_data
+
+
+@app.post("/api/v2/compare")
+async def compare_images(
+    file_a: UploadFile = File(...),
+    file_b: UploadFile = File(...),
+    model_name: str = Form(default="convnext_small"),
+    xai_method: str = Form(default="gradcam++"),
+):
+    """Analyze two uploaded images and return side-by-side comparison data."""
+    allowed_types = {
+        "image/jpeg", "image/png", "image/gif", "image/bmp",
+        "image/tiff", "application/octet-stream", "application/dicom",
+    }
+    for label, f in [("Image A", file_a), ("Image B", file_b)]:
+        if f.content_type and f.content_type not in allowed_types:
+            raise HTTPException(400, f"{label}: invalid file type '{f.content_type}'.")
+
+    contents_a = await file_a.read(MAX_UPLOAD_BYTES + 1)
+    if len(contents_a) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"Image A too large. Max {MAX_UPLOAD_MB} MB.")
+    contents_b = await file_b.read(MAX_UPLOAD_BYTES + 1)
+    if len(contents_b) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"Image B too large. Max {MAX_UPLOAD_MB} MB.")
+
+    analysis_a = await _run_single_analysis(contents_a, model_name, xai_method)
+    analysis_b = await _run_single_analysis(contents_b, model_name, xai_method)
+
+    return {"image_a": analysis_a, "image_b": analysis_b}
+
+
+# ---------------------------------------------------------------------------
 # Dashboard v2: Explanation with adjustable params
 # ---------------------------------------------------------------------------
 
@@ -913,8 +1057,13 @@ async def get_dashboard_explanation(
     threshold: float = Query(default=0.5, ge=0.0, le=1.0),
     opacity: float = Query(default=0.6, ge=0.0, le=1.0),
     colormap: str = Query(default="jet"),
+    finding: Optional[str] = Query(default=None),
 ):
-    """Regenerate XAI explanation with adjustable threshold and opacity."""
+    """Regenerate XAI explanation with adjustable threshold and opacity.
+
+    The optional ``finding`` parameter selects which class to generate
+    the Grad-CAM for.  When omitted, the top predicted class is used.
+    """
     if analysis_id not in _analysis_store:
         raise HTTPException(404, "Analysis not found")
 
@@ -931,8 +1080,20 @@ async def get_dashboard_explanation(
     image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
     image_np = np.array(image)
 
+    # Resolve target class index from the finding name
+    target_class_idx: Optional[int] = None
+    if finding:
+        class_names = get_class_names()
+        for i, cn in enumerate(class_names):
+            if cn.lower() == finding.lower():
+                target_class_idx = i
+                break
+
     try:
-        result = pipeline.predict(image_np, return_uncertainty=False, return_explanation=True)
+        result = pipeline.predict(
+            image_np, return_uncertainty=False, return_explanation=True,
+            xai_method=method, target_class=target_class_idx,
+        )
     except Exception as e:
         raise HTTPException(500, f"Explanation failed: {e}")
 
@@ -1012,7 +1173,7 @@ async def submit_dashboard_feedback(feedback: DashboardFeedbackRequest):
     entry = feedback.model_dump()
     entry["timestamp"] = datetime.utcnow().isoformat()
     entry["feedback_id"] = f"fb-{uuid.uuid4().hex[:8]}"
-    _feedback_store.append(entry)
+    _feedback_store_append(entry)
 
     # Also log via PredictionLogger
     try:
@@ -1165,11 +1326,42 @@ async def generate_dashboard_report(request: DashboardReportRequest):
 
 @app.post("/api/v2/export-report")
 async def export_report_html(request: ExportReportRequest):
-    """Generate a self-contained HTML clinical report via ClinicalReporter."""
+    """Generate a clinical report in HTML, PDF, or JSON format."""
     stored = _analysis_store.get(request.analysis_id)
     if not stored:
         raise HTTPException(404, "Analysis not found")
 
+    report_id = f"RPT-{uuid.uuid4().hex[:8]}"
+    timestamp = datetime.utcnow().isoformat()
+
+    # ── JSON shortcut: return structured data directly ────────────────
+    if request.format == "json":
+        return {
+            "json": {
+                "report_id": report_id,
+                "analysis_id": request.analysis_id,
+                "patient_id": stored.get("patient_id", ""),
+                "patient_meta": stored.get("patient_meta", {}),
+                "prediction": stored["prediction"],
+                "confidence": stored["confidence"],
+                "uncertainty": stored.get("uncertainty", {}),
+                "uncertainty_level": stored.get("uncertainty_level", "unknown"),
+                "top_k_predictions": stored.get("top_k_predictions", []),
+                "key_findings": stored.get("key_findings", []),
+                "llm_summary": stored.get("llm_summary", ""),
+                "model_version": stored.get("model_version", ""),
+                "region_scores": stored.get("region_scores", {}),
+                "indication": request.indication or "",
+                "comments": request.comments or "",
+                "conversation_log": request.conversation_log or [],
+                "timestamp": timestamp,
+            },
+            "report_id": report_id,
+            "format": "json",
+            "timestamp": timestamp,
+        }
+
+    # ── HTML / PDF: full ClinicalReporter pipeline ────────────────────
     try:
         from xclinvision.agent import ClinicalContext, create_agent
         from xclinvision.agent.reporter import ClinicalReporter
@@ -1191,7 +1383,6 @@ async def export_report_html(request: ExportReportRequest):
         agent = _get_agent()
         report_data = agent.generate_report(context)
 
-        # Build a proper ClinicalReport from the agent output
         raw_regions = stored.get("region_scores", {})
         spatial_evidence = {k: str(v) for k, v in raw_regions.items()}
         clinical_report = ClinicalReport(
@@ -1205,17 +1396,36 @@ async def export_report_html(request: ExportReportRequest):
             citations=report_data.get("citations", []),
         )
 
-        # Vision data for the reporter
         vision_data = {
             "class_names": class_names,
             "probabilities": probs,
         }
-        # Include XAI explanation if available and requested
-        if request.include_xai and stored.get("explanation"):
-            vision_data["explanation"] = stored["explanation"]
+        # Embed XAI heatmaps into the report if available
+        if request.include_xai:
+            explanation_data = {}
+            # The stored heatmaps are base64 PNGs; decode them to numpy arrays
+            # for the reporter's overlay generation.
+            if stored.get("heatmap_gradcam"):
+                try:
+                    import base64 as _b64
+                    hm_bytes = _b64.b64decode(stored["heatmap_gradcam"])
+                    hm_img = Image.open(io.BytesIO(hm_bytes)).convert("L")
+                    explanation_data["heatmap"] = np.array(hm_img).astype(np.float32) / 255.0
+                except Exception:
+                    pass
+            if stored.get("explanation"):
+                explanation_data.update(stored["explanation"])
+            if explanation_data:
+                vision_data["explanation"] = explanation_data
 
-        # Use a placeholder image (grey) if original not in memory
-        image_data = np.full((384, 384, 3), 128, dtype=np.uint8)
+        # Use the real uploaded image when available
+        raw_bytes = _image_store.get(request.analysis_id)
+        if raw_bytes:
+            from PIL import Image as PILImage
+            _pil = PILImage.open(io.BytesIO(raw_bytes)).convert("RGB")
+            image_data = np.array(_pil)
+        else:
+            image_data = np.full((384, 384, 3), 128, dtype=np.uint8)
 
         reporter = ClinicalReporter()
         html = reporter.generate_html(
@@ -1223,17 +1433,44 @@ async def export_report_html(request: ExportReportRequest):
             vision_data=vision_data,
             image_data=image_data,
             patient_meta=stored.get("patient_meta"),
+            indication=request.indication,
+            conversation_log=request.conversation_log,
+            comments=request.comments,
         )
 
+        # ── PDF conversion ────────────────────────────────────────────
+        if request.format == "pdf":
+            try:
+                from weasyprint import HTML as WeasyprintHTML
+                pdf_bytes = WeasyprintHTML(string=html).write_pdf()
+                import base64 as b64mod
+                pdf_b64 = b64mod.b64encode(pdf_bytes).decode("ascii")
+                return {
+                    "pdf_base64": pdf_b64,
+                    "report_id": report_id,
+                    "format": "pdf",
+                    "timestamp": timestamp,
+                }
+            except ImportError:
+                raise HTTPException(
+                    500,
+                    "PDF generation requires weasyprint. "
+                    "Install it with: pip install weasyprint",
+                )
+
+        # ── Default: HTML ─────────────────────────────────────────────
         return {
             "html": html,
-            "report_id": f"RPT-{uuid.uuid4().hex[:8]}",
-            "timestamp": datetime.utcnow().isoformat(),
+            "report_id": report_id,
+            "format": "html",
+            "timestamp": timestamp,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.warning("HTML report export error: %s", e)
-        raise HTTPException(500, detail=f"Failed to generate HTML report: {e}")
+        logger.warning("Report export error: %s", e)
+        raise HTTPException(500, detail=f"Failed to generate report: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1455,8 +1692,15 @@ async def llm_provider_health():
 
 
 def _build_sse_event(data: str, event: str = "message") -> str:
-    """Format a single SSE frame."""
-    return f"event: {event}\ndata: {data}\n\n"
+    """Format a single SSE frame.
+
+    SSE uses newlines as frame delimiters.  Any literal newlines inside
+    *data* must be sent as separate ``data:`` lines so the client can
+    reassemble them.
+    """
+    lines = data.split("\n")
+    data_part = "\n".join(f"data: {line}" for line in lines)
+    return f"event: {event}\n{data_part}\n\n"
 
 
 @app.post("/api/v2/chat/stream")
@@ -1481,7 +1725,7 @@ async def llm_chat_stream(request: ChatRequest):
             reasoning_agent = _get_reasoning_agent()
 
             # Classify intent & plan tools
-            from xclinvision.agent.reasoning import classify_intent
+            from xclinvision.agent.reasoning import classify_intent, _INTENT_TOOL_MAP
             intent = classify_intent(request.message)
 
             # Build context
@@ -1496,7 +1740,6 @@ async def llm_chat_stream(request: ChatRequest):
             }
 
             # Execute tools first (non-streamed)
-            from xclinvision.agent.reasoning import _INTENT_TOOL_MAP
             tool_names = _INTENT_TOOL_MAP.get(intent, ["get_prediction_details"])
 
             tool_context = {**extra_context}
@@ -1522,16 +1765,18 @@ async def llm_chat_stream(request: ChatRequest):
                 )
 
             system_prompt = (
-                "You are XClinVision's clinical reasoning assistant. You have just executed "
-                "tools to gather evidence about a chest X-ray analysis. Your task is to "
-                "synthesize the tool outputs into a clear, grounded, professional response.\n\n"
+                "You are XClinVision's clinical reasoning assistant — a helpful, "
+                "natural, conversational AI that answers questions about chest X-ray "
+                "analyses. You have just executed tools to gather evidence.\n\n"
                 "RULES:\n"
+                "- Respond in clear, concise natural language — NOT raw JSON.\n"
                 "- You are an ASSISTIVE tool. You do NOT replace a radiologist.\n"
                 "- Ground every claim in the tool outputs provided. Do NOT invent findings.\n"
                 "- When uncertain, say so explicitly.\n"
-                "- Use evidence-based clinical language.\n"
-                "- Be concise but thorough.\n"
-                "- If tool data is missing or errored, acknowledge it gracefully."
+                "- Use evidence-based clinical language but keep it accessible.\n"
+                "- Be concise but thorough. Avoid repeating what you said before.\n"
+                "- If tool data is missing or errored, acknowledge it gracefully.\n"
+                "- Never return raw JSON, debug output, or code — only human-readable text."
             )
 
             user_prompt = (
@@ -1560,12 +1805,15 @@ async def llm_chat_stream(request: ChatRequest):
             yield _build_sse_event(json.dumps({"status": "done"}), event="done")
 
         except Exception as e:
-            logger.warning("Streaming chat error: %s", e)
+            logger.warning("Streaming chat error: %s", e, exc_info=True)
             # Send a fallback non-streamed response as SSE
             fallback = (
-                f"Analysis shows {stored['prediction']} "
-                f"({stored['confidence']:.1%} confidence). "
-                f"Regarding '{request.message}': Clinical correlation is recommended."
+                f"I found that the analysis shows **{stored['prediction']}** "
+                f"with {stored['confidence']:.0%} confidence. "
+                f"Regarding your question about '{request.message}': "
+                "I'm currently unable to provide a detailed AI-powered response "
+                "(the language model may be temporarily unavailable). "
+                "Clinical correlation is recommended — please consult with a specialist."
             )
             yield _build_sse_event(
                 json.dumps({"token": fallback}), event="token",

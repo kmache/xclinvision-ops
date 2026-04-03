@@ -2,24 +2,33 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies + uv (fast Python package installer)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libxrender-dev \
     curl \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libgdk-pixbuf-2.0-0 \
+    libgdk-pixbuf2.0-dev \
+    shared-mime-info \
+    libcairo2 \
+    libffi-dev \
+    && gdk-pixbuf-query-loaders > /usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache 2>/dev/null || true \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies (backend + core library)
 COPY app/backend/requirements.txt /app/backend-requirements.txt
-RUN pip install --no-cache-dir -r /app/backend-requirements.txt
+RUN uv pip install --system --no-cache -r /app/backend-requirements.txt
 
 # Install the xclinvision core package
 COPY pyproject.toml /app/pyproject.toml
 COPY src/ /app/src/
-RUN pip install --no-cache-dir -e .
+RUN uv pip install --system --no-cache -e .
 
 # Copy configs used by the core library at runtime
 COPY configs/ /app/configs/

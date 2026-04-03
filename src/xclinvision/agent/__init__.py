@@ -162,7 +162,16 @@ def create_agent() -> _SimpleClinicalAgent:
     if _AGENT_DEPS_AVAILABLE:
         try:
             manager = get_llm_manager()
-            retriever = HybridRetriever()
+
+            # HybridRetriever needs an ingested vector store.
+            # Default location mirrors ingest_knowledge.py conventions.
+            import os
+            from pathlib import Path
+            vectorstore_dir = os.environ.get(
+                "XCLINVISION_VECTORSTORE_DIR",
+                str(Path(__file__).resolve().parents[3] / "data" / "vector_db"),
+            )
+            retriever = HybridRetriever(vectorstore_dir=vectorstore_dir)
             guardrails = GuardrailValidator()
             audit = AuditTrail()
             full_agent = ClinicalReasoningAgent(

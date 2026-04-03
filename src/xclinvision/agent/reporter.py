@@ -201,6 +201,22 @@ def generate_gradcam_overlay(
 # ════════════════════════════════════════════════════════════════════════════════
 
 
+def _image_to_base64_png(image: np.ndarray) -> str:
+    """Encode a numpy image (H×W or H×W×3) to a base64 PNG string."""
+    if image.dtype != np.uint8:
+        img_min, img_max = float(image.min()), float(image.max())
+        if img_max > img_min:
+            image = ((image - img_min) / (img_max - img_min) * 255).astype(np.uint8)
+        else:
+            image = np.zeros_like(image, dtype=np.uint8)
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    elif image.ndim == 3 and image.shape[2] == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    _, buf = cv2.imencode(".png", image)
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
 class ClinicalReporter:
     """Renders a :class:`ClinicalReport` into a self-contained clinical HTML document.
 
@@ -239,6 +255,9 @@ class ClinicalReporter:
         image_data: np.ndarray,
         *,
         patient_meta: Optional[Dict[str, Any]] = None,
+        indication: str = "",
+        conversation_log: Optional[List[Dict[str, str]]] = None,
+        comments: str = "",
     ) -> str:
         """Produce a self-contained HTML string with embedded images/charts.
 
@@ -249,11 +268,18 @@ class ClinicalReporter:
         vision_data:
             Raw output of ``InferencePipeline.predict()`` – must contain
             ``class_names``, ``probabilities``, and optionally
-            ``explanation.heatmap``.
+            ``explanation.heatmap``, ``explanation.scorecam``,
+            ``explanation.attention_map``.
         image_data:
             Original X-ray image as a numpy array (H×W or H×W×3).
         patient_meta:
             Optional patient metadata dict (``age``, ``sex``, etc.).
+        indication:
+            Clinical indication / reason for exam.
+        conversation_log:
+            Optional list of ``{"role": "...", "content": "..."}`` dicts.
+        comments:
+            Additional free-text comments for the report.
         """
         class_names: List[str] = vision_data.get("class_names", self.class_names)
         probabilities: List[float] = vision_data.get("probabilities", [])
@@ -261,7 +287,12 @@ class ClinicalReporter:
         # 1. Calibrated findings table
         calibrated = calibrate_predictions(class_names, probabilities, self.threshold_profile)
 
-        # 2. Grad-CAM overlay
+        # 2. Original input image
+        original_b64 = ""
+        if image_data is not None and image_data.size > 0:
+            original_b64 = _image_to_base64_png(image_data)
+
+        # 3. Grad-CAM overlay
         explanation = vision_data.get("explanation")
         heatmap = explanation.get("heatmap") if isinstance(explanation, dict) else None
         gradcam_b64 = ""
@@ -270,23 +301,45 @@ class ClinicalReporter:
                 image_data, np.asarray(heatmap), alpha=self.gradcam_alpha
             )
 
-        # 3. Radar chart
+        # 4. Score-CAM overlay (if available)
+        scorecam_b64 = ""
+        scorecam_map = explanation.get("scorecam") if isinstance(explanation, dict) else None
+        if scorecam_map is not None:
+            scorecam_b64 = generate_gradcam_overlay(
+                image_data, np.asarray(scorecam_map), alpha=self.gradcam_alpha
+            )
+
+        # 5. Attention map overlay (if available)
+        attention_b64 = ""
+        attention_map = explanation.get("attention_map") if isinstance(explanation, dict) else None
+        if attention_map is not None:
+            attention_b64 = generate_gradcam_overlay(
+                image_data, np.asarray(attention_map), alpha=self.gradcam_alpha
+            )
+
+        # 6. Radar chart
         radar_b64 = ""
         if probabilities:
             radar_b64 = generate_radar_chart(
                 class_names, probabilities, baseline=self.radar_baseline
             )
 
-        # 4. Render template
+        # 7. Render template
         report_id = datetime.now(tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
         generated_at = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
         html = self._template.render(
             report=report,
             calibrated=calibrated,
+            original_b64=original_b64,
             gradcam_b64=gradcam_b64,
+            scorecam_b64=scorecam_b64,
+            attention_b64=attention_b64,
             radar_b64=radar_b64,
             patient_meta=patient_meta or {},
+            indication=indication or "",
+            conversation_log=conversation_log or [],
+            comments=comments or "",
             report_id=report_id,
             generated_at=generated_at,
         )
