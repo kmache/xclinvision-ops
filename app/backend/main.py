@@ -31,7 +31,10 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Any, List, Optional, Dict
+from typing import Any, List, Optional, Dict, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from xclinvision.inference import InferencePipeline
 import numpy as np
 from PIL import Image
 import cv2
@@ -1441,7 +1444,7 @@ async def export_report_html(request: ExportReportRequest):
         # ── PDF conversion ────────────────────────────────────────────
         if request.format == "pdf":
             try:
-                from weasyprint import HTML as WeasyprintHTML
+                from weasyprint import HTML as WeasyprintHTML  # type: ignore
                 pdf_bytes = WeasyprintHTML(string=html).write_pdf()
                 import base64 as b64mod
                 pdf_b64 = b64mod.b64encode(pdf_bytes).decode("ascii")
