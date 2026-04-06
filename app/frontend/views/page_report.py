@@ -416,13 +416,11 @@ def render_report_preview(
             if st.button("Export HTML", width='stretch', disabled=not analysis_id):
                 client = st.session_state.get("api_client")
                 if client and analysis_id:
-                    conv_log = _build_conversation_log()
                     with st.spinner("Generating HTML…"):
                         result = client.export_report_html(
                             analysis_id=analysis_id,
                             indication=indication,
                             comments=comments,
-                            conversation_log=conv_log,
                         )
                     if result and result.get("html"):
                         st.session_state["_export_html"] = result["html"]
@@ -438,13 +436,11 @@ def render_report_preview(
             if st.button("Export PDF", width='stretch', disabled=not analysis_id):
                 client = st.session_state.get("api_client")
                 if client and analysis_id:
-                    conv_log = _build_conversation_log()
                     with st.spinner("Generating PDF…"):
                         result = client.export_report_pdf(
                             analysis_id=analysis_id,
                             indication=indication,
                             comments=comments,
-                            conversation_log=conv_log,
                         )
                     if result and result.get("pdf_base64"):
                         import base64 as b64mod
@@ -461,7 +457,6 @@ def render_report_preview(
 
         with export_col3:
             # Build JSON payload from local fields + analysis data
-            conv_log = _build_conversation_log()
             payload = json.dumps(
                 {
                     "patient_id": patient_id,
@@ -472,7 +467,6 @@ def render_report_preview(
                     "impression": impression,
                     "comments": comments,
                     "predictions": analysis.get("top_k_predictions", []),
-                    "conversation_log": conv_log,
                     "generated_at": datetime.now().isoformat(),
                 },
                 indent=2,
@@ -548,10 +542,6 @@ def render_report_preview(
 # ==============================================================================
 
 def render() -> None:
-    # ── Apply any pending AI-generated content BEFORE widgets render ──
-    # Streamlit does not allow setting a widget-bound key after the widget
-    # has been instantiated.  We stage values in _pending_* keys and apply
-    # them here, before the widgets are created on this rerun.
     for field in ("report_impression", "report_indication"):
         pending_key = f"_pending_{field}"
         if pending_key in st.session_state:

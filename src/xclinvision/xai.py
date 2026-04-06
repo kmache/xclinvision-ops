@@ -110,6 +110,9 @@ class GradCAMPlusPlus:
         with torch.set_grad_enabled(True):
             self.model.eval()
             self.model.zero_grad()
+            
+            device = next(self.model.parameters()).device
+            input_tensor = input_tensor.to(device)
 
             # Input MUST require grad to build computation graph
             input_tensor = input_tensor.clone().detach().requires_grad_(True)
@@ -238,6 +241,9 @@ class ScoreCAM:
         target_class: Optional[int] = None,
     ) -> Tuple[np.ndarray, int]:
         self.model.eval()
+        
+        device = next(self.model.parameters()).device
+        input_tensor = input_tensor.to(device)
 
         # 1. Forward pass to capture activations and baseline output
         output = self.model(input_tensor)
@@ -307,9 +313,10 @@ class ScoreCAM:
 
         scores = self.model(masked_inputs)  # (k, num_classes)
 
-        # 5. Extract target class scores and apply softmax -> weights
+        # 5. Extract target class scores and apply relu -> normalize
         target_scores = scores[:, target_class]  # (k,)
-        weights = F.softmax(target_scores, dim=0)  # (k,)
+        target_scores = F.relu(target_scores)
+        weights = target_scores / (target_scores.sum() + 1e-8)  # L1 normalize
 
         # 6. Weighted sum of the selected activation maps
         cam = (weights.view(k, 1, 1) * selected_acts).sum(dim=0)  # (h_act, w_act)
@@ -383,6 +390,9 @@ class AttentionRollout:
         so the caller can use any method interchangeably.
         """
         self.model.eval()
+        
+        device = next(self.model.parameters()).device
+        input_tensor = input_tensor.to(device)
 
         # --- Collect attention weights via one-shot hooks ---
         attentions: List[torch.Tensor] = []

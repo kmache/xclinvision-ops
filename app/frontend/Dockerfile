@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install system dependencies + uv (fast Python package installer)
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-RUN apt-get update && apt-get install -y \
+RUN apt update && apt install -y \
     libgl1 \
     libglib2.0-0 \
     curl \

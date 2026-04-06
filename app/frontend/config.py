@@ -36,9 +36,9 @@ API_BASE_URL: Final = os.getenv("API_URL", "http://localhost:8000").rstrip("/")
 # Timeouts (seconds)
 HEALTH_CHECK_TIMEOUT: Final = 2.0
 DEFAULT_TIMEOUT: Final = float(os.getenv("REQUEST_TIMEOUT", "15"))
-INFERENCE_TIMEOUT: Final = 120.0       # image analysis can be slow
-EXPLAIN_TIMEOUT: Final = 60.0          # Grad-CAM generation
-CHAT_TIMEOUT: Final = 60.0             # LLM clinical assistant
+INFERENCE_TIMEOUT: Final = 120.0       
+EXPLAIN_TIMEOUT: Final = 60.0         
+CHAT_TIMEOUT: Final = 60.0            
 FEEDBACK_TIMEOUT: Final = 10.0
 REPORT_TIMEOUT: Final = 30.0
 HISTORY_TIMEOUT: Final = 30.0
@@ -46,7 +46,7 @@ DRIFT_TIMEOUT: Final = 15.0
 MODEL_CARD_TIMEOUT: Final = 10.0
 FEEDBACK_STATS_TIMEOUT: Final = 10.0
 EXPORT_REPORT_TIMEOUT: Final = 30.0
-COMPARE_TIMEOUT: Final = 240.0         # two images analysed sequentially
+COMPARE_TIMEOUT: Final = 240.0       
 
 # ==============================================================================
 # 2. CLASS LABELS & COLOURS
@@ -67,7 +67,7 @@ class UIConfig:
 
     # Upload constraints
     MAX_UPLOAD_DIM: int = 1024
-    ALLOWED_EXTENSIONS: tuple = ("png", "jpg", "jpeg", "dcm")
+    ALLOWED_EXTENSIONS: tuple = ("png", "jpg", "jpeg", "dcm", "dicom")
 
     # Image overlay defaults
     DEFAULT_THRESHOLD: float = 0.5

@@ -25,6 +25,14 @@ AVAILABLE_MODELS = {
     "DenseNet-121 (F1 0.52, AUC 0.890)": "densenet",
 }
 
+# Default XAI method per model architecture
+_MODEL_XAI_DEFAULTS: dict[str, str] = {
+    "vit_base": "attention_rollout",
+    "convnext_small": "gradcam++",
+    "efficientnet_b0": "gradcam++",
+    "densenet": "gradcam++",
+}
+
 # Pathology-only class names (exclude "No finding")
 PATHOLOGY_NAMES = [c for c in CLASS_NAMES if c != "No finding"]
 
@@ -137,7 +145,7 @@ def render_llm_agent(analysis: dict):
         with pcol2:
             st.markdown("<br>", unsafe_allow_html=True)
             if selected != active:
-                if st.button("Switch", key="btn_switch_provider", use_container_width=True):
+                if st.button("Switch", key="btn_switch_provider", width='stretch'):
                     result = client.switch_llm_provider(selected)
                     if result and result.get("status") == "switched":
                         st.toast(f"Switched to **{selected}** provider", icon="✅")
@@ -327,7 +335,7 @@ def render_llm_agent(analysis: dict):
     chip_cols = st.columns(len(chips))
     for i, (label, color) in enumerate(chips):
         with chip_cols[i]:
-            if st.button(label, key=f"chip_{i}", use_container_width=True):
+            if st.button(label, key=f"chip_{i}", width='stretch'):
                 st.session_state["_pending_chat_msg"] = label
                 st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
@@ -342,7 +350,7 @@ def render_llm_agent(analysis: dict):
         fcols = st.columns(min(len(followups), 3))
         for fc, ftext in zip(fcols, followups[:3]):
             with fc:
-                if st.button(f"💡 {ftext}", key=f"followup_{ftext[:20]}", use_container_width=True):
+                if st.button(f"💡 {ftext}", key=f"followup_{ftext[:20]}", width='stretch'):
                     st.session_state["_pending_chat_msg"] = ftext
                     st.session_state.pop("_suggested_followups", None)
                     st.rerun()
@@ -355,12 +363,12 @@ def render_llm_agent(analysis: dict):
         )
         conv_col1, conv_col2 = st.columns(2)
         with conv_col1:
-            if st.button("📋 Copy Conversation", key="btn_copy_conv", use_container_width=True):
+            if st.button("📋 Copy Conversation", key="btn_copy_conv", width='stretch'):
                 conv_text = _format_conversation_text(st.session_state.llm_messages)
                 st.session_state["_clipboard_conversation"] = conv_text
                 st.toast("Conversation copied to clipboard!", icon="📋")
         with conv_col2:
-            if st.button("📝 Send to Report", key="btn_send_to_report", use_container_width=True):
+            if st.button("📝 Send to Report", key="btn_send_to_report", width='stretch'):
                 conv_text = _format_conversation_text(st.session_state.llm_messages)
                 st.session_state["_conversation_for_report"] = conv_text
                 st.toast("Conversation sent to Report page!", icon="📝")
@@ -442,6 +450,12 @@ def render():
             model_label = c6.selectbox("Model", list(AVAILABLE_MODELS.keys()), index=0)
             model_name = AVAILABLE_MODELS[model_label]
 
+            # Auto-select XAI method when model changes
+            _prev_model = st.session_state.get("_prev_model_name")
+            if _prev_model != model_name:
+                st.session_state["_prev_model_name"] = model_name
+                st.session_state["xai_method"] = _MODEL_XAI_DEFAULTS.get(model_name, "gradcam++")
+
             analyze_clicked = st.button(
                 "🔍 Analyze Image", type="primary", width='stretch',
                 disabled=(uploaded_file is None),
@@ -452,6 +466,7 @@ def render():
         with st.spinner("Running AI analysis..."):
             file_bytes = uploaded_file.getvalue()
             if client:
+                _xai = st.session_state.get("xai_method", _MODEL_XAI_DEFAULTS.get(model_name, "gradcam++"))
                 result = client.analyze_image(
                     file_bytes=file_bytes, filename=uploaded_file.name,
                     patient_id=pt_id or "UNKNOWN",
@@ -459,6 +474,7 @@ def render():
                     modality="X-ray", body_part="Chest",
                     clinical_history=f"Age: {age}, Sex: {sex}, View: {view}",
                     model_name=model_name,
+                    xai_method=_xai,
                 )
                 if result:
                     st.session_state["current_analysis"] = result
@@ -528,9 +544,31 @@ def render():
         # Heatmap
         st.subheader("Finding to explain")
         with st.container(border=True):
-            if analysis and analysis.get("heatmap_overlay"):
-                overlay_img = _b64_to_image(analysis["heatmap_overlay"])
-                st.image(overlay_img, width='stretch')
+            if analysis and (analysis.get("heatmap_overlay") or analysis.get("scorecam_overlay")):
+                xai_method = analysis.get("xai_method", "gradcam++")
+                labels = []
+                if analysis.get("heatmap_overlay"):
+                    labels.append(xai_method.replace("_", " ").title())
+                if analysis.get("scorecam_overlay") and xai_method != "scorecam":
+                    labels.append("Score-CAM (Fallback)")
+                
+                if labels:
+                    tabs = st.tabs(labels)
+                    idx = 0
+                    if analysis.get("heatmap_overlay"):
+                        with tabs[idx]:
+                            st.image(_b64_to_image(analysis["heatmap_overlay"]), width='stretch')
+                            if xai_method == "attention_rollout":
+                                st.caption("Attention Map Overlay")
+                            else:
+                                st.caption(f"{xai_method.replace('++', '++').title()} Overlay")
+                        idx += 1
+                    if analysis.get("scorecam_overlay") and xai_method != "scorecam":
+                        with tabs[idx]:
+                            st.image(_b64_to_image(analysis["scorecam_overlay"]), width='stretch')
+                            st.caption("Score-CAM Overlay (Low Confidence Fallback)")
+                        idx += 1
+
                 if st.checkbox("Legend", value=True):
                     st.markdown(
                         '<div style="position:relative;width:100%;height:22px;margin-top:4px;'
@@ -614,7 +652,7 @@ def render():
                             st.session_state["current_analysis"] = analysis
                             st.rerun()
                         else:
-                            st.warning("Could not regenerate heatmap.")
+                            st.warning("Could not regenerate heatmap, the selected models may not match the XAI method, please check your selections.")
             else:
                 st.info("Run an analysis first to adjust explanation parameters.")
 
@@ -625,3 +663,4 @@ def render():
                 render_llm_agent(analysis)
             else:
                 st.info("Run an analysis to enable the clinical AI assistant.")
+

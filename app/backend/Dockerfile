@@ -4,21 +4,22 @@ WORKDIR /app
 
 # Install system dependencies + uv (fast Python package installer)
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-RUN apt-get update && apt-get install -y \
+RUN apt update && apt install -y \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
+    libxcb1 \
     libxext6 \
     libxrender-dev \
     curl \
     libpango-1.0-0 \
     libpangocairo-1.0-0 \
     libgdk-pixbuf-2.0-0 \
-    libgdk-pixbuf2.0-dev \
+    libgdk-pixbuf-xlib-2.0-dev \
     shared-mime-info \
     libcairo2 \
     libffi-dev \
-    && gdk-pixbuf-query-loaders > /usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache 2>/dev/null || true \
+    && (gdk-pixbuf-query-loaders > /usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders.cache 2>/dev/null || true) \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies (backend + core library)

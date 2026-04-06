@@ -122,17 +122,14 @@ def _scan_and_rewrite(text: str) -> Tuple[str, List[str]]:
 # 2.  GuardrailValidator
 # ════════════════════════════════════════════════════════════════════════════════
 
-
 @dataclass
 class GuardrailResult:
     """Result of a guardrail validation pass."""
-
     passed: bool
     term_violations: List[str] = field(default_factory=list)
     structural_warnings: List[str] = field(default_factory=list)
     rewrites_applied: int = 0
     force_human_review: bool = False
-
 
 class GuardrailValidator:
     """Validate and sanitise clinical reports before delivery.
@@ -340,3 +337,4 @@ def build_clinical_threshold_profile(
         {k: f"{v:.2f} ({priority_map.get(k, 'routine')})" for k, v in thresholds.items()},
     )
     return profile
+

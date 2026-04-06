@@ -837,6 +837,7 @@ async def analyze_image(
     # --- Build heatmap images ------------------------------------------------
     heatmap_b64 = None
     overlay_b64 = None
+    scorecam_heatmap_b64 = None
     explanation = result.get("explanation") or {}
     vis = explanation.get("visualization") or {}
 
@@ -854,6 +855,15 @@ async def analyze_image(
         logger.warning("XAI heatmap unavailable for this analysis — returning null heatmap fields")
         heatmap_b64 = None
         overlay_b64 = None
+
+    # Score-CAM fallback (generated when confidence / plausibility is low)
+    scorecam_vis = explanation.get("scorecam_visualization") or {}
+    scorecam_cam = scorecam_vis.get("grayscale_cam")
+    scorecam_overlay_b64 = None
+    if scorecam_cam is not None:
+        scorecam_heatmap_b64 = _img_to_base64(scorecam_cam)
+        sc_overlay_img = _generate_heatmap_overlay(vis_image, scorecam_cam, opacity=0.45)
+        scorecam_overlay_b64 = _img_to_base64(sc_overlay_img)
 
     # --- Build top-k predictions ---------------------------------------------
     probs = result.get("probabilities", [])
@@ -908,6 +918,9 @@ async def analyze_image(
         "top_k_predictions": top_k,
         "heatmap_gradcam": heatmap_b64,
         "heatmap_overlay": overlay_b64,
+        "scorecam_heatmap": scorecam_heatmap_b64,
+        "scorecam_overlay": scorecam_overlay_b64,
+        "xai_method": xai_method,
         "region_scores": region_scores if isinstance(region_scores, dict) else {},
         "key_findings": key_findings,
         "llm_summary": llm_summary,
@@ -1356,7 +1369,6 @@ async def export_report_html(request: ExportReportRequest):
                 "region_scores": stored.get("region_scores", {}),
                 "indication": request.indication or "",
                 "comments": request.comments or "",
-                "conversation_log": request.conversation_log or [],
                 "timestamp": timestamp,
             },
             "report_id": report_id,
@@ -1387,7 +1399,10 @@ async def export_report_html(request: ExportReportRequest):
         report_data = agent.generate_report(context)
 
         raw_regions = stored.get("region_scores", {})
-        spatial_evidence = {k: str(v) for k, v in raw_regions.items()}
+        spatial_evidence = {
+            k: f"{float(v):.2f}" if isinstance(v, (int, float)) else str(v)
+            for k, v in raw_regions.items()
+        }
         clinical_report = ClinicalReport(
             findings=report_data.get("key_findings", [stored["prediction"]]),
             spatial_evidence=spatial_evidence,
@@ -1406,6 +1421,7 @@ async def export_report_html(request: ExportReportRequest):
         # Embed XAI heatmaps into the report if available
         if request.include_xai:
             explanation_data = {}
+            used_method = stored.get("xai_method", "gradcam++")
             # The stored heatmaps are base64 PNGs; decode them to numpy arrays
             # for the reporter's overlay generation.
             if stored.get("heatmap_gradcam"):
@@ -1413,7 +1429,23 @@ async def export_report_html(request: ExportReportRequest):
                     import base64 as _b64
                     hm_bytes = _b64.b64decode(stored["heatmap_gradcam"])
                     hm_img = Image.open(io.BytesIO(hm_bytes)).convert("L")
-                    explanation_data["heatmap"] = np.array(hm_img).astype(np.float32) / 255.0
+                    hm_np = np.array(hm_img).astype(np.float32) / 255.0
+                    # Map to the correct key so the report template shows the right label
+                    if used_method == "attention_rollout":
+                        explanation_data["attention_map"] = hm_np
+                    elif used_method == "scorecam":
+                        explanation_data["scorecam"] = hm_np
+                    else:
+                        explanation_data["heatmap"] = hm_np
+                except Exception:
+                    pass
+            # Score-CAM fallback heatmap (generated for low-confidence predictions)
+            if stored.get("scorecam_heatmap"):
+                try:
+                    import base64 as _b64
+                    sc_bytes = _b64.b64decode(stored["scorecam_heatmap"])
+                    sc_img = Image.open(io.BytesIO(sc_bytes)).convert("L")
+                    explanation_data["scorecam"] = np.array(sc_img).astype(np.float32) / 255.0
                 except Exception:
                     pass
             if stored.get("explanation"):
@@ -1437,7 +1469,6 @@ async def export_report_html(request: ExportReportRequest):
             image_data=image_data,
             patient_meta=stored.get("patient_meta"),
             indication=request.indication,
-            conversation_log=request.conversation_log,
             comments=request.comments,
         )
 

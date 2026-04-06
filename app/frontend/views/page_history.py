@@ -212,8 +212,7 @@ def _render_patient_history(client) -> None:
                                     placeholder="Enter a patient ID")
     with sel2:
         st.markdown("<div style='height:27px'></div>", unsafe_allow_html=True)
-        fetch_btn = st.button("📥 Fetch History", type="primary", width='stretch',
-                               disabled=(not patient_id))
+        fetch_btn = st.button("📥 Fetch History", type="primary", width='stretch', disabled=(not patient_id))
 
     # Fetch history from backend
     if fetch_btn and patient_id and client:
@@ -414,7 +413,7 @@ def _render_manual_comparison(client) -> None:
     with up_a:
         _card_start("Image A")
         file_a = st.file_uploader(
-            "Upload Image A", type=["jpg", "jpeg", "png", "bmp", "tiff"],
+            "Upload Image A", type=["jpg", "jpeg", "png", "bmp", "tiff", "dcm", "dicom"],
             key="manual_cmp_file_a", label_visibility="collapsed",
         )
         if file_a:
@@ -424,7 +423,7 @@ def _render_manual_comparison(client) -> None:
     with up_b:
         _card_start("Image B")
         file_b = st.file_uploader(
-            "Upload Image B", type=["jpg", "jpeg", "png", "bmp", "tiff"],
+            "Upload Image B", type=["jpg", "jpeg", "png", "bmp", "tiff", "dcm", "dicom"],
             key="manual_cmp_file_b", label_visibility="collapsed",
         )
         if file_b:

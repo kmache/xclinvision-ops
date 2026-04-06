@@ -22,10 +22,10 @@ help:
 	@echo "  clean           Clean build artifacts"
 
 install:
-	pip install -e .
+	uv pip install -e .
 
 dev-install:
-	pip install -e ".[dev]"
+	uv pip install -e ".[dev]"
 	pre-commit install
 
 download-data:
@@ -63,13 +63,13 @@ format:
 	isort src/ tests/ app/
 
 docker-build:
-	docker-compose -f deployment/docker-compose.yml build
+	docker compose -f deployment/docker-compose.yml build
 
 docker-up:
 	docker-compose -f deployment/docker-compose.yml up -d
 
 docker-down:
-	docker-compose -f deployment/docker-compose.yml down
+	docker compose -f deployment/docker-compose.yml down
 
 mlflow-ui:
 	mlflow ui --backend-store-uri sqlite:///mlruns.db --port 5000

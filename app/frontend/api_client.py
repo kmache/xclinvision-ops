@@ -145,6 +145,7 @@ class XClinVisionClient:
         body_part: str = "Chest",
         clinical_history: str = "",
         model_name: str = "convnext_small",
+        xai_method: str = "gradcam++",
     ) -> Optional[Dict[str, Any]]:
         """Upload an image and run full AI analysis.
 
@@ -159,6 +160,7 @@ class XClinVisionClient:
             "body_part": body_part,
             "clinical_history": clinical_history,
             "model_name": model_name,
+            "xai_method": xai_method,
         }
         return self._post_multipart(url, files=files, data=data, timeout=INFERENCE_TIMEOUT)
 

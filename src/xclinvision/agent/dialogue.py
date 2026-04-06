@@ -37,7 +37,6 @@ class DialogueTurn:
     role: str  # "user" or "assistant"
     content: str
 
-
 @dataclass
 class SessionMemory:
     """Stores clinical context for a single analysis session.
@@ -166,8 +165,6 @@ _TEMPORAL_QUERY_KEYWORDS = {
 # ════════════════════════════════════════════════════════════════════════════════
 # 3.  ClinicalDialogueManager
 # ════════════════════════════════════════════════════════════════════════════════
-
-
 class ClinicalDialogueManager:
     """Handles interactive follow-up questions with context-aware, grounded responses.
 
@@ -292,7 +289,6 @@ class ClinicalDialogueManager:
         return response
 
     # ── internal helpers ──────────────────────────────────────────────
-
     def _build_augmented_query(self, question: str, session: SessionMemory) -> str:
         """Combine the user's question with current findings for better retrieval."""
         parts = [question]
