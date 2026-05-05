@@ -6,7 +6,9 @@ duplicate boilerplate.
 """
 
 import io
+import os
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -20,6 +22,13 @@ from PIL import Image
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "app" / "backend"))
 sys.path.insert(0, str(_REPO_ROOT / "src"))
+
+# ---------------------------------------------------------------------------
+# Point persistent storage at a per-run temp directory before main is imported.
+# ---------------------------------------------------------------------------
+_TMP_STORAGE_DIR = Path(tempfile.mkdtemp(prefix="xclinvision_test_storage_"))
+os.environ.setdefault("XCLINVISION_DB_PATH", str(_TMP_STORAGE_DIR / "xclinvision.db"))
+os.environ.setdefault("XCLINVISION_IMAGE_DIR", str(_TMP_STORAGE_DIR / "images"))
 
 
 # ---------------------------------------------------------------------------

@@ -84,10 +84,9 @@ def _safe_open_rgb(raw: bytes, max_pixels: int = MAX_IMAGE_PIXELS) -> Image.Imag
     return img.convert("RGB")
 
 
-_IMAGE_STORE_MAX = 200
-# Hard cap on aggregate bytes retained in _image_store. With _IMAGE_STORE_MAX=200
-# and MAX_UPLOAD_BYTES=20 MB, raw retention can reach ~4 GB. Cap at 256 MB and
-# evict oldest until under both limits.
+# Per-store caps now live in app.backend.storage; constants kept here only for
+# any external tooling that still imports them.
+_IMAGE_STORE_MAX = int(os.environ.get("IMAGE_STORE_MAX", 200))
 _IMAGE_STORE_MAX_BYTES = int(os.environ.get("IMAGE_STORE_MAX_BYTES", 256 * 1024 * 1024))
 
 
@@ -733,49 +732,118 @@ async def get_metrics():
 
 
 # ---------------------------------------------------------------------------
-# Dashboard v2: In-memory storage (replace with SQLite/Postgres in prod)
+# Dashboard v2: persistent storage (SQLite + filesystem)
 # ---------------------------------------------------------------------------
+# Backed by app/backend/storage.py. The legacy module-level names
+# ``_analysis_store`` / ``_feedback_store`` / ``_image_store`` are preserved
+# as thin dict/list-like proxies so existing call sites and tests that poke
+# them directly continue to work unchanged.
 
-_ANALYSIS_STORE_MAX = 5000
-_FEEDBACK_STORE_MAX = 10000
+try:
+    from .storage import build_storage_from_env  # type: ignore[import-not-found]
+except ImportError:
+    # Tests load this file as a top-level ``main`` module (sys.path injected
+    # to ``app/backend``); fall back to absolute import in that case.
+    from storage import build_storage_from_env  # type: ignore[import-not-found,no-redef]
 
-_analysis_store: Dict[str, dict] = {}   
-_feedback_store: List[dict] = []         
-_image_store: Dict[str, bytes] = {}    
+storage = build_storage_from_env()
+
+_ANALYSIS_STORE_MAX = storage.analysis_max
+_FEEDBACK_STORE_MAX = storage.feedback_max
+
+
+class _AnalysisStoreProxy:
+    """Dict-like proxy over storage.analyses (id -> data)."""
+
+    def __getitem__(self, key: str) -> dict:
+        v = storage.get_analysis(key)
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def __setitem__(self, key: str, value: dict) -> None:
+        storage.put_analysis(key, value)
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and storage.exists_analysis(key)
+
+    def __len__(self) -> int:
+        return storage.count_analyses()
+
+    def __iter__(self):
+        return iter(storage.all_analyses())
+
+    def get(self, key: str, default=None):
+        v = storage.get_analysis(key)
+        return v if v is not None else default
+
+    def values(self):
+        return list(storage.all_analyses().values())
+
+    def items(self):
+        return list(storage.all_analyses().items())
+
+    def keys(self):
+        return list(storage.all_analyses().keys())
+
+
+class _FeedbackStoreProxy:
+    """List-like proxy over storage.feedback."""
+
+    def __iter__(self):
+        return iter(storage.all_feedback())
+
+    def __reversed__(self):
+        return reversed(storage.all_feedback())
+
+    def __len__(self) -> int:
+        return storage.count_feedback()
+
+    def __getitem__(self, idx):
+        return storage.all_feedback()[idx]
+
+    def append(self, entry: dict) -> None:
+        storage.append_feedback(entry)
+
+
+class _ImageStoreProxy:
+    """Dict-like proxy over storage images."""
+
+    def __getitem__(self, key: str) -> bytes:
+        v = storage.get_image(key)
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def __setitem__(self, key: str, value: bytes) -> None:
+        storage.put_image(key, value)
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and storage.get_image(key) is not None
+
+    def get(self, key: str, default=None):
+        v = storage.get_image(key)
+        return v if v is not None else default
+
+
+_analysis_store = _AnalysisStoreProxy()
+_feedback_store = _FeedbackStoreProxy()
+_image_store = _ImageStoreProxy()
 
 
 def _analysis_store_put(analysis_id: str, data: dict) -> None:
-    """Insert into _analysis_store with FIFO eviction capped at _ANALYSIS_STORE_MAX."""
-    if len(_analysis_store) >= _ANALYSIS_STORE_MAX:
-        oldest_key = next(iter(_analysis_store))
-        del _analysis_store[oldest_key]
-    _analysis_store[analysis_id] = data
+    """Persist an analysis through the Storage layer."""
+    storage.put_analysis(analysis_id, data)
 
 
 def _feedback_store_append(entry: dict) -> None:
-    """Append to _feedback_store, trimming oldest when over _FEEDBACK_STORE_MAX."""
-    _feedback_store.append(entry)
-    while len(_feedback_store) > _FEEDBACK_STORE_MAX:
-        _feedback_store.pop(0)
+    """Persist a feedback entry through the Storage layer."""
+    storage.append_feedback(entry)
+
 
 def _image_store_put(analysis_id: str, data: bytes) -> None:
-    """Insert into _image_store with FIFO eviction.
-
-    Bounded by both:
-      - count (_IMAGE_STORE_MAX, default 200 entries)
-      - aggregate bytes (_IMAGE_STORE_MAX_BYTES, default 256 MB)
-
-    Without the byte cap, sustained traffic of large uploads (~20 MB each)
-    against the 200-entry count cap could retain up to ~4 GB of raw image
-    bytes in process memory.
-    """
-    while (len(_image_store) >= _IMAGE_STORE_MAX or
-           sum(len(v) for v in _image_store.values()) + len(data) > _IMAGE_STORE_MAX_BYTES):
-        if not _image_store:
-            break
-        oldest_key = next(iter(_image_store))
-        del _image_store[oldest_key]
-    _image_store[analysis_id] = data
+    """Persist a raw image through the Storage layer."""
+    storage.put_image(analysis_id, data)
 
 
 def _img_to_base64(img_array: np.ndarray) -> str:
@@ -1293,8 +1361,8 @@ async def llm_chat(request: ChatRequest):
 
         # Extra context the tools may need
         extra_context = {
-            "analysis_store": _analysis_store,
-            "feedback_store": _feedback_store,
+            "analysis_store": storage.all_analyses(),
+            "feedback_store": storage.all_feedback(),
         }
 
         agent_response = reasoning_agent.process_message(
@@ -1832,8 +1900,8 @@ async def llm_chat_stream(request: ChatRequest):
             ]
 
             extra_context = {
-                "analysis_store": _analysis_store,
-                "feedback_store": _feedback_store,
+                "analysis_store": storage.all_analyses(),
+                "feedback_store": storage.all_feedback(),
             }
 
             # Execute tools first (non-streamed)
