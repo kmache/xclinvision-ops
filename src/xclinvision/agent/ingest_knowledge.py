@@ -7,7 +7,7 @@ vector store that enables reliable retrieval for clinical reasoning.
 
 Creates:
     data/vectorstore/chroma/         ← ChromaDB persistent store (semantic)
-    data/vectorstore/bm25_index.pkl  ← Serialised BM25 index (keyword)
+    data/vectorstore/bm25_index/     ← Serialised BM25 index (keyword, bm25s on-disk format)
 
 Data sources (auto-discovered from --data-dirs):
     - XML        : Indiana University CXR reports (FINDINGS + IMPRESSION)
@@ -33,17 +33,16 @@ import argparse
 import hashlib
 import json
 import logging
-import pickle
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import bm25s
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from rank_bm25 import BM25Okapi
 import tiktoken
 
 # ── Required Domain Imports ──
@@ -795,7 +794,10 @@ def build_chromadb(chunks: List[Chunk], output_dir: Path, embedding_model: str =
 def _tokenize_for_bm25(text: str) -> List[str]:
     return [t for t in re.sub(r"[^\w\s]", " ", text.lower()).split() if len(t) > 1]
 
-def build_bm25_index(chunks: List[Chunk], output_dir: Path) -> BM25Okapi:
+def build_bm25_index(chunks: List[Chunk], output_dir: Path) -> bm25s.BM25:
+    # NOTE: persisted via bm25s on-disk format (numpy + json, no pickle).
+    # The previous pickle-based artifact was replaced to remove the
+    # arbitrary-code-execution risk on load.
     output_dir.mkdir(parents=True, exist_ok=True)
     chunk_ids, corpus, chunk_texts, chunk_metadatas = [], [], [], []
     for c in chunks:
@@ -803,12 +805,21 @@ def build_bm25_index(chunks: List[Chunk], output_dir: Path) -> BM25Okapi:
         corpus.append(_tokenize_for_bm25(c.text))
         chunk_texts.append(c.text)
         chunk_metadatas.append(c.metadata)
-        
-    bm25 = BM25Okapi(corpus)
-    index_path = output_dir / "bm25_index.pkl"
-    with open(index_path, "wb") as f:
-        pickle.dump({"bm25": bm25, "chunk_ids": chunk_ids, "chunk_texts": chunk_texts, "chunk_metadatas": chunk_metadatas, "corpus": corpus}, f)
-    
+
+    bm25 = bm25s.BM25()
+    bm25.index(corpus, show_progress=False)
+
+    index_dir = output_dir / "bm25_index"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    bm25.save(str(index_dir), allow_pickle=False, show_progress=False)
+    sidecar = {
+        "chunk_ids": chunk_ids,
+        "chunk_texts": chunk_texts,
+        "chunk_metadatas": chunk_metadatas,
+    }
+    with open(index_dir / "chunks.json", "w", encoding="utf-8") as f:
+        json.dump(sidecar, f, ensure_ascii=False)
+
     logger.info("BM25 index built (%d docs)", len(chunk_ids))
     return bm25
 
@@ -822,9 +833,20 @@ class HybridRetriever:
         self.collection = chromadb.PersistentClient(path=str(vectorstore_dir / "chroma")).get_collection(
             name=collection_name, embedding_function=SentenceTransformerEmbeddingFunction(model_name=embedding_model, trust_remote_code=True)
         )
-        with open(vectorstore_dir / "bm25_index.pkl", "rb") as f:
-            data = pickle.load(f)
-        self.bm25, self.bm25_ids, self.bm25_texts, self.bm25_metas = data["bm25"], data["chunk_ids"], data["chunk_texts"], data["chunk_metadatas"]
+        index_dir = vectorstore_dir / "bm25_index"
+        legacy_pkl = vectorstore_dir / "bm25_index.pkl"
+        if not index_dir.is_dir() and legacy_pkl.exists():
+            raise RuntimeError(
+                f"Found legacy pickle BM25 index at {legacy_pkl}. "
+                "This format is no longer loaded (pickle.load is unsafe). "
+                "Re-run scripts/ingest_knowledge.py to rebuild as bm25s on-disk format."
+            )
+        self.bm25 = bm25s.BM25.load(str(index_dir), allow_pickle=False)
+        with open(index_dir / "chunks.json", "r", encoding="utf-8") as f:
+            sidecar = json.load(f)
+        self.bm25_ids = sidecar["chunk_ids"]
+        self.bm25_texts = sidecar["chunk_texts"]
+        self.bm25_metas = sidecar["chunk_metadatas"]
 
     def query(self, text: str, top_k: int = 10, rrf_k: int = 60, where: Optional[Dict] = None) -> List[Dict[str, Any]]:
         n = top_k * 3

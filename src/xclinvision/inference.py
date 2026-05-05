@@ -336,14 +336,16 @@ class InferencePipeline:
             if return_uncertainty:
                 self.enable_mc_dropout()
                 mc_preds_list = []
-                with torch.no_grad():
-                    for _ in range(self.mc_samples):
-                        mc_logits = self._apply_temperature(self.model(x_batch))
-                        if self.multilabel:
-                            mc_preds_list.append(torch.sigmoid(mc_logits).cpu().numpy())
-                        else:
-                            mc_preds_list.append(F.softmax(mc_logits, dim=1).cpu().numpy())
-                self.model.eval()
+                try:
+                    with torch.no_grad():
+                        for _ in range(self.mc_samples):
+                            mc_logits = self._apply_temperature(self.model(x_batch))
+                            if self.multilabel:
+                                mc_preds_list.append(torch.sigmoid(mc_logits).cpu().numpy())
+                            else:
+                                mc_preds_list.append(F.softmax(mc_logits, dim=1).cpu().numpy())
+                finally:
+                    self.model.eval()
                 batched_mc_preds = np.array(mc_preds_list) # Shape: (mc_samples, batch_size, num_classes)
 
             for i, (vis_image, prob) in enumerate(zip(vis_images, probs_batch)):
@@ -425,15 +427,16 @@ class InferencePipeline:
         _enable_mc_dropout(self.model)
 
         mc_preds: List[np.ndarray] = []
-        with torch.no_grad():
-            for _ in range(self.mc_samples):
-                logits = self._apply_temperature(self.model(x))
-                if self.multilabel:
-                    mc_preds.append(torch.sigmoid(logits).cpu().numpy())
-                else:
-                    mc_preds.append(F.softmax(logits, dim=1).cpu().numpy())
-
-        self.model.eval()
+        try:
+            with torch.no_grad():
+                for _ in range(self.mc_samples):
+                    logits = self._apply_temperature(self.model(x))
+                    if self.multilabel:
+                        mc_preds.append(torch.sigmoid(logits).cpu().numpy())
+                    else:
+                        mc_preds.append(F.softmax(logits, dim=1).cpu().numpy())
+        finally:
+            self.model.eval()
 
         preds = np.array(mc_preds)     
         mean_pred = preds.mean(axis=0) 

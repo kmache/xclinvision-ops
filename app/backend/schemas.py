@@ -61,6 +61,7 @@ class ReportRequest(BaseModel):
     confidence: float
     uncertainty_level: str
     highlighted_regions: List[str]
+    probabilities: Optional[List[float]] = None
     patient_age: Optional[int] = None
     patient_sex: Optional[str] = None
 

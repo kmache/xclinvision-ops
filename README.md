@@ -8,7 +8,7 @@
 
 **AI-powered Medical Imaging Platform with Clinical Decision Support**
 
-XClinVision-Ops is a production-grade chest X-ray analysis platform combining multi-model deep learning inference, visual explainability, uncertainty quantification, an LLM-powered reasoning agent with RAG, and full report generation. It ships as a FastAPI backend + Streamlit dashboard, containerised with Docker.
+XClinVision-Ops is a production-grade chest X-ray analysis platform combining multi-model deep learning inference, visual explainability, uncertainty quantification, an LLM-powered reasoning agent with RAG, and full report generation. It ships as a FastAPI backend + Streamlit dashboard, containerised with Docker. [Demo](https://youtu.be/4_3VytZUHDE?si=rAhWslSZANGs_5Tl)
 
 > **Disclaimer:** This system is intended for research and clinical decision support only. It does not provide autonomous medical diagnoses and must be used under qualified clinician supervision. Not certified for clinical use.
 
@@ -17,6 +17,7 @@ XClinVision-Ops is a production-grade chest X-ray analysis platform combining mu
 ## Table of Contents
 
 - [Key Features](#key-features)
+- [Technology Stack](#️-technology-stack)
 - [Architecture](#architecture)
 - [Project Structure](#project-structure)
 - [Installation](#installation)
@@ -51,6 +52,25 @@ XClinVision-Ops is a production-grade chest X-ray analysis platform combining mu
 | **MLOps** | MLflow experiment tracking; prediction logging; clinician feedback loop; audit trails |
 
 **Target pathologies:** No Finding · Cardiomegaly · Aortic Enlargement · Pleural Thickening · Pulmonary Fibrosis
+
+---
+
+## 🛠️ Technology Stack
+
+| Category | Tools & Frameworks |
+|---|---|
+| **Deep Learning** | PyTorch 2.0+, torchvision, timm (ConvNeXt, DenseNet, EfficientNet, ViT, Swin Transformer) |
+| **Explainability** | Grad-CAM++, Score-CAM, Attention Rollout, PyTorch hooks |
+| **Uncertainty** | MC Dropout, Temperature Scaling |
+| **LLM / Agent** | OpenAI API compatible LLMs, custom tool-calling agent loop |
+| **RAG & Vector DB** | ChromaDB, BM25, Reciprocal Rank Fusion (RRF), Sentence Transformers |
+| **Backend API** | FastAPI, Uvicorn, Pydantic |
+| **Frontend Dashboard** | Streamlit |
+| **Report Generation** | Jinja2, WeasyPrint, Matplotlib, Plotly |
+| **MLOps & Tracking** | MLflow, PSI drift detection, custom feedback loop |
+| **Data** | VinBigData Chest X-ray dataset, NLM-CXR reports (3 900+ records) |
+| **Infrastructure** | Docker, Docker Compose, Nginx |
+| **Language & Tooling** | Python 3.10+, YAML configs, pyproject.toml |
 
 ---
 
@@ -678,3 +698,7 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 > These AI-generated findings are intended to assist — not replace — clinical judgement.
 > Always correlate with clinical presentation and consult a qualified radiologist.
+
+---
+
+<div align="center">Built with ❤️ for better healthcare AI</div>

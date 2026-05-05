@@ -256,12 +256,12 @@ def _render_drift_tab():
                 st.info("No feedback submitted yet. Use the Inference page to provide feedback.")
 
         with st.container(border=True):
-            st.markdown("#### Limitations & Risks")
+            st.markdown("#### Data Quality Notes")
             st.markdown(
-                "- Trained on frontal views only (PA / AP)\n"
-                "- Not validated for pediatric populations\n"
-                "- Performance degrades on non-standard equipment\n"
-                "- Research use only"
+                "- Monitor for distribution drift between training and deployment data\n"
+                "- Track feedback-to-prediction ratio as an early warning signal\n"
+                "- Review low-confidence predictions periodically for edge cases\n"
+                "- See the **Model Card** tab for full limitations & risks"
             )
 
     # Bottom: audit tools

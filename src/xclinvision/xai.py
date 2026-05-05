@@ -101,6 +101,13 @@ class GradCAMPlusPlus:
         if self._bwd_handle is not None:
             self._bwd_handle.remove()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.remove_hooks()
+        return False
+
     @torch.enable_grad()
     def generate(
         self,
@@ -233,6 +240,13 @@ class ScoreCAM:
     def remove_hooks(self) -> None:
         if self._fwd_handle is not None:
             self._fwd_handle.remove()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.remove_hooks()
+        return False
 
     @torch.no_grad()
     def generate(

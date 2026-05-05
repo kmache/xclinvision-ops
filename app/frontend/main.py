@@ -208,7 +208,11 @@ with st.sidebar:
     # Disclaimer
     st.warning(UI.DISCLAIMER)
 
-    st.caption(f"XClinVision v{UI.APP_VERSION} — © 2026 NounCode AI")
+    st.markdown(
+        "<p style='text-align: center; font-size: 0.8rem; margin-top: 10px;'>Built with ❤️ for better healthcare AI</p>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"<div style='text-align: center;'>XClinVision v{{UI.APP_VERSION}} — © 2026 NounCode AI</div>", unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------

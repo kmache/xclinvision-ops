@@ -310,15 +310,33 @@ def render_impression_section() -> tuple[str, str]:
         f"Additional comments</span>",
         unsafe_allow_html=True,
     )
+    st.markdown(
+        f"<p style='font-size:12px;color:{COLORS['neutral']};margin:2px 0 6px 0;opacity:0.75;'>"
+        f"Add clinician notes, follow-up instructions, or contextual observations. "
+        f"These will appear in the exported report under a styled 'Clinician Notes' section.</p>",
+        unsafe_allow_html=True,
+    )
     if "report_comments" not in st.session_state:
         st.session_state["report_comments"] = ""
     comments = st.text_area(
         "Additional comments",
-        height=80,
-        placeholder="Additional comments",
+        height=140,
+        placeholder="e.g. Patient reports chronic cough for 3 weeks. Correlate with sputum cytology.\nFollow-up CT recommended if findings persist.",
         key="report_comments",
         label_visibility="collapsed",
     )
+
+    # Show conversation log inclusion toggle
+    conv_log = _build_conversation_log()
+    include_conv = False
+    if conv_log:
+        include_conv = st.checkbox(
+            f"Include AI consultation log ({len(conv_log)} messages) in report",
+            value=True,
+            key="report_include_conv_log",
+        )
+    st.session_state["report_conversation_log"] = conv_log if include_conv else []
+
     return impression, comments
 
 
@@ -342,12 +360,31 @@ def render_report_preview(
         preview_parts = []
         if indication.strip():
             preview_parts.append(f"**Indication:** {indication.strip()}")
+
+        # Predictions summary from current analysis
+        analysis = _get_analysis()
+        preds = analysis.get("top_k_predictions", [])
+        positive_preds = [
+            p for p in preds
+            if p.get("probability", 0) >= 0.5 and p.get("class_name") != "No finding"
+        ]
+        if positive_preds:
+            pred_lines = " &bull; ".join(
+                f"{p['class_name']} ({p['probability']:.1%})"
+                for p in sorted(positive_preds, key=lambda x: x.get("probability", 0), reverse=True)
+            )
+            preview_parts.append(f"**Key Findings:** {pred_lines}")
+
         if impression.strip():
             preview_parts.append(f"**Impression:** {impression.strip()}")
         if comments.strip():
-            preview_parts.append(f"**Additional notes:** {comments.strip()}")
+            preview_parts.append(f"**Clinician Notes:** {comments.strip()}")
 
-        analysis = _get_analysis()
+        # Conversation log summary
+        conv_log = st.session_state.get("report_conversation_log", [])
+        if conv_log:
+            preview_parts.append(f"**AI Consultation Log:** {len(conv_log)} messages included")
+
         if analysis.get("analysis_id"):
             preview_parts.append(f"**Analysis ID:** {analysis['analysis_id']}")
 
@@ -421,6 +458,7 @@ def render_report_preview(
                             analysis_id=analysis_id,
                             indication=indication,
                             comments=comments,
+                            conversation_log=st.session_state.get("report_conversation_log"),
                         )
                     if result and result.get("html"):
                         st.session_state["_export_html"] = result["html"]
@@ -441,6 +479,7 @@ def render_report_preview(
                             analysis_id=analysis_id,
                             indication=indication,
                             comments=comments,
+                            conversation_log=st.session_state.get("report_conversation_log"),
                         )
                     if result and result.get("pdf_base64"):
                         import base64 as b64mod
