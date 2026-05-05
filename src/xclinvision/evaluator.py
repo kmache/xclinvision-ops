@@ -32,10 +32,17 @@ class MetricsComputer:
     sensitivity, specificity, AUC-ROC, and sklearn classification report.
     """
 
-    def __init__(self, class_names: Optional[List[str]] = None):
+    def __init__(
+        self,
+        class_names: Optional[List[str]] = None,
+        multilabel: Optional[bool] = None,
+    ):
         from xclinvision.config import get_class_names, is_multilabel
         self.class_names = class_names or get_class_names()
-        self.multilabel = is_multilabel()
+        # `multilabel` is now a hint; the authoritative routing in
+        # compute_all_metrics is the input-array shape. Keep the attribute
+        # for back-compat with callers that mutate it directly.
+        self.multilabel = is_multilabel() if multilabel is None else multilabel
 
     # ------------------------------------------------------------------
     # Full metric suite
@@ -49,8 +56,14 @@ class MetricsComputer:
     ) -> Dict[str, float]:
         """Compute all evaluation metrics.
 
-        Supports both multi-class (integer labels) and multi-label (binary
-        matrix) depending on ``self.multilabel``.
+        Routing is determined by the *shape* of ``y_true``:
+
+        - 1-D integer labels → multiclass metrics
+        - 2-D binary matrix (N, num_classes) → multilabel metrics
+
+        ``self.multilabel`` is retained as a hint for back-compat but is
+        ignored when it conflicts with the input shape. Mismatched arrays
+        (e.g. 1-D y_true with 2-D y_pred) raise ValueError.
 
         Args:
             y_true: Ground-truth labels — shape (N,) for multiclass or
@@ -61,7 +74,15 @@ class MetricsComputer:
         Returns:
             Flat dict mapping metric names to float values.
         """
-        if self.multilabel:
+        y_true = np.asarray(y_true)
+        y_pred = np.asarray(y_pred)
+        if y_true.ndim != y_pred.ndim:
+            raise ValueError(
+                f"y_true.ndim ({y_true.ndim}) != y_pred.ndim ({y_pred.ndim}); "
+                "use 1-D arrays for multiclass or 2-D for multilabel."
+            )
+        is_ml = y_true.ndim == 2 and y_true.shape[-1] > 1
+        if is_ml:
             return self._compute_multilabel_metrics(y_true, y_pred, y_probs)
         return self._compute_multiclass_metrics(y_true, y_pred, y_probs)
 
