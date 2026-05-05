@@ -124,6 +124,16 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
+# ---------------------------------------------------------------------------
+# Routers (Issue #8: incremental extraction of the god-module)
+# ---------------------------------------------------------------------------
+try:
+    from .routers.llm import router as _llm_router  # type: ignore[import-not-found]
+except ImportError:
+    from routers.llm import router as _llm_router  # type: ignore[import-not-found,no-redef]
+
+app.include_router(_llm_router)
+
 # All Pydantic schemas are consolidated in schemas.py (imported at top).
 
 
@@ -1805,55 +1815,8 @@ async def get_feedback_stats():
 
 
 # ---------------------------------------------------------------------------
-# LLM Provider Management
+# LLM Provider Management — moved to app/backend/routers/llm.py
 # ---------------------------------------------------------------------------
-
-
-def _get_llm_manager():
-    """Return the module-level LLMManager singleton."""
-    from xclinvision.agent.llm_manager import get_llm_manager
-    return get_llm_manager()
-
-
-@app.get("/api/v2/llm/providers")
-async def list_llm_providers():
-    """List available LLM providers and current active provider."""
-    try:
-        manager = _get_llm_manager()
-        return {
-            "providers": manager.available_providers,
-            "active": manager.active_name,
-        }
-    except Exception as e:
-        logger.warning("Failed to list LLM providers: %s", e)
-        return {"providers": [], "active": None, "error": str(e)}
-
-
-@app.post("/api/v2/llm/switch", dependencies=[Depends(require_auth)])
-async def switch_llm_provider(provider: str = Form(...)):
-    """Switch the active LLM provider at runtime."""
-    try:
-        manager = _get_llm_manager()
-        manager.set_active(provider)
-        return {"active": manager.active_name, "status": "switched"}
-    except ValueError as e:
-        raise HTTPException(400, detail=str(e))
-    except Exception as e:
-        logger.warning("Failed to switch LLM provider: %s", e)
-        raise HTTPException(500, detail=f"Provider switch failed: {e}")
-
-
-@app.get("/api/v2/llm/health")
-async def llm_provider_health():
-    """Health check for all registered LLM providers."""
-    try:
-        manager = _get_llm_manager()
-        return {
-            "active": manager.active_name,
-            "status": manager.provider_status(),
-        }
-    except Exception as e:
-        return {"active": None, "status": {}, "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
