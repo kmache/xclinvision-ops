@@ -85,6 +85,10 @@ def _safe_open_rgb(raw: bytes, max_pixels: int = MAX_IMAGE_PIXELS) -> Image.Imag
 
 
 _IMAGE_STORE_MAX = 200
+# Hard cap on aggregate bytes retained in _image_store. With _IMAGE_STORE_MAX=200
+# and MAX_UPLOAD_BYTES=20 MB, raw retention can reach ~4 GB. Cap at 256 MB and
+# evict oldest until under both limits.
+_IMAGE_STORE_MAX_BYTES = int(os.environ.get("IMAGE_STORE_MAX_BYTES", 256 * 1024 * 1024))
 
 
 @asynccontextmanager
@@ -755,13 +759,20 @@ def _feedback_store_append(entry: dict) -> None:
         _feedback_store.pop(0)
 
 def _image_store_put(analysis_id: str, data: bytes) -> None:
-    """Insert into _image_store with FIFO eviction capped at _IMAGE_STORE_MAX.
+    """Insert into _image_store with FIFO eviction.
 
-    Fix #16: unbounded _image_store accumulates raw image bytes and will OOM
-    under sustained concurrent usage.  Evict the oldest entry when the cap
-    is reached so memory stays bounded.
+    Bounded by both:
+      - count (_IMAGE_STORE_MAX, default 200 entries)
+      - aggregate bytes (_IMAGE_STORE_MAX_BYTES, default 256 MB)
+
+    Without the byte cap, sustained traffic of large uploads (~20 MB each)
+    against the 200-entry count cap could retain up to ~4 GB of raw image
+    bytes in process memory.
     """
-    if len(_image_store) >= _IMAGE_STORE_MAX:
+    while (len(_image_store) >= _IMAGE_STORE_MAX or
+           sum(len(v) for v in _image_store.values()) + len(data) > _IMAGE_STORE_MAX_BYTES):
+        if not _image_store:
+            break
         oldest_key = next(iter(_image_store))
         del _image_store[oldest_key]
     _image_store[analysis_id] = data
