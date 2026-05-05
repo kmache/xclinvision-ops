@@ -30,6 +30,12 @@ _TMP_STORAGE_DIR = Path(tempfile.mkdtemp(prefix="xclinvision_test_storage_"))
 os.environ.setdefault("XCLINVISION_DB_PATH", str(_TMP_STORAGE_DIR / "xclinvision.db"))
 os.environ.setdefault("XCLINVISION_IMAGE_DIR", str(_TMP_STORAGE_DIR / "images"))
 
+# Use a deterministic test token so the bearer-auth dependency lets the
+# session-scoped TestClient through. Every test that hits a protected
+# endpoint relies on the default Authorization header injected below.
+_TEST_TOKEN = "test-token-please-change"
+os.environ.setdefault("XCLINVISION_API_TOKEN", _TEST_TOKEN)
+
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -44,7 +50,16 @@ def app():
 
 @pytest.fixture(scope="session")
 def client(app):
-    """Session-scoped synchronous TestClient."""
+    """Session-scoped synchronous TestClient with the bearer token preset."""
+    from starlette.testclient import TestClient
+    with TestClient(app) as c:
+        c.headers.update({"Authorization": f"Bearer {_TEST_TOKEN}"})
+        yield c
+
+
+@pytest.fixture(scope="session")
+def unauth_client(app):
+    """TestClient with no Authorization header — for negative auth tests."""
     from starlette.testclient import TestClient
     with TestClient(app) as c:
         yield c

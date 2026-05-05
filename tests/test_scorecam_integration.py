@@ -31,7 +31,11 @@ def app():
 @pytest.fixture(scope="session")
 def client(app):
     from starlette.testclient import TestClient
+    import os as _os
     with TestClient(app) as c:
+        token = _os.environ.get("XCLINVISION_API_TOKEN", "").strip()
+        if token:
+            c.headers.update({"Authorization": f"Bearer {token}"})
         yield c
 
 

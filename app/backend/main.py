@@ -27,8 +27,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from xclinvision.config import get_class_names, get_num_classes
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
+
+try:
+    from .auth import require_auth  # type: ignore[import-not-found]
+except ImportError:
+    from auth import require_auth  # type: ignore[import-not-found,no-redef]
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Any, List, Optional, Dict, TYPE_CHECKING
@@ -884,7 +889,7 @@ def _generate_heatmap_overlay(
 # Dashboard v2: Analyze endpoint (full pipeline)
 # ---------------------------------------------------------------------------
 
-@app.post("/api/v2/analyze")
+@app.post("/api/v2/analyze", dependencies=[Depends(require_auth)])
 async def analyze_image(
     file: UploadFile = File(...),
     patient_id: str = Form(default="UNKNOWN"),
@@ -1164,7 +1169,7 @@ async def _run_single_analysis(
     return analysis_data
 
 
-@app.post("/api/v2/compare")
+@app.post("/api/v2/compare", dependencies=[Depends(require_auth)])
 async def compare_images(
     file_a: UploadFile = File(...),
     file_b: UploadFile = File(...),
@@ -1197,7 +1202,7 @@ async def compare_images(
 # Dashboard v2: Explanation with adjustable params
 # ---------------------------------------------------------------------------
 
-@app.get("/api/v2/explain/{analysis_id}")
+@app.get("/api/v2/explain/{analysis_id}", dependencies=[Depends(require_auth)])
 async def get_dashboard_explanation(
     analysis_id: str,
     method: str = Query(default="gradcam++"),
@@ -1283,7 +1288,7 @@ async def get_dashboard_explanation(
 # Dashboard v2: Patient history
 # ---------------------------------------------------------------------------
 
-@app.get("/api/v2/history/{patient_id}")
+@app.get("/api/v2/history/{patient_id}", dependencies=[Depends(require_auth)])
 async def get_patient_history(patient_id: str, limit: int = Query(default=50, le=200)):
     """Retrieve all historical analyses for a patient (temporal comparison)."""
     history = [
@@ -1314,7 +1319,7 @@ async def get_patient_history(patient_id: str, limit: int = Query(default=50, le
 # Dashboard v2: Feedback
 # ---------------------------------------------------------------------------
 
-@app.post("/api/v2/feedback")
+@app.post("/api/v2/feedback", dependencies=[Depends(require_auth)])
 async def submit_dashboard_feedback(feedback: DashboardFeedbackRequest):
     """Store clinician feedback from the dashboard UI."""
     entry = feedback.model_dump()
@@ -1338,7 +1343,7 @@ async def submit_dashboard_feedback(feedback: DashboardFeedbackRequest):
 # Dashboard v2: LLM Chat
 # ---------------------------------------------------------------------------
 
-@app.post("/api/v2/chat")
+@app.post("/api/v2/chat", dependencies=[Depends(require_auth)])
 async def llm_chat(request: ChatRequest):
     """Context-aware LLM chat powered by the reasoning agent.
 
@@ -1398,7 +1403,7 @@ async def llm_chat(request: ChatRequest):
 # Dashboard v2: Report generation
 # ---------------------------------------------------------------------------
 
-@app.post("/api/v2/generate-report")
+@app.post("/api/v2/generate-report", dependencies=[Depends(require_auth)])
 async def generate_dashboard_report(request: DashboardReportRequest):
     """Generate a structured clinical report from one or more analyses."""
     analyses = [_analysis_store.get(aid) for aid in request.analysis_ids]
@@ -1471,7 +1476,7 @@ async def generate_dashboard_report(request: DashboardReportRequest):
 # ---------------------------------------------------------------------------
 
 
-@app.post("/api/v2/export-report")
+@app.post("/api/v2/export-report", dependencies=[Depends(require_auth)])
 async def export_report_html(request: ExportReportRequest):
     """Generate a clinical report in HTML, PDF, or JSON format."""
     stored = _analysis_store.get(request.analysis_id)
@@ -1642,7 +1647,7 @@ async def export_report_html(request: ExportReportRequest):
 # Dashboard v2: Drift metrics
 # ---------------------------------------------------------------------------
 
-@app.get("/api/v2/drift-metrics")
+@app.get("/api/v2/drift-metrics", dependencies=[Depends(require_auth)])
 async def get_drift_metrics(days: int = Query(default=30, ge=1, le=365)):
     """Return drift monitoring metrics from prediction logs."""
     try:
@@ -1765,7 +1770,7 @@ async def get_model_card():
 # Dashboard v2: Feedback statistics
 # ---------------------------------------------------------------------------
 
-@app.get("/api/v2/feedback-stats")
+@app.get("/api/v2/feedback-stats", dependencies=[Depends(require_auth)])
 async def get_feedback_stats():
     """Return aggregated feedback statistics for the audit dashboard."""
     total = len(_feedback_store)
@@ -1824,7 +1829,7 @@ async def list_llm_providers():
         return {"providers": [], "active": None, "error": str(e)}
 
 
-@app.post("/api/v2/llm/switch")
+@app.post("/api/v2/llm/switch", dependencies=[Depends(require_auth)])
 async def switch_llm_provider(provider: str = Form(...)):
     """Switch the active LLM provider at runtime."""
     try:
@@ -1868,7 +1873,7 @@ def _build_sse_event(data: str, event: str = "message") -> str:
     return f"event: {event}\n{data_part}\n\n"
 
 
-@app.post("/api/v2/chat/stream")
+@app.post("/api/v2/chat/stream", dependencies=[Depends(require_auth)])
 async def llm_chat_stream(request: ChatRequest):
     """Streaming chat endpoint using Server-Sent Events.
 

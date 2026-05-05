@@ -7,6 +7,7 @@ across view files.
 """
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -40,7 +41,14 @@ class XClinVisionClient:
 
     def __init__(self) -> None:
         self.session = requests.Session()
-        logger.info("XClinVision API Client initialized")
+        token = os.environ.get("XCLINVISION_API_TOKEN", "").strip()
+        if token:
+            self.session.headers["Authorization"] = f"Bearer {token}"
+            logger.info("XClinVision API Client initialized (bearer token attached)")
+        else:
+            logger.warning(
+                "XCLINVISION_API_TOKEN unset; protected v2 endpoints will return 401."
+            )
 
     # ------------------------------------------------------------------
     # Internal helpers
