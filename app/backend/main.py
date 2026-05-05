@@ -245,14 +245,15 @@ def get_pipeline(model_name: Optional[str] = None):
     Caches pipelines so each architecture is loaded only once.
     """
     # 1. Try to resolve from the auto-discovered registry
+    # NOTE: the cache lookup is intentionally done only under the lock. A prior
+    # unlocked fast-path read could race with eviction (see _MAX_PIPELINE_CACHE
+    # branch below) and raise KeyError between the ``in`` check and the ``[]``.
     if model_name and model_name in _model_registry:
-        if model_name in _pipeline_cache:
-            return _pipeline_cache[model_name]
         meta = _model_registry[model_name]
         with _pipeline_lock:
-            # Double-check after acquiring lock
-            if model_name in _pipeline_cache:
-                return _pipeline_cache[model_name]
+            cached = _pipeline_cache.get(model_name)
+            if cached is not None:
+                return cached
             try:
                 pipeline = _build_pipeline(
                     model_path=meta["_pth_path"],
@@ -275,12 +276,11 @@ def get_pipeline(model_name: Optional[str] = None):
     if env_path and Path(env_path).exists():
         env_arch = os.getenv("XCLINVISION_ARCHITECTURE", "convnext_small")
         cache_key = f"_env_{env_arch}"
-        if cache_key in _pipeline_cache:
-            return _pipeline_cache[cache_key]
         image_size = int(os.getenv("XCLINVISION_IMAGE_SIZE", "384"))
         with _pipeline_lock:
-            if cache_key in _pipeline_cache:
-                return _pipeline_cache[cache_key]
+            cached = _pipeline_cache.get(cache_key)
+            if cached is not None:
+                return cached
             pipeline = _build_pipeline(env_path, env_arch, image_size)
             _pipeline_cache[cache_key] = pipeline
             return pipeline
