@@ -125,7 +125,7 @@ def test_temperature_scaler_skipped_for_multilabel():
     """TemperatureScaler.fit should not be called when is_multilabel() is True."""
     from xclinvision.config import is_multilabel
     if is_multilabel():
-        from xclinvision.reliability import TemperatureScaler
+        from xclinvision.evaluator import TemperatureScaler
         ts = TemperatureScaler()
         # In multilabel mode, scaler should either not fit or return identity
         assert hasattr(ts, 'temperature')
