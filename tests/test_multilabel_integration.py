@@ -29,7 +29,7 @@ def test_get_class_weights_multilabel_returns_pos_weight():
 def test_multilabel_focal_loss_output_shape():
     logits = torch.randn(8, 3)
     targets = torch.randint(0, 2, (8, 3)).float()
-    from xclinvision.trainer import MultilabelFocalLoss
+    from xclinvision.losses import MultilabelFocalLoss
     loss_fn = MultilabelFocalLoss(gamma=2.0)
     loss = loss_fn(logits, targets)
     assert loss.shape == ()
