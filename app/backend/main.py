@@ -60,6 +60,30 @@ from schemas import (
 MAX_UPLOAD_MB = 20
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
+# PIL decompression-bomb guard: cap pixel count for any decoded image.
+# A 20 MB compressed PNG/TIFF can decode to multi-GB pixel buffers, so
+# bounding compressed bytes is not enough.
+MAX_IMAGE_PIXELS = 50_000_000  # 50 megapixels, well above any clinical CXR
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
+
+def _safe_open_rgb(raw: bytes, max_pixels: int = MAX_IMAGE_PIXELS) -> Image.Image:
+    """Decode bytes into an RGB PIL image, refusing decompression bombs.
+
+    Validates declared pixel count via ``Image.size`` BEFORE decoding the
+    full pixel buffer (Pillow lazy-loads on first access). Raises
+    HTTPException(413) on oversize input.
+    """
+    img = Image.open(io.BytesIO(raw))
+    w, h = img.size
+    if w * h > max_pixels:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image too large: {w}x{h} exceeds {max_pixels} pixel cap",
+        )
+    return img.convert("RGB")
+
+
 _IMAGE_STORE_MAX = 200
 
 
@@ -101,6 +125,7 @@ app.add_middleware(
 
 _pipeline_cache: Dict[str, "InferencePipeline"] = {}
 _pipeline_lock = threading.Lock()
+_MAX_PIPELINE_CACHE = int(os.getenv("XCLINVISION_MAX_CACHED_MODELS", "4"))
 
 # Directory containing exported best model .pth files + _meta.json sidecars
 _MODELS_DIR = Path(os.getenv(
@@ -216,6 +241,11 @@ def get_pipeline(model_name: Optional[str] = None):
                     architecture=model_name,
                     image_size=384,  # All best_models are trained at 384
                 )
+                # Evict oldest entry if cache is full
+                if len(_pipeline_cache) >= _MAX_PIPELINE_CACHE:
+                    oldest = next(iter(_pipeline_cache))
+                    del _pipeline_cache[oldest]
+                    logger.info("Evicted model '%s' from pipeline cache", oldest)
                 _pipeline_cache[model_name] = pipeline
                 logger.info("Loaded model '%s' from registry (%s)", model_name, meta["_pth_path"])
                 return pipeline
@@ -494,7 +524,9 @@ async def predict(
         raise HTTPException(400, "File content does not match a supported image format (JPEG, PNG, BMP, TIFF, DICOM).")
 
     try:
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
+        image = _safe_open_rgb(contents)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(400, f"Could not process image: {str(e)}")
 
@@ -566,7 +598,9 @@ async def explain(
             f"File too large. Maximum upload size is {MAX_UPLOAD_MB} MB.",
         )
     try:
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
+        image = _safe_open_rgb(contents)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(400, f"Could not process image: {str(e)}")
 
@@ -612,7 +646,7 @@ async def generate_report(request: ReportRequest):
 
     context = ClinicalContext(
         prediction=class_names[request.prediction],
-        probabilities=[0.0] * num_classes,  # Placeholder (dynamic length)
+        probabilities=request.probabilities if request.probabilities and len(request.probabilities) == num_classes else [0.0] * num_classes,
         confidence=request.confidence,
         uncertainty_level=request.uncertainty_level,
         highlighted_regions=request.highlighted_regions,
@@ -806,10 +840,18 @@ async def analyze_image(
         from xclinvision.processing import read_image_grayscale
         gray = read_image_grayscale(contents)
         if gray is not None:
+            h, w = gray.shape[:2]
+            if w * h > MAX_IMAGE_PIXELS:
+                raise HTTPException(
+                    413,
+                    f"Image too large: {w}x{h} exceeds {MAX_IMAGE_PIXELS} pixel cap",
+                )
             image_np = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
         else:
-            image = Image.open(io.BytesIO(contents)).convert("RGB")
+            image = _safe_open_rgb(contents)
             image_np = np.array(image)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(400, f"Could not process image: {e}")
     analysis_id = f"XCL-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
@@ -938,11 +980,13 @@ async def analyze_image(
     # Store for later retrieval (compress stored image to save memory)
     _analysis_store_put(analysis_id, analysis_data)
     try:
-        _store_img = Image.open(io.BytesIO(contents)).convert("RGB")
+        _store_img = _safe_open_rgb(contents)
         _buf = io.BytesIO()
         _store_img.save(_buf, format="JPEG", quality=80)
         # Fix #16: use evicting helper to prevent unbounded memory growth.
         _image_store_put(analysis_id, _buf.getvalue())
+    except HTTPException:
+        raise
     except Exception:
         _image_store_put(analysis_id, contents)
 
@@ -966,9 +1010,17 @@ async def _run_single_analysis(
         from xclinvision.processing import read_image_grayscale
         gray = read_image_grayscale(contents)
         if gray is not None:
+            h, w = gray.shape[:2]
+            if w * h > MAX_IMAGE_PIXELS:
+                raise HTTPException(
+                    413,
+                    f"Image too large: {w}x{h} exceeds {MAX_IMAGE_PIXELS} pixel cap",
+                )
             image_np = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
         else:
-            image_np = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
+            image_np = np.array(_safe_open_rgb(contents))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(400, f"Could not process image: {e}")
 
@@ -1093,7 +1145,7 @@ async def get_dashboard_explanation(
     if pipeline is None:
         raise HTTPException(503, "No model loaded.")
 
-    image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    image = _safe_open_rgb(raw_bytes)
     image_np = np.array(image)
 
     # Resolve target class index from the finding name
@@ -1456,8 +1508,7 @@ async def export_report_html(request: ExportReportRequest):
         # Use the real uploaded image when available
         raw_bytes = _image_store.get(request.analysis_id)
         if raw_bytes:
-            from PIL import Image as PILImage
-            _pil = PILImage.open(io.BytesIO(raw_bytes)).convert("RGB")
+            _pil = _safe_open_rgb(raw_bytes)
             image_data = np.array(_pil)
         else:
             image_data = np.full((384, 384, 3), 128, dtype=np.uint8)
@@ -1469,6 +1520,7 @@ async def export_report_html(request: ExportReportRequest):
             image_data=image_data,
             patient_meta=stored.get("patient_meta"),
             indication=request.indication,
+            conversation_log=request.conversation_log,
             comments=request.comments,
         )
 
