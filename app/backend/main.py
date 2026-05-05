@@ -685,7 +685,7 @@ async def submit_feedback(feedback: FeedbackRequest):
     feedback_entry = {
         "feedback_id": f"fb_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}",
         "timestamp": datetime.now().isoformat(),
-        **feedback.dict(),
+        **feedback.model_dump(),
     }
     _feedback_store_append(feedback_entry)
     logger.info(
