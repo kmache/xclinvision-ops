@@ -11,7 +11,7 @@ import albumentations as A
 import cv2
 import numpy as np
 import pandas as pd
-import pytorch_lightning as pl
+# pytorch_lightning is imported lazily inside _build_chestxray_datamodule(); see __getattr__ at bottom.
 import torch
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
@@ -191,238 +191,258 @@ class ChestXrayDataset(Dataset):
 # ---------------------------------------------------------------------------
 # 3. DataModule 
 # ---------------------------------------------------------------------------
-class ChestXrayDataModule(pl.LightningDataModule):
-    def __init__(
-        self, 
-        manifest_path: str,
-        config: PipelineConfig,
-        batch_size: int = 32, 
-        num_workers: int = 4,
-        image_size: int = 512, 
-        cache_size: int = 1000, 
-        use_weighted_sampler: bool = True,
-        mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
-        std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
-        horizontal_flip: bool = True,
-        preload: bool = False,
-        aug_strength: float = 1.0,
-    ):
-        super().__init__()
-        self.manifest_path = Path(manifest_path)
-        self.config = config
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.image_size = image_size
-        self._cache_per_worker = max(0, cache_size // num_workers) if num_workers > 0 else cache_size
-        self.use_weighted_sampler = use_weighted_sampler
-        self.mean, self.std = mean, std
-        self.horizontal_flip = horizontal_flip
-        self.preload = preload
-        self.aug_strength = aug_strength
-        
-        self.train_dataset = None
-        self.val_dataset = None
-        self.test_dataset = None
-        self.predict_dataset = None
-        
-    def setup(self, stage: Optional[str] = None):
-        if not self.manifest_path.exists():
-            raise FileNotFoundError(f"Manifest not found: {self.manifest_path}")
-            
-        df = pd.read_csv(self.manifest_path)
-        required = {'split', 'filepath_processed'}
-        required |= set(self.config.class_names) if self.config.multilabel else {'class'}
-        
-        if required - set(df.columns):
-            raise ValueError(f"Manifest missing required columns: {required - set(df.columns)}")
 
-        if stage in ("fit", None) and self.train_dataset is None:
-            self.train_dataset = ChestXrayDataset(
-                df[df['split'] == 'train'], self.config, 
-                get_train_transforms(self.image_size, self.mean, self.std, self.horizontal_flip, self.aug_strength), 
-                self._cache_per_worker, self.image_size
-            )
-            # Shuffle val split once so positive samples are spread across
-            # batches — avoids all-zero batches when prevalence is low.
-            val_df = df[df['split'] == 'val'].sample(frac=1, random_state=42)
-            self.val_dataset = ChestXrayDataset(
-                val_df, self.config,
-                get_val_transforms(self.image_size, self.mean, self.std), 
-                0, self.image_size
-            )
+
+# ---------------------------------------------------------------------------
+# DataModule (lazy)
+# ---------------------------------------------------------------------------
+# pytorch_lightning is imported only when ChestXrayDataModule is actually
+# accessed, so importing this module (e.g. for transforms or ChestXrayDataset)
+# does not require pl to load successfully.
+
+def _build_chestxray_datamodule():
+    import pytorch_lightning as pl
+
+    class ChestXrayDataModule(pl.LightningDataModule):
+        def __init__(
+            self, 
+            manifest_path: str,
+            config: PipelineConfig,
+            batch_size: int = 32, 
+            num_workers: int = 4,
+            image_size: int = 512, 
+            cache_size: int = 1000, 
+            use_weighted_sampler: bool = True,
+            mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
+            std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
+            horizontal_flip: bool = True,
+            preload: bool = False,
+            aug_strength: float = 1.0,
+        ):
+            super().__init__()
+            self.manifest_path = Path(manifest_path)
+            self.config = config
+            self.batch_size = batch_size
+            self.num_workers = num_workers
+            self.image_size = image_size
+            self._cache_per_worker = max(0, cache_size // num_workers) if num_workers > 0 else cache_size
+            self.use_weighted_sampler = use_weighted_sampler
+            self.mean, self.std = mean, std
+            self.horizontal_flip = horizontal_flip
+            self.preload = preload
+            self.aug_strength = aug_strength
             
-        if stage in ("test", "predict", None):
-            if self.test_dataset is None:
-                test_df = df[df['split'] == 'test'].sample(frac=1, random_state=42)
-                self.test_dataset = ChestXrayDataset(
-                    test_df, self.config,
+            self.train_dataset = None
+            self.val_dataset = None
+            self.test_dataset = None
+            self.predict_dataset = None
+            
+        def setup(self, stage: Optional[str] = None):
+            if not self.manifest_path.exists():
+                raise FileNotFoundError(f"Manifest not found: {self.manifest_path}")
+                
+            df = pd.read_csv(self.manifest_path)
+            required = {'split', 'filepath_processed'}
+            required |= set(self.config.class_names) if self.config.multilabel else {'class'}
+            
+            if required - set(df.columns):
+                raise ValueError(f"Manifest missing required columns: {required - set(df.columns)}")
+
+            if stage in ("fit", None) and self.train_dataset is None:
+                self.train_dataset = ChestXrayDataset(
+                    df[df['split'] == 'train'], self.config, 
+                    get_train_transforms(self.image_size, self.mean, self.std, self.horizontal_flip, self.aug_strength), 
+                    self._cache_per_worker, self.image_size
+                )
+                # Shuffle val split once so positive samples are spread across
+                # batches — avoids all-zero batches when prevalence is low.
+                val_df = df[df['split'] == 'val'].sample(frac=1, random_state=42)
+                self.val_dataset = ChestXrayDataset(
+                    val_df, self.config,
                     get_val_transforms(self.image_size, self.mean, self.std), 
                     0, self.image_size
                 )
-            self.predict_dataset = self.test_dataset
+                
+            if stage in ("test", "predict", None):
+                if self.test_dataset is None:
+                    test_df = df[df['split'] == 'test'].sample(frac=1, random_state=42)
+                    self.test_dataset = ChestXrayDataset(
+                        test_df, self.config,
+                        get_val_transforms(self.image_size, self.mean, self.std), 
+                        0, self.image_size
+                    )
+                self.predict_dataset = self.test_dataset
 
-        if self.preload:
-            self._preload_images()
-            
-        # Log dataset state on initial setup
-        if stage in ("fit", None):
-            stats = self.get_statistics()
-            logger.info("Dataset stats: train=%d, val=%d, test=%d", 
-                        stats['train_samples'], stats['val_samples'], stats['test_samples'])
+            if self.preload:
+                self._preload_images()
+                
+            # Log dataset state on initial setup
+            if stage in ("fit", None):
+                stats = self.get_statistics()
+                logger.info("Dataset stats: train=%d, val=%d, test=%d", 
+                            stats['train_samples'], stats['val_samples'], stats['test_samples'])
 
-    def _preload_images(self) -> None:
-        datasets = [
-            ds for ds in (self.train_dataset, self.val_dataset, self.test_dataset)
-            if ds is not None and hasattr(ds, '_load_image_impl')
-        ]
-        
-        if not datasets:
-            logger.warning("No datasets available for preloading")
-            return
+        def _preload_images(self) -> None:
+            datasets = [
+                ds for ds in (self.train_dataset, self.val_dataset, self.test_dataset)
+                if ds is not None and hasattr(ds, '_load_image_impl')
+            ]
             
-        all_paths = {p for ds in datasets for p in ds.df["filepath_processed"]}
-        logger.info("Preloading %d images into RAM …", len(all_paths))
-        
-        shared = {path: datasets[0]._load_image_impl(path) for path in all_paths}
-        for ds in datasets:
-            ds._preloaded = shared
+            if not datasets:
+                logger.warning("No datasets available for preloading")
+                return
+                
+            all_paths = {p for ds in datasets for p in ds.df["filepath_processed"]}
+            logger.info("Preloading %d images into RAM …", len(all_paths))
             
-        total_bytes = sum(img.nbytes for img in shared.values())
-        logger.info("Preload complete: %.2f GB (%d images)", total_bytes / 1e9, len(shared))
+            shared = {path: datasets[0]._load_image_impl(path) for path in all_paths}
+            for ds in datasets:
+                ds._preloaded = shared
+                
+            total_bytes = sum(img.nbytes for img in shared.values())
+            logger.info("Preload complete: %.2f GB (%d images)", total_bytes / 1e9, len(shared))
 
-    def get_class_weights(self) -> torch.Tensor:
-        """
-        Computes weights for class imbalance correction.
-        
-        Returns:
-            torch.Tensor:
-                - Multilabel: returns `pos_weight` for BCEWithLogitsLoss (num_neg / num_pos).
-                - Multiclass: returns sample probability weights for WeightedRandomSampler.
-        """
-        if self.config.multilabel:
-            label_matrix = self.train_dataset.labels
-            pos_counts = label_matrix.sum(axis=0)
-            neg_counts = len(label_matrix) - pos_counts
-            return torch.tensor(neg_counts / np.maximum(pos_counts, 1), dtype=torch.float32)
+        def get_class_weights(self) -> torch.Tensor:
+            """
+            Computes weights for class imbalance correction.
+            
+            Returns:
+                torch.Tensor:
+                    - Multilabel: returns `pos_weight` for BCEWithLogitsLoss (num_neg / num_pos).
+                    - Multiclass: returns sample probability weights for WeightedRandomSampler.
+            """
+            if self.config.multilabel:
+                label_matrix = self.train_dataset.labels
+                pos_counts = label_matrix.sum(axis=0)
+                neg_counts = len(label_matrix) - pos_counts
+                return torch.tensor(neg_counts / np.maximum(pos_counts, 1), dtype=torch.float32)
 
-        counts = self.train_dataset.df['class'].str.lower().value_counts().to_dict()
-        num_classes = len(self.config.class_names)
-        weights = torch.zeros(num_classes, dtype=torch.float32)
-        total = sum(counts.values()) or 1
-        
-        for class_name, label_idx in self.config.class_map.items():
-            count = max(counts.get(class_name.lower(), 0), 1)
-            weights[label_idx] = total / (num_classes * count)
+            counts = self.train_dataset.df['class'].str.lower().value_counts().to_dict()
+            num_classes = len(self.config.class_names)
+            weights = torch.zeros(num_classes, dtype=torch.float32)
+            total = sum(counts.values()) or 1
             
-        return weights / weights.sum() * len(weights)
+            for class_name, label_idx in self.config.class_map.items():
+                count = max(counts.get(class_name.lower(), 0), 1)
+                weights[label_idx] = total / (num_classes * count)
+                
+            return weights / weights.sum() * len(weights)
 
-    def get_sampler(self) -> Optional[WeightedRandomSampler]:
-        if not self.use_weighted_sampler: return None
-        
-        if self.config.multilabel:
-            label_matrix = self.train_dataset.labels  
-            pos_count = label_matrix.sum(axis=0)
+        def get_sampler(self) -> Optional[WeightedRandomSampler]:
+            if not self.use_weighted_sampler: return None
             
-            # Effective number of samples (Class-Balanced weighting strategy)
-            beta = 0.9999
-            eff_num = (1.0 - (beta ** np.maximum(pos_count, 1.0))) / (1.0 - beta)
-            class_weights = 1.0 / eff_num
-            
-            sample_weights_np = (label_matrix * class_weights).sum(axis=1)
-            
-            # Fix: Assign weight to "No finding" samples (all-zero label vectors)
-            no_finding_mask = label_matrix.sum(axis=1) == 0
-            no_finding_count = no_finding_mask.sum()
-            if no_finding_count > 0:
-                eff_num_nf = (1.0 - (beta ** no_finding_count)) / (1.0 - beta)
-                weight_nf = 1.0 / eff_num_nf
-                sample_weights_np[no_finding_mask] = weight_nf
+            if self.config.multilabel:
+                label_matrix = self.train_dataset.labels  
+                pos_count = label_matrix.sum(axis=0)
+                
+                # Effective number of samples (Class-Balanced weighting strategy)
+                beta = 0.9999
+                eff_num = (1.0 - (beta ** np.maximum(pos_count, 1.0))) / (1.0 - beta)
+                class_weights = 1.0 / eff_num
+                
+                sample_weights_np = (label_matrix * class_weights).sum(axis=1)
+                
+                # Fix: Assign weight to "No finding" samples (all-zero label vectors)
+                no_finding_mask = label_matrix.sum(axis=1) == 0
+                no_finding_count = no_finding_mask.sum()
+                if no_finding_count > 0:
+                    eff_num_nf = (1.0 - (beta ** no_finding_count)) / (1.0 - beta)
+                    weight_nf = 1.0 / eff_num_nf
+                    sample_weights_np[no_finding_mask] = weight_nf
 
-            sample_weights = torch.DoubleTensor(sample_weights_np)
-            # Normalization to prevent NaN/Inf in the sampler
-            sample_weights = sample_weights / sample_weights.sum() * len(sample_weights)
+                sample_weights = torch.DoubleTensor(sample_weights_np)
+                # Normalization to prevent NaN/Inf in the sampler
+                sample_weights = sample_weights / sample_weights.sum() * len(sample_weights)
+                return WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+                
+            weights = self.get_class_weights()
+            sample_weights = torch.DoubleTensor([weights[l].item() for l in self.train_dataset.labels])
             return WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+
+        def train_dataloader(self):
+            sampler = self.get_sampler()
+            pw = self.num_workers > 0 and len(self.train_dataset) > self.batch_size
+            return DataLoader(
+                self.train_dataset, batch_size=self.batch_size, shuffle=(sampler is None),
+                sampler=sampler, num_workers=self.num_workers, pin_memory=True,
+                drop_last=True, persistent_workers=pw,
+            )
+             
+        def val_dataloader(self):
+            pw = self.num_workers > 0 and len(self.val_dataset) > self.batch_size
+            return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, 
+                              num_workers=self.num_workers, pin_memory=True, persistent_workers=pw)
             
-        weights = self.get_class_weights()
-        sample_weights = torch.DoubleTensor([weights[l].item() for l in self.train_dataset.labels])
-        return WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+        def test_dataloader(self):
+            pw = self.num_workers > 0 and len(self.test_dataset) > self.batch_size
+            return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, 
+                              num_workers=self.num_workers, pin_memory=True, persistent_workers=pw)
 
-    def train_dataloader(self):
-        sampler = self.get_sampler()
-        pw = self.num_workers > 0 and len(self.train_dataset) > self.batch_size
-        return DataLoader(
-            self.train_dataset, batch_size=self.batch_size, shuffle=(sampler is None),
-            sampler=sampler, num_workers=self.num_workers, pin_memory=True,
-            drop_last=True, persistent_workers=pw,
-        )
-         
-    def val_dataloader(self):
-        pw = self.num_workers > 0 and len(self.val_dataset) > self.batch_size
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, 
-                          num_workers=self.num_workers, pin_memory=True, persistent_workers=pw)
-        
-    def test_dataloader(self):
-        pw = self.num_workers > 0 and len(self.test_dataset) > self.batch_size
-        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, 
-                          num_workers=self.num_workers, pin_memory=True, persistent_workers=pw)
+        def predict_dataloader(self):
+            pw = self.num_workers > 0 and len(self.predict_dataset) > self.batch_size
+            return DataLoader(self.predict_dataset, batch_size=self.batch_size, shuffle=False, 
+                              num_workers=self.num_workers, pin_memory=True, persistent_workers=pw)
 
-    def predict_dataloader(self):
-        pw = self.num_workers > 0 and len(self.predict_dataset) > self.batch_size
-        return DataLoader(self.predict_dataset, batch_size=self.batch_size, shuffle=False, 
-                          num_workers=self.num_workers, pin_memory=True, persistent_workers=pw)
+        def get_statistics(self) -> dict:
+            """Compute and return dataset statistics for reporting."""
+            if self.train_dataset is None or self.val_dataset is None or self.test_dataset is None:
+                self.setup()
 
-    def get_statistics(self) -> dict:
-        """Compute and return dataset statistics for reporting."""
-        if self.train_dataset is None or self.val_dataset is None or self.test_dataset is None:
-            self.setup()
-
-        if self.config.multilabel:
-            # 1. Dist for explicit diseases (using the filtered _class_names to avoid IndexError)
-            dist = {
-                name: {
-                    'train': int(self.train_dataset.labels[:, i].sum()),
-                    'val': int(self.val_dataset.labels[:, i].sum()),
-                    'test': int(self.test_dataset.labels[:, i].sum()),
+            if self.config.multilabel:
+                # 1. Dist for explicit diseases (using the filtered _class_names to avoid IndexError)
+                dist = {
+                    name: {
+                        'train': int(self.train_dataset.labels[:, i].sum()),
+                        'val': int(self.val_dataset.labels[:, i].sum()),
+                        'test': int(self.test_dataset.labels[:, i].sum()),
+                    }
+                    for i, name in enumerate(self.train_dataset._class_names)
                 }
-                for i, name in enumerate(self.train_dataset._class_names)
+                
+                # 2. Add 'No finding' back into the stats by counting the all-zero rows
+                dist['no finding'] = {
+                    'train': int((self.train_dataset.labels.sum(axis=1) == 0).sum()),
+                    'val': int((self.val_dataset.labels.sum(axis=1) == 0).sum()),
+                    'test': int((self.test_dataset.labels.sum(axis=1) == 0).sum()),
+                }
+
+                return {
+                    'train_samples': len(self.train_dataset),
+                    'val_samples': len(self.val_dataset),
+                    'test_samples': len(self.test_dataset),
+                    'class_distribution': dist,
+                    'class_weights': self.get_class_weights().tolist(),
+                }
+
+            # --- Multiclass Logic ---
+            train_counts = self.train_dataset.df['class'].str.lower().value_counts().to_dict()
+            val_counts = self.val_dataset.df['class'].str.lower().value_counts().to_dict()
+            test_counts = self.test_dataset.df['class'].str.lower().value_counts().to_dict()
+            
+            total_train = sum(train_counts.values())
+            
+            stats = {
+                'train_samples': total_train,
+                'val_samples': sum(val_counts.values()),
+                'test_samples': sum(test_counts.values()),
+                'class_distribution': {
+                    name.lower(): {
+                        'train': train_counts.get(name.lower(), 0),
+                        'val': val_counts.get(name.lower(), 0),
+                        'test': test_counts.get(name.lower(), 0),
+                    }
+                    for name in self.config.class_names
+                },
+                'class_weights': self.get_class_weights().tolist()
             }
             
-            # 2. Add 'No finding' back into the stats by counting the all-zero rows
-            dist['no finding'] = {
-                'train': int((self.train_dataset.labels.sum(axis=1) == 0).sum()),
-                'val': int((self.val_dataset.labels.sum(axis=1) == 0).sum()),
-                'test': int((self.test_dataset.labels.sum(axis=1) == 0).sum()),
-            }
+            return stats
+    return ChestXrayDataModule
 
-            return {
-                'train_samples': len(self.train_dataset),
-                'val_samples': len(self.val_dataset),
-                'test_samples': len(self.test_dataset),
-                'class_distribution': dist,
-                'class_weights': self.get_class_weights().tolist(),
-            }
 
-        # --- Multiclass Logic ---
-        train_counts = self.train_dataset.df['class'].str.lower().value_counts().to_dict()
-        val_counts = self.val_dataset.df['class'].str.lower().value_counts().to_dict()
-        test_counts = self.test_dataset.df['class'].str.lower().value_counts().to_dict()
-        
-        total_train = sum(train_counts.values())
-        
-        stats = {
-            'train_samples': total_train,
-            'val_samples': sum(val_counts.values()),
-            'test_samples': sum(test_counts.values()),
-            'class_distribution': {
-                name.lower(): {
-                    'train': train_counts.get(name.lower(), 0),
-                    'val': val_counts.get(name.lower(), 0),
-                    'test': test_counts.get(name.lower(), 0),
-                }
-                for name in self.config.class_names
-            },
-            'class_weights': self.get_class_weights().tolist()
-        }
-        
-        return stats
-
+def __getattr__(name):
+    if name == "ChestXrayDataModule":
+        cls = _build_chestxray_datamodule()
+        globals()["ChestXrayDataModule"] = cls
+        return cls
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

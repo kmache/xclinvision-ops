@@ -6,8 +6,12 @@ import numpy as np
 import torch
 import cv2
 from scipy.linalg import sqrtm
-from xclinvision.dataset import get_val_transforms
 from xclinvision.modeling import get_model_normalization
+
+# NOTE: ``get_val_transforms`` is imported lazily inside the methods that need
+# it.  Importing it at module load pulls in ``xclinvision.dataset``, which in
+# turn lazily ties into ``pytorch_lightning`` once ``ChestXrayDataModule`` is
+# built.  Keeping the import local keeps this module usable without pl.
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +45,7 @@ class ReliabilityAnalyzer:
             model_name = 'biomedclip'
             
         norm_stats = get_model_normalization(self.model, model_name)
+        from xclinvision.dataset import get_val_transforms  # lazy: avoid pulling pl at module load
         transform = get_val_transforms(
             image_size=img_size, 
             mean=norm_stats["mean"], 
