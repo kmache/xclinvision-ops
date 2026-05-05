@@ -218,9 +218,12 @@ def _tool_get_evaluation_metrics(context: Dict[str, Any]) -> ToolResult:
 
 def _tool_get_monitoring_status(context: Dict[str, Any]) -> ToolResult:
     """Get drift monitoring and feedback statistics."""
-    # Pull from in-memory stores if available (injected via context)
-    feedback_store = context.get("_feedback_store", [])
-    analysis_store = context.get("_analysis_store", {})
+    # Pull from in-memory stores if available (injected via context).
+    # Backend passes these under "analysis_store"/"feedback_store"; the
+    # earlier "_analysis_store"/"_feedback_store" lookups silently always
+    # returned empty defaults.
+    feedback_store = context.get("feedback_store", [])
+    analysis_store = context.get("analysis_store", {})
 
     total_predictions = len(analysis_store)
     total_feedback = len(feedback_store)
@@ -279,7 +282,7 @@ def _tool_generate_report(context: Dict[str, Any]) -> ToolResult:
 def _tool_compare_with_history(context: Dict[str, Any]) -> ToolResult:
     """Compare current analysis with prior studies for the same patient."""
     analysis = context.get("analysis")
-    analysis_store = context.get("_analysis_store", {})
+    analysis_store = context.get("analysis_store", {})
 
     if not analysis:
         return ToolResult(success=False, error="No current analysis available.")
@@ -421,7 +424,7 @@ def build_default_tool_registry() -> ToolRegistry:
     registry.register(ToolDescriptor(
         name="compare_with_history",
         description="Compare current analysis with prior studies for the same patient (temporal comparison).",
-        parameters={"analysis": "dict — current analysis data", "_analysis_store": "dict — all stored analyses"},
+        parameters={"analysis": "dict — current analysis data", "analysis_store": "dict — all stored analyses"},
         func=_tool_compare_with_history,
     ))
 
