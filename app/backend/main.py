@@ -45,7 +45,7 @@ from PIL import Image
 import cv2
 import io
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from schemas import (
     AnalysisResponse,
@@ -948,7 +948,7 @@ async def analyze_image(
         raise
     except Exception as e:
         raise HTTPException(400, f"Could not process image: {e}")
-    analysis_id = f"XCL-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
+    analysis_id = f"XCL-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
 
     # --- Run inference -------------------------------------------------------
     pipeline = get_pipeline(model_name=model_name)
@@ -1046,7 +1046,7 @@ async def analyze_image(
     analysis_data = {
         "analysis_id": analysis_id,
         "patient_id": patient_id,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "prediction": result["class_name"],
         "confidence": result["confidence"],
         "uncertainty": result.get("uncertainty", {}),
@@ -1151,10 +1151,10 @@ async def _run_single_analysis(
         key=lambda x: x["probability"], reverse=True,
     )
 
-    analysis_id = f"XCL-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
+    analysis_id = f"XCL-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
     analysis_data = {
         "analysis_id": analysis_id,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "prediction": result["class_name"],
         "confidence": result["confidence"],
         "uncertainty_level": result.get("uncertainty_level", "unknown"),
@@ -1333,7 +1333,7 @@ async def get_patient_history(patient_id: str, limit: int = Query(default=50, le
 async def submit_dashboard_feedback(feedback: DashboardFeedbackRequest):
     """Store clinician feedback from the dashboard UI."""
     entry = feedback.model_dump()
-    entry["timestamp"] = datetime.utcnow().isoformat()
+    entry["timestamp"] = datetime.now(timezone.utc).isoformat()
     entry["feedback_id"] = f"fb-{uuid.uuid4().hex[:8]}"
     _feedback_store_append(entry)
 
@@ -1477,7 +1477,7 @@ async def generate_dashboard_report(request: DashboardReportRequest):
         "content": content,
         "analysis_ids": request.analysis_ids,
         "template": request.template,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -1494,7 +1494,7 @@ async def export_report_html(request: ExportReportRequest):
         raise HTTPException(404, "Analysis not found")
 
     report_id = f"RPT-{uuid.uuid4().hex[:8]}"
-    timestamp = datetime.utcnow().isoformat()
+    timestamp = datetime.now(timezone.utc).isoformat()
 
     # ── JSON shortcut: return structured data directly ────────────────
     if request.format == "json":
@@ -1664,7 +1664,7 @@ async def get_drift_metrics(days: int = Query(default=30, ge=1, le=365)):
         from xclinvision.monitoring import PredictionLogger
 
         pred_logger = PredictionLogger()
-        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        start_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         history = pred_logger.get_prediction_history(start_date=start_date)
 
         if history:
