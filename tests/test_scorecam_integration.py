@@ -48,7 +48,13 @@ def _fake_pipeline(method: str = "gradcam++"):
     """Return a mock InferencePipeline with realistic predict() output."""
     pipeline = MagicMock()
 
-    def _predict(image, return_uncertainty=True, return_explanation=True, xai_method="gradcam++"):
+    def _predict(
+        image,
+        return_uncertainty=True,
+        return_explanation=True,
+        xai_method="gradcam++",
+        target_class=None,
+    ):
         return {
             "prediction": 0,
             "class_name": "No finding",
