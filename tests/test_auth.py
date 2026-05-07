@@ -1,8 +1,9 @@
-"""Auth smoke tests for the v2 PII endpoints.
+"""Auth smoke tests for protected endpoints.
 
-These verify that protected endpoints enforce the bearer token. Open
-endpoints (health, v1, model-card, llm/providers, llm/health) must
-keep working without auth.
+These verify that protected endpoints enforce the bearer token. v1
+endpoints are now also bearer-protected (issue #1). Open endpoints
+(health, model-card, llm/providers, llm/health) must keep working
+without auth.
 """
 from __future__ import annotations
 
@@ -39,6 +40,27 @@ def test_v2_drift_metrics_requires_auth(unauth_client):
 
 def test_v2_llm_switch_requires_auth(unauth_client):
     r = unauth_client.post("/api/v2/llm/switch", json={"provider": "openai", "model": "x"})
+    assert r.status_code == 401
+
+
+def test_v1_predict_requires_auth(unauth_client, dummy_image_bytes):
+    r = unauth_client.post(
+        "/api/v1/predict",
+        files={"file": ("x.jpg", dummy_image_bytes, "image/jpeg")},
+    )
+    assert r.status_code == 401
+
+
+def test_v1_feedback_requires_auth(unauth_client):
+    r = unauth_client.post(
+        "/api/v1/feedback",
+        json={"prediction": 0, "correct_label": 0, "feedback_type": "correct"},
+    )
+    assert r.status_code == 401
+
+
+def test_v1_dataset_info_requires_auth(unauth_client):
+    r = unauth_client.get("/api/v1/dataset/info")
     assert r.status_code == 401
 
 

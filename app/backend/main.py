@@ -460,7 +460,7 @@ async def health_check():
     }
 
 
-@app.get("/api/v1/dataset/info")
+@app.get("/api/v1/dataset/info", dependencies=[Depends(require_auth)])
 async def dataset_info():
     """Return dataset directories and image counts for each split."""
     raw_data_dir = os.getenv("XCLINVISION_DATA_DIR", "data/processed_384")
@@ -480,7 +480,7 @@ async def dataset_info():
     }
 
 
-@app.get("/api/v1/models")
+@app.get("/api/v1/models", dependencies=[Depends(require_auth)])
 async def list_models():
     """List available trained models from the auto-discovered registry."""
     global _model_registry
@@ -503,7 +503,7 @@ async def list_models():
     return {"models": models}
 
 
-@app.post("/api/v1/predict", response_model=PredictionResponse)
+@app.post("/api/v1/predict", response_model=PredictionResponse, dependencies=[Depends(require_auth)])
 async def predict(
     file: UploadFile = File(...),
     model_name: str = "convnext_small",
@@ -598,7 +598,7 @@ async def predict(
     )
 
 
-@app.post("/api/v1/explain")
+@app.post("/api/v1/explain", dependencies=[Depends(require_auth)])
 async def explain(
     file: UploadFile = File(...),
     model_name: str = "convnext_small",
@@ -648,7 +648,7 @@ async def explain(
     }
 
 
-@app.post("/api/v1/report")
+@app.post("/api/v1/report", dependencies=[Depends(require_auth)])
 async def generate_report(request: ReportRequest):
     """Generate clinical report using LLM agent."""
     from xclinvision.agent import ClinicalContext
@@ -678,7 +678,7 @@ async def generate_report(request: ReportRequest):
     return report
 
 
-@app.post("/api/v1/feedback")
+@app.post("/api/v1/feedback", dependencies=[Depends(require_auth)])
 async def submit_feedback(feedback: FeedbackRequest):
     """Submit clinician feedback for model prediction."""
     # Fix #17: actually persist feedback instead of silently discarding it.
@@ -702,7 +702,7 @@ async def submit_feedback(feedback: FeedbackRequest):
     }
 
 
-@app.get("/api/v1/metrics")
+@app.get("/api/v1/metrics", dependencies=[Depends(require_auth)])
 async def get_metrics():
     """Get model performance metrics.
 
