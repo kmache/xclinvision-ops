@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, Optional
 
+from xclinvision.agent.guardrails import CRITICAL_CONDITIONS
 from xclinvision.agent.tools import ToolRegistry, ToolResult, build_default_tool_registry
 
 logger = logging.getLogger(__name__)
@@ -530,6 +531,15 @@ Reference the tool outputs as evidence. Keep it concise."""
         if prediction == "No finding":
             urgency = "Low"
             assessment = "No acute findings detected. Routine follow-up as indicated."
+        elif prediction in CRITICAL_CONDITIONS:
+            # Issue #4: pneumothorax / consolidation are clinical emergencies
+            # and must escalate to High regardless of model confidence —
+            # under-triage in this branch is a patient-safety regression.
+            urgency = "High"
+            assessment = (
+                f"Critical finding ({prediction}) detected. "
+                "Immediate radiologist review and clinical correlation required."
+            )
         elif confidence >= 0.8 and uncertainty in ("low", "very_low"):
             urgency = "High" if prediction in ("Aortic enlargement",) else "Medium"
             assessment = (
