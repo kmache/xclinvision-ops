@@ -224,7 +224,10 @@ def _default_call_llm(system: str, user: str, *, temperature: float = 0.2) -> st
         api_key=os.environ.get("OPENAI_API_KEY", ""),
         base_url=os.environ.get("OPENAI_API_BASE"),
     )
-    model = os.environ.get("OPENAI_MODEL", "gpt-5.4-nano")
+    # Issue #5: 'gpt-5.4-nano' was not a real model id; default to the
+    # actual fallback so unconfigured deploys don't burn one wasted call
+    # per request.
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
     fallback_model = "gpt-4o-mini"
 
     messages = [
@@ -243,8 +246,12 @@ def _default_call_llm(system: str, user: str, *, temperature: float = 0.2) -> st
         )
         return response.choices[0].message.content or ""
     except Exception as exc:
-        # Catch provider-specific errors (e.g. BadRequestError for models
-        # that don't support response_format) and fall back gracefully.
+        # Issue #5: only fall back when the failure is a feature/model
+        # mismatch — propagate auth, rate-limit, and network errors so
+        # callers see real failures.
+        from openai import BadRequestError, NotFoundError
+        if not isinstance(exc, (BadRequestError, NotFoundError)):
+            raise
         logger.warning(
             "Structured JSON mode failed (%s); falling back to plain completion "
             "with regex JSON extraction.",
@@ -252,8 +259,8 @@ def _default_call_llm(system: str, user: str, *, temperature: float = 0.2) -> st
         )
 
     # Fallback: plain completion → regex-extract the first JSON object.
-    # Try primary model first, then fallback model.
-    for m in (model, fallback_model):
+    # Try primary model first, then fallback model (de-duped).
+    for m in dict.fromkeys((model, fallback_model)):
         try:
             response = client.chat.completions.create(
                 model=m,

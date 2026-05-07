@@ -83,7 +83,7 @@ class OpenAIProvider(LLMProvider):
 
     Configuration via environment variables:
     - ``OPENAI_API_KEY``  — required
-    - ``OPENAI_MODEL``    — defaults to ``gpt-5.4-nano``
+    - ``OPENAI_MODEL``    — defaults to ``gpt-4o-mini`` (issue #5)
     - ``OPENAI_API_BASE`` — optional custom base URL
     """
 
@@ -96,7 +96,9 @@ class OpenAIProvider(LLMProvider):
         base_url: Optional[str] = None,
     ) -> None:
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
-        self._model = model or os.environ.get("OPENAI_MODEL", "gpt-5.4-nano")
+        # Issue #5: previous default 'gpt-5.4-nano' is not a real model id;
+        # every unconfigured deploy hit the fallback path on every call.
+        self._model = model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
         self._base_url = base_url or os.environ.get("OPENAI_API_BASE")
         self._client: Any = None
         logger.info("OpenAIProvider: model=%s, base_url=%s, key_set=%s",
@@ -150,13 +152,22 @@ class OpenAIProvider(LLMProvider):
                 )
             return response.choices[0].message.content or ""
         except Exception as exc:
+            # Issue #5: only fall back when the failure is a feature/model
+            # mismatch (BadRequestError = response_format unsupported,
+            # NotFoundError = model id wrong). Auth, rate-limit, and
+            # network errors must propagate so callers see real failures
+            # instead of a misleading "fallback" warning.
+            from openai import BadRequestError, NotFoundError
+            if not isinstance(exc, (BadRequestError, NotFoundError)):
+                raise
             logger.warning(
                 "Structured JSON mode failed (%s); falling back to plain completion.",
                 exc,
             )
 
         # Fallback: plain completion (try primary model, then fallback model)
-        for model in (self._model, self._FALLBACK_MODEL):
+        # dict.fromkeys de-duplicates when primary == fallback.
+        for model in dict.fromkeys((self._model, self._FALLBACK_MODEL)):
             try:
                 response = client.chat.completions.create(
                     model=model,
