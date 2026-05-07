@@ -232,21 +232,17 @@
   </div>
 
   <!-- Spatial Evidence -->
+  {# Issue #3: report.spatial_evidence is keyed by human-readable region
+     labels produced by interpret_xai_regions ("right upper lobe", etc.),
+     not the raw region keys. Iterate over .items() so populated regions
+     actually appear; the outer {% if %} hides the panel when empty. #}
   {% if report.spatial_evidence %}
   <div class="section">
     <h2>Spatial Evidence (XAI)</h2>
     <div class="spatial-grid">
-      <div><span class="region">right_upper:</span> {{ report.spatial_evidence.get('right_upper', '0.00') }}</div>
-      <div><span class="region">right_middle:</span> {{ report.spatial_evidence.get('right_middle', '0.00') }}</div>
-      <div><span class="region">right_lower:</span> {{ report.spatial_evidence.get('right_lower', '0.00') }}</div>
-
-      <div><span class="region">left_upper:</span> {{ report.spatial_evidence.get('left_upper', '0.00') }}</div>
-      <div><span class="region">left_middle:</span> {{ report.spatial_evidence.get('left_middle', '0.00') }}</div>
-      <div><span class="region">left_lower:</span> {{ report.spatial_evidence.get('left_lower', '0.00') }}</div>
-
-      <div><span class="region">hilar:</span> {{ report.spatial_evidence.get('hilar', '0.00') }}</div>
-      <div><span class="region">cardiac:</span> {{ report.spatial_evidence.get('cardiac', '0.00') }}</div>
-      <div><span class="region">apical:</span> {{ report.spatial_evidence.get('apical', '0.00') }}</div>
+      {% for region, description in report.spatial_evidence.items() %}
+      <div><span class="region">{{ region }}:</span> {{ description }}</div>
+      {% endfor %}
     </div>
   </div>
   {% endif %}
