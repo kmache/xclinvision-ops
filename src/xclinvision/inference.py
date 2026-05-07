@@ -378,7 +378,7 @@ class InferencePipeline:
                     mean_pred = item_preds.mean(axis=0)
                     
                     epistemic = float(item_preds.var(axis=0).mean())
-                    predictive_entropy = float(-np.sum(mean_pred * np.log(mean_pred + 1e-10)))
+                    predictive_entropy = self._predictive_entropy(mean_pred, self.multilabel)
                     
                     result["uncertainty"] = {
                         "epistemic": epistemic,
@@ -409,6 +409,31 @@ class InferencePipeline:
         """Enable dropout layers for MC-Dropout inference (in-place)."""
         _enable_mc_dropout(self.model)
 
+    @staticmethod
+    def _predictive_entropy(mean_pred: np.ndarray, multilabel: bool) -> float:
+        """Predictive entropy of an averaged prediction distribution.
+
+        Multiclass softmax outputs sum to 1, so categorical Shannon entropy
+        ``-Σ p·log p`` is appropriate.
+
+        Multilabel sigmoid outputs are independent Bernoulli per label and
+        do *not* sum to 1; applying the categorical formula to them gives a
+        meaningless value (issue #2). The correct quantity is per-label
+        binary entropy ``-(p·log p + (1-p)·log(1-p))``, here averaged
+        across labels so the result remains bounded in ``[0, log 2]`` and
+        is comparable across configurations with different label counts.
+        """
+        eps = 1e-10
+        if multilabel:
+            binary = -(
+                mean_pred * np.log(mean_pred + eps)
+                + (1.0 - mean_pred) * np.log(1.0 - mean_pred + eps)
+            )
+            return float(np.mean(binary))
+        # np.sum on shape (1, K) returns a (1,) array; squeeze before float()
+        # to avoid NumPy 1.25 deprecation warning.
+        return float(np.squeeze(-np.sum(mean_pred * np.log(mean_pred + eps), axis=-1)))
+
     def compute_uncertainty(self, x: torch.Tensor) -> Dict[str, Any]:
         """Estimate epistemic uncertainty via MC Dropout.
 
@@ -438,13 +463,12 @@ class InferencePipeline:
         finally:
             self.model.eval()
 
-        preds = np.array(mc_preds)     
-        mean_pred = preds.mean(axis=0) 
+        preds = np.array(mc_preds)
+        mean_pred = preds.mean(axis=0)
 
         epistemic = float(preds.var(axis=0).mean())
 
-        eps = 1e-10
-        predictive_entropy = float(-np.sum(mean_pred * np.log(mean_pred + eps), axis=-1))
+        predictive_entropy = self._predictive_entropy(mean_pred, self.multilabel)
 
         return {
             "epistemic": epistemic,
