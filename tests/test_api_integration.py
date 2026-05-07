@@ -153,6 +153,23 @@ class TestPredictV1:
         )
         assert r.status_code == 400
 
+    def test_predict_missing_content_type_header(self, client):
+        # issue #6: multipart part without a Content-Type must 400, not 500.
+        boundary = "----testboundary6"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="file"; filename="xray.jpg"\r\n'
+            "\r\n"
+            "\xff\xd8\xff\xe0\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("latin-1")
+        r = client.post(
+            "/api/v1/predict",
+            content=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        assert r.status_code == 400
+
     @patch("main.get_pipeline")
     def test_predict_invalid_magic_bytes(self, mock_get_pipe, client):
         mock_get_pipe.return_value = _fake_pipeline()

@@ -513,8 +513,8 @@ async def predict(
     import time
     start_time = time.time()
 
-    # Validate file
-    if not file.content_type.startswith("image/"):
+    # Validate file (issue #6: guard against None content_type)
+    if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(400, "Invalid file type. Please upload an image.")
 
     # Fix #4: enforce upload size limit before reading into memory.
@@ -605,7 +605,8 @@ async def explain(
     target_class: Optional[int] = None,
 ):
     """Generate Grad-CAM++ explanation for image."""
-    if not file.content_type.startswith("image/"):
+    # issue #6: guard against None content_type
+    if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(400, "Invalid file type")
 
     # Fix #2: enforce the same upload size limit as /predict.
