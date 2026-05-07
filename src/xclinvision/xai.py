@@ -35,7 +35,12 @@ logger = logging.getLogger(__name__)
 # Constants & Radiological Mappings
 # ---------------------------------------------------------------------------
 
-DEFAULT_CLASS_NAMES: List[str] = get_class_names()
+# Issue #10: previously DEFAULT_CLASS_NAMES = get_class_names() was captured
+# at import time and reused as a default-arg value, so any caller that did
+# not pass class_names= got a frozen snapshot — defeating the project's
+# config-driven contract and breaking _reset_class_names_cache() in tests.
+# Callers now pass class_names explicitly or get the live result of
+# get_class_names() via the per-call resolution below.
 
 LUNG_REGIONS: Dict[str, Tuple[float, float, float, float]] = {
     # ---------------------------------------------------------------
@@ -724,7 +729,7 @@ class ExplainabilityEngine:
     def __init__(
         self,
         model: nn.Module,
-        class_names: List[str] = DEFAULT_CLASS_NAMES,
+        class_names: Optional[List[str]] = None,
         architecture: str = "unknown",
         target_layer: Optional[nn.Module] = None,
         device: str = "cpu",
@@ -733,7 +738,8 @@ class ExplainabilityEngine:
         dataset_std: Optional[Union[np.ndarray, List[float]]] = None,
     ) -> None:
         self.model = model
-        self.class_names = class_names
+        # Issue #10: resolve via live config when caller did not supply names.
+        self.class_names = class_names if class_names is not None else get_class_names()
         self.architecture = architecture
         self.device = device
         self.img_size = img_size
@@ -1005,7 +1011,7 @@ class ValidationXAI:
         model: nn.Module,
         architecture: str,
         output_dir: Union[str, Path],
-        class_names: List[str] = DEFAULT_CLASS_NAMES,
+        class_names: Optional[List[str]] = None,
         img_size: int = 384,
         device: Optional[str] = None,
         dataset_mean: Optional[Union[np.ndarray, List[float]]] = None,
@@ -1015,7 +1021,8 @@ class ValidationXAI:
         self.architecture = architecture
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.class_names = class_names
+        # Issue #10: resolve via live config when caller did not supply names.
+        self.class_names = class_names if class_names is not None else get_class_names()
         self.img_size = img_size
 
         if device is None:
@@ -1024,7 +1031,7 @@ class ValidationXAI:
 
         self.engine = ExplainabilityEngine(
             model,
-            class_names=class_names,
+            class_names=self.class_names,
             architecture=architecture,
             device=self.device,
             img_size=img_size,
@@ -1173,7 +1180,7 @@ def generate_explanation(
     image: np.ndarray,
     prediction: int,
     confidence: float,
-    class_names: List[str] = DEFAULT_CLASS_NAMES,
+    class_names: Optional[List[str]] = None,
     architecture: str = "unknown",
     device: str = "cpu",
     img_size: int = 1024,
@@ -1181,9 +1188,11 @@ def generate_explanation(
     dataset_std: Optional[Union[np.ndarray, List[float]]] = None,
     method: str = "gradcam++",
 ) -> Dict[str, Any]:
+    # Issue #10: resolve class_names per call so config / cache resets are
+    # reflected immediately instead of pinned to import-time state.
     engine = ExplainabilityEngine(
         model,
-        class_names=class_names,
+        class_names=class_names if class_names is not None else get_class_names(),
         architecture=architecture,
         device=device,
         img_size=img_size,
