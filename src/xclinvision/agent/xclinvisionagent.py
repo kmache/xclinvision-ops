@@ -260,6 +260,7 @@ def _default_call_llm(system: str, user: str, *, temperature: float = 0.2) -> st
 
     # Fallback: plain completion → regex-extract the first JSON object.
     # Try primary model first, then fallback model (de-duped).
+    last_exc: Optional[Exception] = None
     for m in dict.fromkeys((model, fallback_model)):
         try:
             response = client.chat.completions.create(
@@ -274,11 +275,16 @@ def _default_call_llm(system: str, user: str, *, temperature: float = 0.2) -> st
             match = re.search(r"\{.*\}", raw, re.DOTALL)
             return match.group() if match else raw
         except Exception as exc:
+            last_exc = exc
             if m == model:
                 logger.warning("Primary model '%s' failed: %s. Trying fallback '%s'.", m, exc, fallback_model)
-            else:
-                logger.warning("No JSON object found in fallback LLM response; returning raw text.")
-                raise
+            continue
+
+    # Same fall-through hazard as OpenAIProvider.call: never return None from a
+    # function annotated -> str.
+    raise RuntimeError(
+        f"_default_call_llm: all candidate models failed. Last error: {last_exc}"
+    ) from last_exc
 
 
 # ════════════════════════════════════════════════════════════════════════════════

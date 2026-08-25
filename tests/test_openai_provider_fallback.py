@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from openai import AuthenticationError, BadRequestError
+from openai import AuthenticationError, BadRequestError, RateLimitError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -75,3 +75,32 @@ def test_bad_request_triggers_plain_fallback(monkeypatch):
 
     assert out == '{"k": 1}'
     assert fake_client.chat.completions.create.call_count == 2
+
+
+def test_all_candidate_models_failing_raises_not_none(monkeypatch):
+    """Issue 6: the plain-completion loop must not fall through returning None.
+
+    When OPENAI_MODEL equals the hardcoded fallback (the default — both are
+    'gpt-4o-mini'), dict.fromkeys collapses the loop to one iteration. The old
+    code logged and fell off the end, so LLMManager.call_llm saw a non-raising
+    None and never tried the next provider.
+    """
+    provider = OpenAIProvider(api_key="sk-test", model="gpt-4o-mini")
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    bad_request = BadRequestError(
+        "response_format unsupported",
+        response=httpx.Response(400, request=request),
+        body=None,
+    )
+    rate_limited = RateLimitError(
+        "rate limited",
+        response=httpx.Response(429, request=request),
+        body=None,
+    )
+
+    client = MagicMock()
+    client.chat.completions.create.side_effect = [bad_request, rate_limited]
+    provider._client = client
+
+    with pytest.raises(RuntimeError, match="all candidate models failed"):
+        provider.call("system", "user")

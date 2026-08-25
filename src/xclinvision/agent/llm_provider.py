@@ -191,6 +191,7 @@ class OpenAIProvider(LLMProvider):
 
         # Fallback: plain completion (try primary model, then fallback model)
         # dict.fromkeys de-duplicates when primary == fallback.
+        last_exc: Optional[Exception] = None
         for model in dict.fromkeys((self._model, self._FALLBACK_MODEL)):
             try:
                 response = client.chat.completions.create(
@@ -211,11 +212,18 @@ class OpenAIProvider(LLMProvider):
                 match = re.search(r"\{.*\}", raw, re.DOTALL)
                 return match.group() if match else raw
             except Exception as exc:
+                last_exc = exc
                 if model == self._model:
                     logger.warning("Primary model '%s' failed: %s. Trying fallback '%s'.",
                                    model, exc, self._FALLBACK_MODEL)
-                else:
-                    raise
+                continue
+
+        # Every candidate failed. Raise rather than falling off the end returning
+        # None: LLMManager.call_llm treats a non-raising result as success, so a
+        # silent None would stop it from trying the next provider.
+        raise RuntimeError(
+            f"OpenAIProvider: all candidate models failed. Last error: {last_exc}"
+        ) from last_exc
 
     def stream(
         self,
