@@ -590,13 +590,13 @@ python scripts/train.py --config configs/convnext_small.yaml \
 
 ```bash
 # Run all tests
-pytest tests/ -v
+python -m pytest tests/ -v
 
 # Skip tests requiring GPU/torch
-pytest tests/test_api_integration.py -v
+python -m pytest tests/test_api_integration.py -v
 
 # Run with coverage
-pytest tests/ --cov=src/xclinvision --cov-report=term-missing
+python -m pytest tests/ --cov=src/xclinvision --cov-report=term-missing
 ```
 
 All API integration tests use mocked inference pipelines — no GPU or weightsrequired.
@@ -679,7 +679,7 @@ Frontend button click
 2. Create a feature branch: `git checkout -b feat/your-feature`
 3. Install dev dependencies: `pip install -e ".[dev]"`
 4. Make changes, add or update tests
-5. Run the test suite: `pytest tests/ -v`
+5. Run the test suite: `python -m pytest tests/ -v`
 6. Format code: `black src/ app/ tests/ && isort src/ app/ tests/`
 7. Submit a pull request with a clear description of the change
 

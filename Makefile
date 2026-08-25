@@ -50,7 +50,7 @@ tune:
 	@echo "Use train.py with different configs: python scripts/train.py --config configs/<model>.yaml"
 
 test:
-	pytest tests/ -v --cov=xclinvision --cov-report=term-missing
+	python -m pytest tests/ -v --cov=xclinvision --cov-report=term-missing
 
 lint:
 	black --check src/ tests/ app/
