@@ -253,10 +253,21 @@ def _clinical_threshold_profile(checkpoint_thresholds: Optional[Dict[str, float]
     return build_clinical_threshold_profile(class_names, custom_thresholds=merged)
 
 
-def _build_pipeline(model_path: str, architecture: str, image_size: int):
+def _build_pipeline(
+    model_path: str,
+    architecture: str,
+    image_size: int,
+    meta_class_names: Optional[List[str]] = None,
+):
     """Load a trained checkpoint and return an InferencePipeline.
 
     Supports both plain state-dict (.pth) and PyTorch Lightning (.ckpt) files.
+
+    ``meta_class_names`` is the sidecar's class_names, cross-checked against the
+    payload's. That comparison lives here rather than in _discover_models
+    because the checkpoint is already in memory: _discover_models re-runs on
+    every /api/v1/models call, and torch.load-ing every .pth there would read
+    hundreds of MB per request.
     """
     import torch
     from xclinvision.modeling import build_model, get_model_normalization
@@ -325,6 +336,34 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
             thresholds_dict = {str(k): float(v) for k, v in raw_thresh.items()}
             logger.info("Loaded per-class thresholds from payload: %s", thresholds_dict)
 
+    # Labels: prefer what the checkpoint itself declares over the global
+    # configs/system.yaml, so a model can never be served under another
+    # model's label ordering.
+    ckpt_class_names = None
+    if isinstance(checkpoint, dict):
+        raw_names = checkpoint.get("class_names")
+        if isinstance(raw_names, (list, tuple)) and raw_names:
+            ckpt_class_names = [str(n) for n in raw_names]
+
+    if (
+        meta_class_names is not None
+        and ckpt_class_names is not None
+        and list(meta_class_names) != ckpt_class_names
+    ):
+        raise ValueError(
+            f"Checkpoint {model_path} disagrees with its _meta.json sidecar: "
+            f"payload class_names {ckpt_class_names} vs meta {list(meta_class_names)}. "
+            "Refusing to serve a model whose labelling is ambiguous."
+        )
+
+    serving_class_names = ckpt_class_names or get_class_names()
+    if ckpt_class_names is None:
+        logger.warning(
+            "Checkpoint %s declares no class_names; falling back to "
+            "configs/system.yaml (%s).",
+            model_path, serving_class_names,
+        )
+
     norm_stats = get_model_normalization(model, architecture)
 
     profile = _clinical_threshold_profile(thresholds_dict)
@@ -341,6 +380,7 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
         temperature_scaler=temperature_value,
         thresholds=thresholds_dict,
         priority_map=profile.priority_map,
+        class_names=serving_class_names,
     )
 
 
@@ -366,6 +406,7 @@ def get_pipeline(model_name: Optional[str] = None):
                     model_path=meta["_pth_path"],
                     architecture=model_name,
                     image_size=384,  # All best_models are trained at 384
+                    meta_class_names=meta.get("class_names"),
                 )
                 # Evict oldest entry if cache is full
                 if len(_pipeline_cache) >= _MAX_PIPELINE_CACHE:

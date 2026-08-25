@@ -5,7 +5,9 @@ without requiring GPU or trained model weights (inference endpoints are
 tested with mocked pipelines).
 """
 
+import contextlib
 import io
+import logging
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -729,3 +731,156 @@ class TestExportReportV2:
             "analysis_id": "NONEXISTENT",
         })
         assert r.status_code == 404
+
+
+# ===========================================================================
+# Checkpoint integrity (issue #9)
+# ===========================================================================
+
+class TestModelCheckpointIntegrity:
+    """_build_pipeline used strict=False and discarded _IncompatibleKeys.
+
+    A checkpoint whose key names don't match the architecture loaded zero
+    weights and served a randomly-initialised network behind an INFO log.
+    """
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _stubbed_modeling(arch_factory):
+        """Stub xclinvision.modeling so the test needs no real backbone.
+
+        Also sidesteps this environment's torch/torchvision CUDA-major
+        mismatch, which makes `import timm` raise.
+        """
+        import types
+
+        modeling = types.ModuleType("xclinvision.modeling")
+        modeling.build_model = lambda *a, **k: arch_factory()
+        modeling.get_model_normalization = lambda *a, **k: {
+            "mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5],
+        }
+        inference = types.ModuleType("xclinvision.inference")
+
+        class _Pipe:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        inference.InferencePipeline = _Pipe
+        saved = {k: sys.modules.get(k) for k in
+                 ("xclinvision.modeling", "xclinvision.inference")}
+        sys.modules["xclinvision.modeling"] = modeling
+        sys.modules["xclinvision.inference"] = inference
+        try:
+            yield
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+    def test_model_with_renamed_head_is_rejected(self, tmp_path):
+        import torch
+        import torch.nn as nn
+
+        import main  # type: ignore[import-not-found]
+
+        class Arch(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = nn.Linear(4, 4)
+
+        class Renamed(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.classifier = nn.Linear(4, 4)
+
+        ckpt = tmp_path / "renamed.pth"
+        torch.save({"model_state_dict": Renamed().state_dict()}, ckpt)
+
+        with self._stubbed_modeling(Arch):
+            with pytest.raises(ValueError, match="uninitialised"):
+                main._build_pipeline(str(ckpt), "convnext_small", 384)
+
+    def test_model_matching_checkpoint_still_loads(self, tmp_path):
+        """The guard must not reject a legitimate checkpoint."""
+        import torch
+        import torch.nn as nn
+
+        import main  # type: ignore[import-not-found]
+
+        class Arch(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = nn.Linear(4, 4)
+
+        ckpt = tmp_path / "good.pth"
+        torch.save(
+            {"model_state_dict": Arch().state_dict(),
+             "class_names": ["Cardiomegaly", "Aortic enlargement"]},
+            ckpt,
+        )
+
+        with self._stubbed_modeling(Arch):
+            pipe = main._build_pipeline(str(ckpt), "convnext_small", 384)
+
+        # Labels come from the checkpoint, not configs/system.yaml.
+        assert pipe.kwargs["class_names"] == ["Cardiomegaly", "Aortic enlargement"]
+
+    def test_model_meta_disagreeing_with_payload_is_rejected(self, tmp_path):
+        import torch
+        import torch.nn as nn
+
+        import main  # type: ignore[import-not-found]
+
+        class Arch(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = nn.Linear(4, 4)
+
+        ckpt = tmp_path / "skew.pth"
+        torch.save(
+            {"model_state_dict": Arch().state_dict(),
+             "class_names": ["Cardiomegaly", "Aortic enlargement"]},
+            ckpt,
+        )
+
+        with self._stubbed_modeling(Arch):
+            with pytest.raises(ValueError, match="disagrees with its _meta.json"):
+                main._build_pipeline(
+                    str(ckpt), "convnext_small", 384,
+                    meta_class_names=["Aortic enlargement", "Cardiomegaly"],
+                )
+
+    def test_model_registry_skips_mismatched_class_names(self, tmp_path, caplog):
+        """_discover_models must not register a mislabelling model."""
+        import json as _json
+
+        import main  # type: ignore[import-not-found]
+        from xclinvision.config import get_class_names
+
+        (tmp_path / "bogus.pth").write_bytes(b"placeholder")
+        (tmp_path / "bogus_meta.json").write_text(_json.dumps({
+            "model_name": "convnext_small",
+            "num_classes": len(get_class_names()),
+            # Same labels, wrong order -> every prediction would be mislabelled.
+            "class_names": list(reversed(get_class_names())),
+        }))
+
+        original = main._MODELS_DIR
+        main._MODELS_DIR = tmp_path
+        try:
+            with caplog.at_level(logging.ERROR):
+                registry = main._discover_models()
+        finally:
+            main._MODELS_DIR = original
+
+        assert registry == {}
+        assert any("Refusing model" in r.message for r in caplog.records)
+
+    def test_model_registry_accepts_the_shipped_models(self):
+        """The guard must not reject the real models/best_models/ set."""
+        import main  # type: ignore[import-not-found]
+
+        registry = main._discover_models()
+        assert set(registry) >= {"convnext_small", "vit_base"}
