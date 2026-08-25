@@ -187,15 +187,43 @@ def _dummy_image():
 
 
 def test_headline_finding_is_not_lowest_class_index():
-    """The headline label used to be active_indices[0] — i.e. YAML order."""
+    """The headline label used to be active_indices[0] — i.e. YAML order.
+
+    With clinical tiering, Cardiomegaly (URGENT) leads Pulmonary fibrosis
+    (routine) despite the lower probability — that is the policy, not the old
+    index-order bug. What matters is that both positives are surfaced and the
+    ordering is deliberate.
+    """
     names = ["Cardiomegaly", "Aortic enlargement", "Pleural thickening", "Pulmonary fibrosis"]
     pipe = _fixed_logit_pipeline(names, [0.55, 0.01, 0.01, 0.97])
 
     result = pipe.predict(_dummy_image(), return_uncertainty=False, return_explanation=False)
 
+    assert result["class_names_predicted"] == ["Cardiomegaly", "Pulmonary fibrosis"]
+    assert set(result["class_names_predicted"]) == {"Cardiomegaly", "Pulmonary fibrosis"}
+
+
+def test_headline_is_probability_ranked_within_a_tier():
+    """Same tier -> highest probability wins, which the old code got wrong."""
+    names = ["Pleural thickening", "Aortic enlargement", "Pulmonary fibrosis"]
+    pipe = _fixed_logit_pipeline(names, [0.55, 0.01, 0.97])
+
+    result = pipe.predict(_dummy_image(), return_uncertainty=False, return_explanation=False)
+
+    # All three are routine, so index order (Pleural thickening) must not win.
     assert result["class_name"] == "Pulmonary fibrosis"
     assert result["confidence"] == pytest.approx(0.97, abs=1e-3)
-    assert set(result["class_names_predicted"]) == {"Cardiomegaly", "Pulmonary fibrosis"}
+
+
+def test_critical_outranks_a_higher_probability_routine_finding():
+    """Pneumothorax 0.60 must lead Cardiomegaly 0.90."""
+    names = ["Cardiomegaly", "Pneumothorax", "Pulmonary fibrosis"]
+    pipe = _fixed_logit_pipeline(names, [0.90, 0.60, 0.20])
+
+    result = pipe.predict(_dummy_image(), return_uncertainty=False, return_explanation=False)
+
+    assert result["class_name"] == "Pneumothorax"
+    assert result["class_names_predicted"][0] == "Pneumothorax"
 
 
 def test_critical_finding_outranks_a_higher_probability_routine_one():
@@ -241,6 +269,7 @@ def test_analyze_response_carries_every_positive_label(client):
         "uncertainty": {"epistemic": 0.01},
         "uncertainty_level": "low",
         "predictions_multilabel": [1, 0, 0, 1],
+        "thresholds": [0.5, 0.5, 0.5, 0.5],
         "class_names_predicted": ["Pulmonary fibrosis", "Cardiomegaly"],
         "explanation": {"key_findings": [], "visualization": {"region_scores": {}}},
     }
@@ -263,7 +292,15 @@ def test_analyze_response_carries_every_positive_label(client):
     assert response.status_code == 200
     body = response.json()
     assert body["class_names_predicted"] == ["Pulmonary fibrosis", "Cardiomegaly"]
-    assert body["predictions_multilabel"] == [1, 0, 0, 1]
+
+    # predictions_multilabel is now per-class detail, not a raw binary vector.
+    detail = body["predictions_multilabel"]
+    assert [d["class_name"] for d in detail] == [
+        "Cardiomegaly", "Aortic enlargement", "Pleural thickening", "Pulmonary fibrosis",
+    ]
+    assert [d["positive"] for d in detail] == [True, False, False, True]
+    assert detail[3]["probability"] == pytest.approx(0.97, abs=1e-3)
+    assert all(set(d) == {"class_name", "probability", "threshold", "positive"} for d in detail)
 
 def test_temperature_scaler_actually_changes_probabilities():
     """Issue 7: this previously asserted only hasattr(ts, 'temperature') — always true.

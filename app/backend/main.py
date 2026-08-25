@@ -1106,6 +1106,36 @@ def _image_store_put(analysis_id: str, data: bytes) -> None:
     storage.put_image(analysis_id, data)
 
 
+def _per_class_detail(result: dict) -> List[dict]:
+    """Per-class probability, threshold and positive/negative call.
+
+    The dashboard previously received only the headline label, so a
+    co-occurring finding was invisible. Reporting the threshold alongside the
+    probability lets a reader see *why* a class was called negative.
+    """
+    names = result.get("class_names") or get_class_names()
+    probs = result.get("probabilities") or []
+    thresholds = result.get("thresholds") or []
+    binary = result.get("predictions_multilabel") or []
+    detail: List[dict] = []
+    for i, name in enumerate(names):
+        prob = float(probs[i]) if i < len(probs) else None
+        thr = float(thresholds[i]) if i < len(thresholds) else None
+        if i < len(binary):
+            positive = bool(binary[i])
+        elif prob is not None and thr is not None:
+            positive = prob >= thr
+        else:
+            positive = False
+        detail.append({
+            "class_name": name,
+            "probability": prob,
+            "threshold": thr,
+            "positive": positive,
+        })
+    return detail
+
+
 def _img_to_base64(img_array: np.ndarray) -> str:
     """Convert a numpy image array to a base64-encoded PNG string."""
     from PIL import Image as PILImage
@@ -1269,6 +1299,7 @@ def analyze_image(
             uncertainty_level=result.get("uncertainty_level", "unknown"),
             highlighted_regions=list(region_scores.keys())[:3] if region_scores else [],
             class_names=class_names,
+            class_names_predicted=result.get("class_names_predicted") or [],
             patient_age=None,
             patient_sex=None,
         )
@@ -1303,8 +1334,8 @@ def analyze_image(
         # Every label that crossed its threshold, not just the headline one.
         # These were computed by the pipeline and then dropped here, so a
         # co-occurring finding never reached the dashboard or the report.
-        "predictions_multilabel": result.get("predictions_multilabel"),
-        "class_names_predicted": result.get("class_names_predicted"),
+        "predictions_multilabel": _per_class_detail(result),
+        "class_names_predicted": result.get("class_names_predicted") or [],
         "heatmap_gradcam": heatmap_b64,
         "heatmap_overlay": overlay_b64,
         "scorecam_heatmap": scorecam_heatmap_b64,

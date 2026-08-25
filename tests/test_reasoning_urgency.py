@@ -109,3 +109,57 @@ def test_floor_never_raises_an_already_sensitive_threshold():
     )
 
     assert profile.thresholds["Pneumothorax"] == 0.10
+
+
+def test_urgency_escalates_on_a_co_occurring_critical_positive():
+    """Issue 1: a critical finding must escalate even when it is not the headline.
+
+    _format_urgency_assessment keyed off the single headline label, so a
+    Pneumothorax positive sitting behind a Cardiomegaly headline was assessed
+    as Medium.
+    """
+    agent = ReasoningAgent()
+    results = {
+        "get_prediction_details": ToolResult(
+            success=True,
+            data={
+                "prediction": "Cardiomegaly",
+                "confidence": 0.88,
+                "uncertainty_level": "low",
+                "model_version": "vit_base",
+                "top_predictions": [],
+            },
+            tool_name="get_prediction_details",
+        )
+    }
+    analysis = {"class_names_predicted": ["Cardiomegaly", "Pneumothorax"]}
+
+    text = agent._format_urgency_assessment(results, analysis)
+
+    assert "**Urgency Assessment: High**" in text
+    assert "Pneumothorax" in text
+    assert "co-occurring" in text
+
+
+def test_urgency_without_critical_positives_is_unchanged():
+    """The escalation must not fire on routine co-positives."""
+    agent = ReasoningAgent()
+    results = {
+        "get_prediction_details": ToolResult(
+            success=True,
+            data={
+                "prediction": "Cardiomegaly",
+                "confidence": 0.88,
+                "uncertainty_level": "low",
+                "model_version": "vit_base",
+                "top_predictions": [],
+            },
+            tool_name="get_prediction_details",
+        )
+    }
+    analysis = {"class_names_predicted": ["Cardiomegaly", "Pulmonary fibrosis"]}
+
+    text = agent._format_urgency_assessment(results, analysis)
+
+    assert "**Urgency Assessment: Medium**" in text
+    assert "Pulmonary fibrosis" in text  # still listed under all positive labels

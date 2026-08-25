@@ -32,10 +32,40 @@ def _resolve_device(device: Union[str, torch.device]) -> torch.device:
 
 
 #: Ordering used to pick the headline finding when several labels are positive.
-#: Lower sorts first. Mirrors guardrails.ThresholdProfile.get_priority(), which
-#: is not imported here: pulling xclinvision.agent would drag the chromadb
-#: import chain into the inference path.
+#: Lower sorts first.
 _PRIORITY_RANK: Dict[str, int] = {"critical": 0, "urgent": 1, "routine": 2}
+
+#: Cached tier map, resolved on first use when no priority_map was injected.
+_FALLBACK_PRIORITY_MAP: Optional[Dict[str, str]] = None
+
+
+def _default_priority_map() -> Dict[str, str]:
+    """Tier map derived from guardrails' CRITICAL/URGENT condition sets.
+
+    Imported lazily and cached: ``xclinvision.agent.guardrails`` runs the agent
+    package __init__, which pulls chromadb + sentence-transformers (~9.7s), so
+    a module-level import here would tax every ``import xclinvision.inference``
+    including the training and evaluation scripts. Callers that inject a
+    ``priority_map`` (the backend does, from the ThresholdProfile) never reach
+    this.
+    """
+    global _FALLBACK_PRIORITY_MAP
+    if _FALLBACK_PRIORITY_MAP is None:
+        try:
+            from xclinvision.agent.guardrails import (
+                CRITICAL_CONDITIONS,
+                URGENT_CONDITIONS,
+            )
+            resolved = {name: "critical" for name in CRITICAL_CONDITIONS}
+            resolved.update({name: "urgent" for name in URGENT_CONDITIONS})
+            _FALLBACK_PRIORITY_MAP = resolved
+        except Exception as exc:
+            logger.warning(
+                "Could not load clinical priority tiers (%s); multilabel "
+                "headline ranking falls back to probability order.", exc,
+            )
+            _FALLBACK_PRIORITY_MAP = {}
+    return _FALLBACK_PRIORITY_MAP
 
 
 def _enable_mc_dropout(model: nn.Module) -> None:
@@ -121,10 +151,11 @@ class InferencePipeline:
         cardiomegaly at 0.97, and the single reported label drives the LLM
         summary, the exported report and the urgency gate.
         """
+        priority = self._priority_map or _default_priority_map()
         return sorted(
             active_indices,
             key=lambda i: (
-                _PRIORITY_RANK.get(self._priority_map.get(self.class_names[i], "routine"), 2),
+                _PRIORITY_RANK.get(priority.get(self.class_names[i], "routine"), 2),
                 -float(probs_row[i]),
             ),
         )
@@ -305,6 +336,7 @@ class InferencePipeline:
             # raw_probability.
             "confidence": confidence,
             "class_names": self.class_names,
+            "thresholds": [float(t) for t in self._threshold_array],
             # True only when a temperature was fitted. Every shipped checkpoint
             # currently carries temperature=None.
             "calibrated": self.temperature_scaler is not None,

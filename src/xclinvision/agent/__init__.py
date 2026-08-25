@@ -71,6 +71,8 @@ class ClinicalContext:
     uncertainty_level: str = "unknown"
     highlighted_regions: List[str] = field(default_factory=list)
     class_names: List[str] = field(default_factory=list)
+    #: Every label above threshold, ranked. Empty falls back to [prediction].
+    class_names_predicted: List[str] = field(default_factory=list)
     patient_age: Optional[int] = None
     patient_sex: Optional[str] = None
 
@@ -101,7 +103,10 @@ class _SimpleClinicalAgent:
             try:
                 vision_data: Dict[str, Any] = {
                     "class_names": context.class_names or [context.prediction],
-                    "class_names_predicted": [context.prediction] if context.prediction else [],
+                    "class_names_predicted": (
+                        context.class_names_predicted
+                        or ([context.prediction] if context.prediction else [])
+                    ),
                     "probabilities": context.probabilities,
                     "confidence": context.confidence,
                     "explanation": {
@@ -126,7 +131,14 @@ class _SimpleClinicalAgent:
                 logger.warning("Full LLM agent failed, falling back to rule-based report: %s", exc)
 
         # Rule-based fallback
-        findings = f"AI analysis detected {context.prediction}" if context.prediction else "No significant findings detected"
+        # Report every positive label, not just the headline one.
+        positives = context.class_names_predicted or (
+            [context.prediction] if context.prediction else []
+        )
+        if positives:
+            findings = f"AI analysis detected {', '.join(positives)}"
+        else:
+            findings = "No significant findings detected"
         if context.confidence > 0:
             findings += f" with {context.confidence:.1%} confidence"
         findings += "."

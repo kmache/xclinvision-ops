@@ -412,7 +412,7 @@ Reference the tool outputs as evidence. Keep it concise."""
         elif intent == "suggest_next_steps":
             parts.append(self._format_next_steps(tool_results))
         elif intent == "assess_urgency":
-            parts.append(self._format_urgency_assessment(tool_results))
+            parts.append(self._format_urgency_assessment(tool_results, analysis))
         elif intent == "compare_history":
             parts.append(self._format_history_comparison(tool_results))
         elif intent == "get_metrics":
@@ -515,7 +515,10 @@ Reference the tool outputs as evidence. Keep it concise."""
         return "\n".join(lines)
 
     @staticmethod
-    def _format_urgency_assessment(results: Dict[str, ToolResult]) -> str:
+    def _format_urgency_assessment(
+        results: Dict[str, ToolResult],
+        analysis: Optional[Dict[str, Any]] = None,
+    ) -> str:
         pred = results.get("get_prediction_details")
         ns = results.get("suggest_next_steps")
 
@@ -527,8 +530,26 @@ Reference the tool outputs as evidence. Keep it concise."""
         uncertainty = d["uncertainty_level"]
         prediction = d["prediction"]
 
+        # Every label above threshold, not just the headline one. A critical
+        # finding co-occurring with a routine headline must still escalate.
+        positives: List[str] = list(
+            (analysis or {}).get("class_names_predicted") or []
+        ) or [prediction]
+        critical_positives = [p for p in positives if p in CRITICAL_CONDITIONS]
+
         # Rule-based urgency assessment
-        if prediction == "No finding":
+        if critical_positives:
+            urgency = "High"
+            assessment = (
+                f"Critical finding ({', '.join(critical_positives)}) detected. "
+                "Immediate radiologist review and clinical correlation required."
+            )
+            if prediction not in critical_positives:
+                assessment += (
+                    f" Note: the headline finding is {prediction}; the critical "
+                    "finding is a co-occurring positive label."
+                )
+        elif prediction == "No finding":
             urgency = "Low"
             assessment = "No acute findings detected. Routine follow-up as indicated."
         elif prediction in CRITICAL_CONDITIONS:
@@ -564,6 +585,7 @@ Reference the tool outputs as evidence. Keep it concise."""
             "",
             assessment,
             f"- Prediction: {prediction}",
+            f"- All positive labels: {', '.join(positives)}",
             f"- Confidence: {confidence:.1%}",
             f"- Uncertainty: {uncertainty}",
         ]
