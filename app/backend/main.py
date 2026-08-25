@@ -218,6 +218,41 @@ def _discover_models() -> Dict[str, dict]:
 _model_registry: Dict[str, dict] = _discover_models()
 
 
+#: model_name -> ThresholdProfile, populated by _build_pipeline. The report
+#: layer reads this so its clinical language uses the same thresholds the
+#: pipeline used to decide positive/negative.
+_threshold_profiles: Dict[str, Any] = {}
+
+
+def _clinical_threshold_profile(checkpoint_thresholds: Optional[Dict[str, float]]):
+    """Combine the checkpoint's thresholds with the clinical sensitivity floor.
+
+    Checkpoint thresholds are F1-optimised and can sit high (0.60-0.79 for the
+    shipped models). For a life-threatening finding a high threshold trades
+    sensitivity for precision in the wrong direction, so a class in
+    CRITICAL_CONDITIONS is capped at its DEFAULT_CLINICAL_THRESHOLDS value.
+    """
+    from xclinvision.agent.guardrails import (
+        CRITICAL_CONDITIONS,
+        DEFAULT_CLINICAL_THRESHOLDS,
+        build_clinical_threshold_profile,
+    )
+
+    class_names = get_class_names()
+    merged = {k: float(v) for k, v in (checkpoint_thresholds or {}).items()}
+    for name in class_names:
+        if name not in CRITICAL_CONDITIONS:
+            continue
+        cap = DEFAULT_CLINICAL_THRESHOLDS.get(name)
+        if cap is not None and merged.get(name, 0.5) > cap:
+            logger.warning(
+                "Critical finding '%s': capping threshold %.4f -> %.2f to preserve sensitivity",
+                name, merged.get(name, 0.5), cap,
+            )
+            merged[name] = cap
+    return build_clinical_threshold_profile(class_names, custom_thresholds=merged)
+
+
 def _build_pipeline(model_path: str, architecture: str, image_size: int):
     """Load a trained checkpoint and return an InferencePipeline.
 
@@ -284,6 +319,10 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
             logger.info("Loaded per-class thresholds from payload: %s", thresholds_dict)
 
     norm_stats = get_model_normalization(model, architecture)
+
+    profile = _clinical_threshold_profile(thresholds_dict)
+    _threshold_profiles[architecture] = profile
+    thresholds_dict = dict(profile.thresholds)
 
     return InferencePipeline(
         model=model,
@@ -1693,7 +1732,13 @@ def export_report_html(request: ExportReportRequest):
         else:
             image_data = np.full((384, 384, 3), 128, dtype=np.uint8)
 
-        reporter = ClinicalReporter()
+        # Without a profile the reporter defaults every class to 0.50, so a
+        # probability the pipeline classified NEGATIVE (thresholds run
+        # 0.60-0.79) was still rendered "Consistent with <finding>".
+        profile = _threshold_profiles.get(stored.get("model_version", ""))
+        if profile is None:
+            profile = _clinical_threshold_profile(None)
+        reporter = ClinicalReporter(threshold_profile=profile)
         html = reporter.generate_html(
             report=clinical_report,
             vision_data=vision_data,

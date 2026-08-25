@@ -80,3 +80,48 @@ def test_spatial_evidence_no_stale_zero_placeholders():
     # none of them leak into the output.
     for stale in ("right_upper:", "right_middle:", "left_upper:", "cardiac:", "apical:"):
         assert stale not in html
+
+
+def test_report_language_honours_pipeline_thresholds():
+    """Issue 4: report wording must agree with the pipeline's positive/negative call.
+
+    Without a ThresholdProfile the reporter defaults every class to 0.50, so a
+    probability the pipeline classified NEGATIVE (shipped thresholds run
+    0.66-0.78) was still rendered "Consistent with <finding>".
+    """
+    from xclinvision.agent.guardrails import build_clinical_threshold_profile
+    from xclinvision.agent.reporter import calibrate_predictions
+
+    class_names = ["Cardiomegaly", "Aortic enlargement"]
+    thresholds = {"Cardiomegaly": 0.7235, "Aortic enlargement": 0.6595}
+    profile = build_clinical_threshold_profile(class_names, custom_thresholds=thresholds)
+
+    probabilities = [0.60, 0.60]  # below both thresholds -> negative
+
+    without = [r["clinical_term"] for r in calibrate_predictions(class_names, probabilities, None)]
+    assert without == ["Consistent with", "Consistent with"]
+
+    with_profile = [
+        r["clinical_term"] for r in calibrate_predictions(class_names, probabilities, profile)
+    ]
+    assert all(t.startswith("Equivocal") for t in with_profile), with_profile
+
+
+def test_critical_findings_are_floored_to_the_sensitivity_cap():
+    """Issue 4: a critical finding must never be served above its clinical cap."""
+    import main  # noqa: PLC0415 — conftest puts app/backend on sys.path
+
+    original = main.get_class_names
+    main.get_class_names = lambda: ["Pneumothorax", "Consolidation", "Cardiomegaly"]
+    try:
+        profile = main._clinical_threshold_profile(
+            {"Pneumothorax": 0.81, "Consolidation": 0.77, "Cardiomegaly": 0.7235}
+        )
+    finally:
+        main.get_class_names = original
+
+    assert profile.thresholds["Pneumothorax"] == 0.25
+    assert profile.thresholds["Consolidation"] == 0.30
+    # Non-critical classes keep the checkpoint's calibrated value.
+    assert profile.thresholds["Cardiomegaly"] == 0.7235
+    assert profile.get_priority("Pneumothorax") == "critical"
