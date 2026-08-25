@@ -163,15 +163,43 @@ class Storage:
             rows = cur.fetchall()
         return {row[0]: json.loads(row[1]) for row in rows}
 
-    def by_patient(self, patient_id: str) -> List[Dict[str, Any]]:
+    def by_patient(
+        self, patient_id: str, *, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Analyses for one patient, newest first, via idx_analyses_patient."""
+        sql = (
+            "SELECT data_json FROM analyses WHERE patient_id = ? "
+            "ORDER BY timestamp DESC"
+        )
+        params: List[Any] = [patient_id]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
         with self._lock:
-            cur = self._conn.execute(
-                "SELECT data_json FROM analyses WHERE patient_id = ? "
-                "ORDER BY timestamp DESC",
-                (patient_id,),
-            )
-            rows = cur.fetchall()
+            rows = self._conn.execute(sql, params).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    #: Columns the agent tools actually read off the analysis store. Projecting
+    #: to these avoids materialising every row's base64 heatmaps per request.
+    _SUMMARY_KEYS = ("analysis_id", "patient_id", "timestamp", "prediction", "confidence")
+
+    def summaries(self) -> Dict[str, Dict[str, Any]]:
+        """Scalar-only snapshot of all analyses, keyed by id.
+
+        ``all_analyses()`` decodes every stored heatmap; the reasoning tools
+        (``_tool_get_monitoring_status``, ``_tool_compare_with_history``) need
+        only the fields in :attr:`_SUMMARY_KEYS`.
+        """
+        projection = ", ".join(
+            f"json_extract(data_json, '$.{k}')" for k in self._SUMMARY_KEYS
+        )
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT id, {projection} FROM analyses ORDER BY inserted_at ASC"
+            ).fetchall()
+        # json_extract pulls the scalars inside SQLite, so the stored base64
+        # heatmaps are never decoded into Python at all.
+        return {row[0]: dict(zip(self._SUMMARY_KEYS, row[1:])) for row in rows}
 
     # --------------------------------------------------------------- feedback
     def append_feedback(self, entry: Dict[str, Any]) -> None:

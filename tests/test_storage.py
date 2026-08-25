@@ -121,3 +121,40 @@ def test_numpy_serialization(store):
     got = store.get_analysis("a1")
     assert got["scores"] == [0.1, 0.2, 0.3]
     assert got["label"] == 2
+
+
+def test_by_patient_respects_limit(store):
+    store.put_analysis("a1", {"patient_id": "P1", "timestamp": "2024-01-01"})
+    store.put_analysis("a2", {"patient_id": "P1", "timestamp": "2024-02-01"})
+    store.put_analysis("a3", {"patient_id": "P1", "timestamp": "2024-03-01"})
+
+    assert len(store.by_patient("P1")) == 3
+    limited = store.by_patient("P1", limit=2)
+    assert len(limited) == 2
+    # LIMIT is applied after ORDER BY timestamp DESC, so we keep the newest.
+    assert [r["timestamp"] for r in limited] == ["2024-03-01", "2024-02-01"]
+
+
+def test_summaries_projects_scalars_only(store):
+    """Issue 10: the chat context must not decode stored base64 heatmaps."""
+    store.put_analysis("a1", {
+        "analysis_id": "a1",
+        "patient_id": "P1",
+        "timestamp": "2024-01-01",
+        "prediction": "Cardiomegaly",
+        "confidence": 0.9,
+        "heatmap_gradcam": "x" * 4096,
+        "heatmap_overlay": "y" * 4096,
+        "top_k_predictions": [{"class_name": "Cardiomegaly", "probability": 0.9}],
+    })
+
+    summary = store.summaries()["a1"]
+    assert summary == {
+        "analysis_id": "a1",
+        "patient_id": "P1",
+        "timestamp": "2024-01-01",
+        "prediction": "Cardiomegaly",
+        "confidence": 0.9,
+    }
+    # The heavy fields are still retrievable through the full accessor.
+    assert store.get_analysis("a1")["heatmap_gradcam"] == "x" * 4096

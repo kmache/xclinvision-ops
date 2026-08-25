@@ -1335,11 +1335,9 @@ async def get_dashboard_explanation(
 @app.get("/api/v2/history/{patient_id}", dependencies=[Depends(require_auth)])
 async def get_patient_history(patient_id: str, limit: int = Query(default=50, le=200)):
     """Retrieve all historical analyses for a patient (temporal comparison)."""
-    history = [
-        v for v in _analysis_store.values()
-        if v.get("patient_id") == patient_id
-    ]
-    history.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    # Indexed lookup (idx_analyses_patient) instead of decoding every stored
+    # analysis — rows embed base64 heatmaps and the table caps at 5000.
+    history = storage.by_patient(patient_id, limit=limit)
 
     return [
         {
@@ -1410,7 +1408,7 @@ async def llm_chat(request: ChatRequest):
 
         # Extra context the tools may need
         extra_context = {
-            "analysis_store": storage.all_analyses(),
+            "analysis_store": storage.summaries(),
             "feedback_store": storage.all_feedback(),
         }
 
@@ -1902,7 +1900,7 @@ async def llm_chat_stream(request: ChatRequest):
             ]
 
             extra_context = {
-                "analysis_store": storage.all_analyses(),
+                "analysis_store": storage.summaries(),
                 "feedback_store": storage.all_feedback(),
             }
 
