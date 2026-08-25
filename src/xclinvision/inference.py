@@ -137,6 +137,8 @@ class InferencePipeline:
         # class_name -> "critical" | "urgent" | "routine". Absent entries sort
         # as "routine", so an unsupplied map degrades to probability ranking.
         self._priority_map = priority_map or {}
+        #: One warning per pipeline, not per inference.
+        self._warned_uncalibrated = False
         # Cache a torch tensor version on the correct device for GPU-side comparison
         self._threshold_tensor = torch.tensor(
             self._threshold_array, device=self.device, dtype=torch.float32
@@ -176,6 +178,12 @@ class InferencePipeline:
         - Torch Tensor temperature values
         """
         if self.temperature_scaler is None:
+            if not self._warned_uncalibrated:
+                self._warned_uncalibrated = True
+                logger.warning(
+                    "Temperature scaling is a no-op for %s; served probabilities "
+                    "are uncalibrated.", self.architecture,
+                )
             return logits
 
         # Extract the scalar T from whichever representation we have
@@ -340,6 +348,9 @@ class InferencePipeline:
             # True only when a temperature was fitted. Every shipped checkpoint
             # currently carries temperature=None.
             "calibrated": self.temperature_scaler is not None,
+            "calibration_status": (
+                "calibrated" if self.temperature_scaler is not None else "uncalibrated"
+            ),
         }
         if self.multilabel:
             result["predictions_multilabel"] = preds_binary.cpu().tolist()

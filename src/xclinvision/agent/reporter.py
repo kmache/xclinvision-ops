@@ -50,7 +50,9 @@ logger = logging.getLogger(__name__)
 EQUIVOCAL_MARGIN = 0.10
 
 
-def calibrate_probability(prob: float, threshold: float = 0.50) -> str:
+def calibrate_probability(
+    prob: float, threshold: float = 0.50, *, calibrated: bool = True
+) -> str:
     """Map a raw probability to clinical language.
 
     ``threshold`` must be the same per-class threshold the pipeline used to
@@ -64,6 +66,10 @@ def calibrate_probability(prob: float, threshold: float = 0.50) -> str:
     >= threshold - EQUIVOCAL_MARGIN      → "Equivocal; consider clinical correlation"
     otherwise                            → "No significant evidence"
     """
+    if not calibrated:
+        # No fitted temperature: the number is a raw model output, so mapping
+        # it to clinical certainty ("Highly suggestive") is unsupported.
+        return f"Raw model probability: {prob:.2f} (not calibrated)"
     if prob >= threshold + 0.35:
         return "Highly suggestive"
     if prob >= threshold:
@@ -77,6 +83,8 @@ def calibrate_predictions(
     class_names: List[str],
     probabilities: List[float],
     threshold_profile: Optional[ThresholdProfile] = None,
+    *,
+    calibrated: bool = True,
 ) -> List[Dict[str, Any]]:
     """Return a list of ``{class_name, probability, clinical_term}`` dicts,
     sorted by descending probability."""
@@ -96,6 +104,7 @@ def calibrate_predictions(
             "clinical_term": calibrate_probability(
                 prob,
                 threshold_profile.get_threshold(name) if threshold_profile else 0.50,
+                calibrated=calibrated,
             ),
         }
         for name, prob in pairs
@@ -298,7 +307,10 @@ class ClinicalReporter:
         probabilities: List[float] = vision_data.get("probabilities", [])
 
         # 1. Calibrated findings table
-        calibrated = calibrate_predictions(class_names, probabilities, self.threshold_profile)
+        is_calibrated = vision_data.get("calibration_status", "uncalibrated") == "calibrated"
+        calibrated = calibrate_predictions(
+            class_names, probabilities, self.threshold_profile, calibrated=is_calibrated,
+        )
 
         # 2. Original input image
         original_b64 = ""

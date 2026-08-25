@@ -302,29 +302,37 @@ def test_analyze_response_carries_every_positive_label(client):
     assert detail[3]["probability"] == pytest.approx(0.97, abs=1e-3)
     assert all(set(d) == {"class_name", "probability", "threshold", "positive"} for d in detail)
 
-def test_temperature_scaler_actually_changes_probabilities():
-    """Issue 7: this previously asserted only hasattr(ts, 'temperature') — always true.
+def test_fitted_temperature_reduces_ece_on_overconfident_logits():
+    """Issue 7: replaces `assert hasattr(ts, 'temperature')`, which was always true.
 
-    A fitted scaler must measurably flatten overconfident logits, otherwise
-    "calibrated confidence" is a claim with nothing behind it.
+    Temperature scaling only earns the word "calibrated" if it measurably
+    improves calibration. Fit on overconfident logits and assert ECE drops.
     """
     import torch
 
-    from xclinvision.evaluator import TemperatureScaler
+    from xclinvision.evaluator import CalibrationAnalyzer, TemperatureScaler
+
+    analyzer = CalibrationAnalyzer()
 
     rng = np.random.default_rng(0)
-    # Overconfident model: large-magnitude logits, labels agreeing only ~70%.
-    logits = rng.normal(0.0, 6.0, size=(512, 4))
+    # Overconfident: large-magnitude logits whose labels agree only ~70%.
+    logits = rng.normal(0.0, 6.0, size=(2048, 4))
     y_true = (logits + rng.normal(0.0, 4.0, size=logits.shape) > 0).astype(np.float32)
 
     scaler = TemperatureScaler()
     temperature = scaler.fit(logits, y_true, multilabel=True)
-
     assert temperature > 0
+
     raw = torch.sigmoid(torch.tensor(logits)).numpy()
     scaled = torch.sigmoid(torch.tensor(logits) / temperature).numpy()
-    # Temperature scaling must move the probabilities, not return identity.
-    assert not np.allclose(raw, scaled), f"T={temperature} left probabilities unchanged"
+
+    ece_raw = analyzer.compute_ece(y_true, raw, multilabel=True)
+    ece_scaled = analyzer.compute_ece(y_true, scaled, multilabel=True)
+
+    assert ece_scaled < ece_raw, (
+        f"temperature {temperature:.3f} did not improve calibration: "
+        f"ECE {ece_raw:.4f} -> {ece_scaled:.4f}"
+    )
 
 
 def test_predict_reports_whether_probabilities_are_calibrated():
@@ -399,3 +407,75 @@ def test_analyze_response_exposes_raw_probability(client):
     assert body["raw_probability"] == 0.9
     assert body["confidence"] == 0.9      # decision 2: additive only
     assert body["calibrated"] is False
+
+
+def test_analyze_response_reports_calibration_status(client):
+    """Issue 7: every served model is uncalibrated; the response must say so."""
+    import io
+    from unittest.mock import MagicMock, patch
+
+    from PIL import Image
+
+    pipeline = MagicMock()
+    pipeline.predict.return_value = {
+        "prediction": 0,
+        "class_name": "Cardiomegaly",
+        "probabilities": [0.9, 0.1],
+        "raw_probability": 0.9,
+        "confidence": 0.9,
+        "calibrated": False,
+        "calibration_status": "uncalibrated",
+        "thresholds": [0.5, 0.5],
+        "class_names": ["Cardiomegaly", "Aortic enlargement"],
+        "predictions_multilabel": [1, 0],
+        "class_names_predicted": ["Cardiomegaly"],
+        "uncertainty": {"epistemic": 0.01},
+        "uncertainty_level": "low",
+        "explanation": {"key_findings": [], "visualization": {"region_scores": {}}},
+    }
+    pipeline.preprocess.return_value = (
+        np.zeros((3, 64, 64), dtype=np.float32),
+        np.zeros((64, 64, 3), dtype=np.uint8),
+    )
+
+    buf = io.BytesIO()
+    Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8)).save(buf, format="JPEG")
+
+    import main  # noqa: PLC0415
+
+    with patch.object(main, "get_pipeline", return_value=pipeline), \
+            patch.object(main, "_get_agent", side_effect=RuntimeError("no llm")):
+        body = client.post(
+            "/api/v2/analyze", files={"file": ("a.jpg", buf.getvalue(), "image/jpeg")}
+        ).json()
+
+    assert body["calibration_status"] == "uncalibrated"
+    assert body["calibrated"] is False
+    # Deprecated alias still mirrors the value (decision 2: additive only).
+    assert body["confidence"] == body["raw_probability"]
+
+
+def test_uncalibrated_report_uses_no_certainty_language():
+    """An uncalibrated score must not be mapped to clinical certainty."""
+    from xclinvision.agent.reporter import calibrate_predictions
+
+    class_names = ["Cardiomegaly", "Aortic enlargement"]
+    probabilities = [0.97, 0.10]
+
+    terms = [
+        r["clinical_term"]
+        for r in calibrate_predictions(class_names, probabilities, None, calibrated=False)
+    ]
+
+    for term in terms:
+        assert "Highly suggestive" not in term
+        assert "Consistent with" not in term
+        assert "not calibrated" in term
+    assert terms[0] == "Raw model probability: 0.97 (not calibrated)"
+
+    # With a fitted temperature the clinical language returns.
+    calibrated_terms = [
+        r["clinical_term"]
+        for r in calibrate_predictions(class_names, probabilities, None, calibrated=True)
+    ]
+    assert calibrated_terms[0] == "Highly suggestive"

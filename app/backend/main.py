@@ -1328,8 +1328,11 @@ def analyze_image(
         "confidence": result["confidence"],
         "uncertainty": result.get("uncertainty", {}),
         "uncertainty_level": result.get("uncertainty_level", "unknown"),
-        # Whether `confidence` is a calibrated probability or a raw model output.
+        # Whether `confidence`/`raw_probability` is a calibrated probability or
+        # a raw model output. No shipped checkpoint carries a fitted
+        # temperature, so this is "uncalibrated" for every served model today.
         "calibrated": result.get("calibrated", False),
+        "calibration_status": result.get("calibration_status", "uncalibrated"),
         "top_k_predictions": top_k,
         # Every label that crossed its threshold, not just the headline one.
         # These were computed by the pipeline and then dropped here, so a
@@ -1863,6 +1866,9 @@ def export_report_html(request: ExportReportRequest):
         vision_data = {
             "class_names": class_names,
             "probabilities": probs,
+            # Drives the report's language: uncalibrated scores must not be
+            # rendered as clinical certainty.
+            "calibration_status": stored.get("calibration_status", "uncalibrated"),
         }
         # Embed XAI heatmaps into the report if available
         if request.include_xai:
