@@ -1427,8 +1427,8 @@ async def generate_dashboard_report(request: DashboardReportRequest):
 
     # Build sections
     findings = (
-        f"AI analysis of chest {primary.get('model_version', 'X-ray')} "
-        f"({primary['timestamp'][:10]}):\n\n"
+        f"AI analysis of chest X-ray ({primary['timestamp'][:10]}, "
+        f"model {primary.get('model_version', 'unknown')}):\n\n"
         f"1. {primary['prediction']} detected with {primary['confidence']:.1%} confidence. "
         f"Uncertainty: {primary.get('uncertainty_level', 'unknown').capitalize()}.\n"
     )
