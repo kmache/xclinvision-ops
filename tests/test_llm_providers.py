@@ -326,3 +326,81 @@ class TestAgentFactoryIntegration:
         assert agent is not None
         # Even without an API key, the agent should initialise (rule-based)
         assert agent.tools is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. Health-probe caching (issue #2)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestHealthProbeCaching:
+    """LLMProvider.health_check issues a real billed completion — cache it.
+
+    /api/v2/llm/health calls provider_status(), which fans out to every
+    registered provider. Uncached, that was one paid completion per provider
+    per inbound request.
+    """
+
+    @staticmethod
+    def _mock_openai_provider(monkeypatch):
+        from xclinvision.agent.llm_provider import OpenAIProvider
+
+        monkeypatch.delenv("LLM_HEALTH_TTL_SECONDS", raising=False)
+        provider = OpenAIProvider(api_key="sk-test", model="gpt-4o-mini")
+
+        completion = MagicMock()
+        completion.choices = [MagicMock(message=MagicMock(content="OK"))]
+        completion.usage = None
+        client = MagicMock()
+        client.chat.completions.create.return_value = completion
+        provider._client = client
+        return provider, client
+
+    def test_rapid_calls_issue_exactly_one_completion(self, monkeypatch):
+        provider, client = self._mock_openai_provider(monkeypatch)
+
+        results = [provider.health_check() for _ in range(3)]
+
+        assert results == [True, True, True]
+        assert client.chat.completions.create.call_count == 1
+
+    def test_manager_provider_status_reuses_the_cached_verdict(self, monkeypatch):
+        from xclinvision.agent.llm_manager import LLMManager
+
+        provider, client = self._mock_openai_provider(monkeypatch)
+        manager = LLMManager()
+        manager.register(provider)
+
+        for _ in range(5):
+            assert manager.provider_status() == {"openai": True}
+
+        assert client.chat.completions.create.call_count == 1
+
+    def test_zero_ttl_disables_caching(self, monkeypatch):
+        provider, client = self._mock_openai_provider(monkeypatch)
+        monkeypatch.setenv("LLM_HEALTH_TTL_SECONDS", "0")
+
+        provider.health_check()
+        provider.health_check()
+
+        assert client.chat.completions.create.call_count == 2
+
+    def test_invalid_ttl_falls_back_to_the_default(self, monkeypatch):
+        provider, client = self._mock_openai_provider(monkeypatch)
+        monkeypatch.setenv("LLM_HEALTH_TTL_SECONDS", "not-a-number")
+
+        provider.health_check()
+        provider.health_check()
+
+        assert client.chat.completions.create.call_count == 1
+
+    def test_a_failing_provider_is_also_cached(self, monkeypatch):
+        """A down provider must not be re-probed per request either."""
+        provider, client = self._mock_openai_provider(monkeypatch)
+        client.chat.completions.create.side_effect = RuntimeError("upstream down")
+
+        assert provider.health_check() is False
+        assert provider.health_check() is False
+        # A RuntimeError is not a BadRequest/NotFound, so call() re-raises
+        # immediately without trying the plain-completion fallback: one probe.
+        assert client.chat.completions.create.call_count == 1

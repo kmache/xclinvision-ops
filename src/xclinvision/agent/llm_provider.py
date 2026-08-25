@@ -16,9 +16,29 @@ from typing import Any, Dict, Generator, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
-#: How long a health-check verdict stays valid. The probe below is a real
+#: Default lifetime of a health-check verdict. The probe below is a real
 #: billed completion, so it must not run once per inbound request.
+#: Override with the ``LLM_HEALTH_TTL_SECONDS`` env var; 0 disables caching.
 HEALTH_CACHE_TTL_SECONDS = 60.0
+
+
+def _health_ttl_seconds() -> float:
+    """Health-probe cache TTL in seconds, from ``LLM_HEALTH_TTL_SECONDS``.
+
+    Read per call rather than at import so the value can be changed without
+    restarting the process (and so tests can vary it).
+    """
+    raw = os.environ.get("LLM_HEALTH_TTL_SECONDS", "").strip()
+    if not raw:
+        return HEALTH_CACHE_TTL_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid LLM_HEALTH_TTL_SECONDS=%r; falling back to %.0fs",
+            raw, HEALTH_CACHE_TTL_SECONDS,
+        )
+        return HEALTH_CACHE_TTL_SECONDS
 
 
 def _completion_tokens_kwarg(model: str, value: int = 700) -> Dict[str, int]:
@@ -84,13 +104,15 @@ class LLMProvider(ABC):
     def health_check(self) -> bool:
         """Return True if the provider is reachable and functional.
 
-        The verdict is cached for :data:`HEALTH_CACHE_TTL_SECONDS`. A racing
-        pair of callers may both probe once; that is bounded and harmless,
-        whereas probing per request is not.
+        The verdict is cached for :func:`_health_ttl_seconds` seconds
+        (``LLM_HEALTH_TTL_SECONDS``, default 60). A racing pair of callers may
+        both probe once; that is bounded and harmless, whereas probing per
+        request is not.
         """
         cached = getattr(self, "_health_cache", None)
         now = time.monotonic()
-        if cached is not None and now - cached[0] < HEALTH_CACHE_TTL_SECONDS:
+        ttl = _health_ttl_seconds()
+        if cached is not None and ttl > 0 and now - cached[0] < ttl:
             return cached[1]
         result = self._probe()
         self._health_cache = (now, result)
