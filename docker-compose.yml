@@ -13,14 +13,19 @@ services:
       - XCLINVISION_DATA_DIR=/app/data/processed_384
       - XCLINVISION_CORS_ORIGINS=http://localhost:8501,http://frontend:8501
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-5.4-nano}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
       - OPENAI_API_BASE=${OPENAI_API_BASE:-https://api.openai.com/v1}
       - LLM_DEFAULT_PROVIDER=${LLM_DEFAULT_PROVIDER:-openai}
       - XCLINVISION_VECTORSTORE_DIR=/app/data/vector_db
+      # Analyses DB + stored images must outlive the container: without a
+      # volume these default to data/ in the writable layer and are lost.
+      - XCLINVISION_DB_PATH=/app/data/store/xclinvision.db
+      - XCLINVISION_IMAGE_DIR=/app/data/store/images
     volumes:
       - ./models/best_models:/app/models/best_models:ro
       - ./data/processed_384:/app/data/processed_384:ro
       - ./data/vector_db:/app/data/vector_db:ro
+      - xclinvision-store:/app/data/store
       - ./outputs:/app/outputs
       - ./logs:/app/logs
     healthcheck:
@@ -36,8 +41,15 @@ services:
       dockerfile: app/frontend/Dockerfile
     ports:
       - "8501:8501"
+    env_file:
+      - .env
     environment:
       - API_URL=http://backend:8000
+      # Blank the LLM key: the frontend talks only to the backend.
+      - OPENAI_API_KEY=
     depends_on:
       backend:
         condition: service_healthy
+
+volumes:
+  xclinvision-store:
