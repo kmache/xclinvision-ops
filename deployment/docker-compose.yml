@@ -10,10 +10,10 @@ services:
       - XCLINVISION_MODELS_DIR=/app/models/best_models
       - XCLINVISION_DATA_DIR=/app/data/processed_384
       - XCLINVISION_CORS_ORIGINS=http://frontend:8501,http://localhost:8501,http://localhost:80
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
-      - OPENAI_API_BASE=${OPENAI_API_BASE:-https://api.openai.com/v1}
-      - LLM_DEFAULT_PROVIDER=${LLM_DEFAULT_PROVIDER:-openai}
+      # OPENAI_* / LLM_DEFAULT_PROVIDER are deliberately NOT listed here: an
+      # explicit environment: entry overrides env_file, so a bare ${VAR} renders
+      # empty when unset in the shell and a :-default silently beats the .env
+      # value. Leaving them out lets env_file supply them.
       - XCLINVISION_VECTORSTORE_DIR=/app/data/vector_db
       # Analyses DB + stored images must outlive the container: without a
       # volume these default to data/ in the writable layer and are lost.
