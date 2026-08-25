@@ -33,7 +33,7 @@ dependencies = [
     "pandas>=2.0.0",
     "pillow>=10.0.0",
     "opencv-python-headless>=4.8.0",
-    "pydicom>=2.4.0",         # processing.py — .dcm ingestion
+    "pydicom==3.0.1",         # processing.py — .dcm ingestion
     "albumentations>=1.3.0",
     
     # LLM & RAG
@@ -41,19 +41,20 @@ dependencies = [
     "langchain-text-splitters>=0.0.1",
     "chromadb>=0.4.0",
     "sentence-transformers>=2.2.0",
-    "bm25s>=0.2.0",
-    "tiktoken>=0.5.0",        # xclinvisionagent.py — cross-verify prompt budgeting
+    "bm25s==0.3.8",           # agent/ingest_knowledge.py — BM25 half of the hybrid retriever
+    "tiktoken==0.12.0",       # xclinvisionagent.py — cross-verify prompt budgeting
     
     # Backend & API
     "fastapi>=0.103.0",
-    "jinja2>=3.1.0",          # agent/reporter.py — clinical report templating
+    "jinja2==3.1.6",          # agent/reporter.py — clinical report templating
+    "weasyprint==66.0",       # /api/v2/export-report format="pdf" (needs system pango/cairo)
     "uvicorn>=0.23.0",
     "pydantic>=2.0.0",
     "python-multipart>=0.0.6",
     
     # Frontend
     "streamlit>=1.26.0",
-    "requests>=2.31.0",       # app/frontend/api_client.py
+    "requests==2.32.5",       # app/frontend/api_client.py
     
     # MLOps & Experiment Tracking
     "mlflow>=2.7.0",
@@ -78,9 +79,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-pdf = [
-    "weasyprint>=60.0",       # /api/v2/export-report format="pdf"
-]
 dev = [
     "black>=23.7.0",
     "isort>=5.12.0",
