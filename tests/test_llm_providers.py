@@ -404,3 +404,69 @@ class TestHealthProbeCaching:
         # A RuntimeError is not a BadRequest/NotFound, so call() re-raises
         # immediately without trying the plain-completion fallback: one probe.
         assert client.chat.completions.create.call_count == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9. Empty provider results are failures, not successes (issue #6)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestEmptyResultFailover:
+    """A provider returning None broke its `-> str` contract.
+
+    call_llm used to return that None straight through: the fallback chain
+    never engaged and callers raised AttributeError on `.strip()`.
+    """
+
+    class _NullProvider:
+        """Returns None from call() — the pre-fix OpenAIProvider behaviour."""
+
+        def __init__(self, name: str = "null", value=None):
+            self._name = name
+            self._value = value
+            self.calls = 0
+
+        @property
+        def name(self) -> str:
+            return self._name
+
+        def call(self, system: str, user: str, *, temperature: float = 0.2):
+            self.calls += 1
+            return self._value
+
+        def stream(self, system: str, user: str, *, temperature: float = 0.2):
+            yield ""
+
+        def health_check(self) -> bool:
+            return True
+
+    def _manager_with(self, first):
+        from xclinvision.agent.llm_manager import LLMManager
+
+        manager = LLMManager()
+        manager.register(first)          # registered first -> becomes active
+        manager.register(FakeProvider("local", "local answered"))
+        return manager
+
+    def test_none_result_falls_through_to_next_provider(self):
+        null = self._NullProvider()
+        manager = self._manager_with(null)
+
+        assert manager.call_llm("sys", "user") == "local answered"
+        assert null.calls == 1
+
+    def test_empty_string_result_also_falls_through(self):
+        null = self._NullProvider(value="")
+        manager = self._manager_with(null)
+
+        assert manager.call_llm("sys", "user") == "local answered"
+
+    def test_all_providers_empty_raises(self):
+        from xclinvision.agent.llm_manager import LLMManager
+
+        manager = LLMManager()
+        manager.register(self._NullProvider("a"))
+        manager.register(self._NullProvider("b"))
+
+        with pytest.raises(RuntimeError, match="All LLM providers failed"):
+            manager.call_llm("sys", "user")

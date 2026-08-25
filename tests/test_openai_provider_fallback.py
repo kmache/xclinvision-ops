@@ -104,3 +104,40 @@ def test_all_candidate_models_failing_raises_not_none(monkeypatch):
 
     with pytest.raises(RuntimeError, match="all candidate models failed"):
         provider.call("system", "user")
+
+
+def test_both_distinct_models_rate_limited_raises(monkeypatch):
+    """Issue 6: the two-iteration path must raise too, not fall through.
+
+    test_all_candidate_models_failing_raises_not_none covers the default
+    config, where OPENAI_MODEL equals the fallback and dict.fromkeys collapses
+    the loop to one entry. This covers a distinct primary model, so the loop
+    actually runs twice before giving up.
+    """
+    provider = OpenAIProvider(api_key="sk-test", model="gpt-4o")
+    assert provider._model != provider._FALLBACK_MODEL
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+    bad_request = BadRequestError(
+        "response_format unsupported",
+        response=httpx.Response(400, request=request),
+        body=None,
+    )
+    rate_limited = [
+        RateLimitError(
+            "rate limited",
+            response=httpx.Response(429, request=request),
+            body=None,
+        )
+        for _ in range(2)
+    ]
+
+    client = MagicMock()
+    client.chat.completions.create.side_effect = [bad_request, *rate_limited]
+    provider._client = client
+
+    with pytest.raises(RuntimeError, match="all candidate models failed"):
+        provider.call("system", "user")
+
+    # JSON mode + primary plain + fallback plain
+    assert client.chat.completions.create.call_count == 3

@@ -87,13 +87,25 @@ class LLMManager:
         *,
         temperature: float = 0.2,
     ) -> str:
-        """Call the active provider.  Falls back to other providers on failure."""
+        """Call the active provider.  Falls back to other providers on failure.
+
+        A provider that returns ``None`` or an empty string has broken its
+        ``-> str`` contract; that counts as a failure and the next provider is
+        tried. Without this, a provider returning None looked like success, the
+        fallback chain never engaged, and callers hit AttributeError on
+        ``.strip()``.
+        """
         providers_to_try = self._fallback_order()
         last_error: Optional[Exception] = None
 
         for provider in providers_to_try:
             try:
                 result = provider.call(system, user, temperature=temperature)
+                # Deliberately an explicit raise, not `assert`: asserts are
+                # stripped under `python -O`, which would silently remove this
+                # guard from an optimised deployment.
+                if not result:
+                    raise RuntimeError(f"{provider.name} returned empty result")
                 # If we fell back to a different provider, update active
                 if provider.name != self._active_name:
                     logger.warning(
