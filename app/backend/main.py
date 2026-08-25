@@ -1186,6 +1186,72 @@ def _image_store_put(analysis_id: str, data: bytes) -> None:
     storage.put_image(analysis_id, data)
 
 
+def _ingest_upload(contents: bytes) -> "tuple[np.ndarray, bytes]":
+    """Decode an upload and return (RGB array for the model, bytes safe to persist).
+
+    Both /api/v2/analyze and /api/v2/compare go through here so the two cannot
+    drift apart — the same class of divergence 72e142eb had to repair for
+    analysis_data.
+
+    DICOM is the reason this exists. Uploads of application/dicom were already
+    accepted, but PIL cannot open a DICOM, so _safe_open_rgb raised and the
+    caller's `except Exception` branch persisted the ORIGINAL bytes — every
+    identifying tag intact — into the blob store. The bytes returned here for a
+    DICOM are a lossless PNG re-encode of the decoded 8-bit grayscale: it holds
+    no tags at all, so there is nothing to leak by construction, and it is
+    exactly the pixels the model saw, so /api/v2/explain re-renders what was
+    actually analysed.
+
+    Raises:
+        HTTPException: 400 on an undecodable image or a refused DICOM (wrong
+            modality, unreadable), 413 past the pixel cap.
+    """
+    from xclinvision.processing import DicomError, is_dicom, read_dicom_safe
+
+    if is_dicom(contents):
+        try:
+            gray, _dicom_meta = read_dicom_safe(contents, max_pixels=MAX_IMAGE_PIXELS)
+        except DicomError as exc:
+            # Never fall through to the raster path: that would resize without
+            # the rescale/window/photometric handling and silently diverge
+            # preprocessing from training.
+            raise HTTPException(400, str(exc)) from exc
+        image_np = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+        ok, buf = cv2.imencode(".png", gray)
+        if not ok:
+            raise HTTPException(400, "Could not re-encode DICOM pixel data for storage.")
+        # _dicom_meta is deliberately dropped here: it carries only decoding
+        # parameters, and nothing downstream needs them.
+        return image_np, buf.tobytes()
+
+    try:
+        from xclinvision.processing import read_image_grayscale
+        gray = read_image_grayscale(contents)
+        if gray is not None:
+            h, w = gray.shape[:2]
+            if w * h > MAX_IMAGE_PIXELS:
+                raise HTTPException(
+                    413, f"Image too large: {w}x{h} exceeds {MAX_IMAGE_PIXELS} pixel cap",
+                )
+            image_np = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+        else:
+            image_np = np.array(_safe_open_rgb(contents))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Could not process image: {e}")
+
+    # Raster uploads keep the existing JPEG re-encode for the stored copy.
+    try:
+        _buf = io.BytesIO()
+        _safe_open_rgb(contents).save(_buf, format="JPEG", quality=80)
+        return image_np, _buf.getvalue()
+    except HTTPException:
+        raise
+    except Exception:
+        return image_np, contents
+
+
 def _per_class_detail(result: dict) -> List[dict]:
     """Per-class probability, threshold and positive/negative call.
 
@@ -1380,24 +1446,7 @@ def analyze_image(
         )
     image_hash = hashlib.sha256(contents).hexdigest()
 
-    try:
-        from xclinvision.processing import read_image_grayscale
-        gray = read_image_grayscale(contents)
-        if gray is not None:
-            h, w = gray.shape[:2]
-            if w * h > MAX_IMAGE_PIXELS:
-                raise HTTPException(
-                    413,
-                    f"Image too large: {w}x{h} exceeds {MAX_IMAGE_PIXELS} pixel cap",
-                )
-            image_np = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-        else:
-            image = _safe_open_rgb(contents)
-            image_np = np.array(image)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, f"Could not process image: {e}")
+    image_np, storable_bytes = _ingest_upload(contents)
     analysis_id = f"XCL-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
 
     # --- Run inference -------------------------------------------------------
@@ -1522,16 +1571,11 @@ def analyze_image(
 
     # Store for later retrieval (compress stored image to save memory)
     _analysis_store_put(analysis_id, analysis_data)
-    try:
-        _store_img = _safe_open_rgb(contents)
-        _buf = io.BytesIO()
-        _store_img.save(_buf, format="JPEG", quality=80)
-        # Fix #16: use evicting helper to prevent unbounded memory growth.
-        _image_store_put(analysis_id, _buf.getvalue())
-    except HTTPException:
-        raise
-    except Exception:
-        _image_store_put(analysis_id, contents)
+    # storable_bytes is never the raw upload for a DICOM: it is a tag-free PNG
+    # of the decoded pixels. Persisting `contents` here is what leaked PatientName
+    # and PatientID into the blob store.
+    # Fix #16: use evicting helper to prevent unbounded memory growth.
+    _image_store_put(analysis_id, storable_bytes)
 
     return analysis_data
 
@@ -1549,23 +1593,7 @@ def _run_single_analysis(
     don't duplicate the full analysis pipeline.
     """
     image_hash = hashlib.sha256(contents).hexdigest()
-    try:
-        from xclinvision.processing import read_image_grayscale
-        gray = read_image_grayscale(contents)
-        if gray is not None:
-            h, w = gray.shape[:2]
-            if w * h > MAX_IMAGE_PIXELS:
-                raise HTTPException(
-                    413,
-                    f"Image too large: {w}x{h} exceeds {MAX_IMAGE_PIXELS} pixel cap",
-                )
-            image_np = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-        else:
-            image_np = np.array(_safe_open_rgb(contents))
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, f"Could not process image: {e}")
+    image_np, storable_bytes = _ingest_upload(contents)
 
     pipeline = get_pipeline(model_name=model_name)
     if pipeline is None:
@@ -1613,7 +1641,9 @@ def _run_single_analysis(
     # Store so the analysis can be retrieved later (e.g. for XAI, chat, report)
     _analysis_store_put(analysis_id, analysis_data)
     try:
-        _image_store_put(analysis_id, contents)
+        # Never `contents`: for a DICOM that is the original file with every
+        # identifying tag. storable_bytes is the tag-free re-encode.
+        _image_store_put(analysis_id, storable_bytes)
     except Exception:
         logger.debug("Could not cache image for compare analysis %s", analysis_id)
 

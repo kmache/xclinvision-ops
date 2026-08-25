@@ -66,18 +66,174 @@ class PipelineReport:
 # DICOM / standard image reader
 # ---------------------------------------------------------------------------
 
+#: Modalities that are chest radiographs. CR = computed radiography,
+#: DX = digital radiography. Anything else (MR, CT, US, ...) is a different
+#: imaging physics with different intensity semantics; the model has never seen
+#: one and would produce a confident, meaningless answer.
+CXR_MODALITIES = frozenset({"CR", "DX"})
+
+#: The ONLY tags carried out of a DICOM. This is an allowlist, not a denylist:
+#: the Dataset is discarded after these are read, so an identifying tag that is
+#: not named here — including private tags and ones the standard added after
+#: this was written — cannot survive by construction. A denylist would have to
+#: stay exhaustive against several hundred identifying tags to be equally safe.
+_DICOM_KEEP_TAGS = (
+    "Rows",
+    "Columns",
+    "BitsAllocated",
+    "BitsStored",
+    "PhotometricInterpretation",
+    "PixelRepresentation",
+    "WindowCenter",
+    "WindowWidth",
+    "RescaleSlope",
+    "RescaleIntercept",
+    "PixelSpacing",
+    "Modality",
+)
+
+#: Default pixel ceiling, mirroring the backend's MAX_IMAGE_PIXELS.
+DEFAULT_MAX_DICOM_PIXELS = 50_000_000
+
+
+class DicomError(ValueError):
+    """A DICOM could not be ingested safely.
+
+    Raised rather than returned as ``None`` on purpose. A ``None`` return sends
+    the caller down the plain-raster path, which resizes without the rescale,
+    windowing and photometric handling the DICOM needed — silently diverging
+    preprocessing from training on exactly the inputs most likely to be
+    clinically real.
+    """
+
+
+def is_dicom(data: bytes) -> bool:
+    """True when *data* carries the DICM magic at the standard 128-byte offset."""
+    return len(data) > 132 and data[128:132] == b"DICM"
+
+
+def _scalar(value, default=None):
+    """First element of a possibly-multivalued DICOM attribute, as float."""
+    if value is None:
+        return default
+    is_sequence = isinstance(value, (list, tuple)) or (
+        hasattr(value, "__getitem__") and not isinstance(value, (str, bytes))
+    )
+    if is_sequence:
+        try:
+            value = value[0]
+        except (IndexError, KeyError, TypeError):
+            return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def read_dicom_safe(
+    source: Union[str, Path, bytes],
+    *,
+    max_pixels: int = DEFAULT_MAX_DICOM_PIXELS,
+) -> Tuple[np.ndarray, dict]:
+    """Decode a DICOM to 8-bit grayscale and return only non-identifying metadata.
+
+    Returns ``(image, meta)`` where *image* is the same 8-bit grayscale the
+    PNG/JPEG path produces — so downstream preprocessing matches training — and
+    *meta* holds only :data:`_DICOM_KEEP_TAGS`. No identifying tag is ever
+    returned, so nothing downstream can store, log or send one to an LLM.
+
+    The header is read first, on its own, so ``Modality`` and the pixel count
+    are checked *before* any pixel buffer is decoded. Checking after the decode
+    would mean a 40000x40000 DICOM had already been expanded in memory by the
+    time it was refused.
+
+    Raises:
+        DicomError: not a DICOM, unreadable, non-CXR modality, over the pixel
+            cap, or carrying no decodable pixel data.
+    """
+    import io as _io
+
+    import pydicom
+
+    opener = _io.BytesIO(source) if isinstance(source, bytes) else str(source)
+
+    # --- header only: no pixel buffer touched ------------------------------
+    try:
+        header = pydicom.dcmread(opener, stop_before_pixels=True, force=False)
+    except Exception as exc:
+        raise DicomError(f"Not a readable DICOM file: {exc}") from exc
+
+    modality = str(getattr(header, "Modality", "") or "").strip().upper()
+    if modality not in CXR_MODALITIES:
+        raise DicomError(
+            f"Unsupported DICOM modality '{modality or 'UNKNOWN'}'. This model "
+            f"reads chest radiographs only ({'/'.join(sorted(CXR_MODALITIES))})."
+        )
+
+    rows = int(getattr(header, "Rows", 0) or 0)
+    cols = int(getattr(header, "Columns", 0) or 0)
+    if rows <= 0 or cols <= 0:
+        raise DicomError("DICOM declares no image dimensions (Rows/Columns missing).")
+    if rows * cols > max_pixels:
+        raise DicomError(f"DICOM too large: {cols}x{rows} exceeds the {max_pixels} pixel cap.")
+
+    # --- full read + decode ------------------------------------------------
+    if isinstance(source, bytes):
+        opener = _io.BytesIO(source)
+    try:
+        ds = pydicom.dcmread(opener, force=False)
+        image = _decode_dicom_dataset(ds)
+    except Exception as exc:
+        raise DicomError(f"DICOM pixel data could not be decoded: {exc}") from exc
+
+    if image is None or image.size == 0:
+        raise DicomError("DICOM decoded to an empty image.")
+
+    # --- allowlist, then drop the Dataset ----------------------------------
+    meta = {}
+    for name in _DICOM_KEEP_TAGS:
+        value = getattr(ds, name, None)
+        if value is None:
+            continue
+        if name in ("WindowCenter", "WindowWidth", "RescaleSlope", "RescaleIntercept"):
+            meta[name] = _scalar(value)
+        elif name == "PixelSpacing":
+            meta[name] = (
+                [_scalar(v) for v in value] if hasattr(value, "__iter__") else _scalar(value)
+            )
+        elif name in ("Rows", "Columns", "BitsAllocated", "BitsStored", "PixelRepresentation"):
+            meta[name] = int(value)
+        else:
+            meta[name] = str(value)
+    del ds, header
+    return image, meta
+
+
 def read_image_grayscale(source: Union[str, Path, bytes]) -> Optional[np.ndarray]:
-    """Read an image as 8-bit grayscale, with transparent DICOM support."""
+    """Read an image as 8-bit grayscale, with transparent DICOM support.
+
+    Returns ``None`` for an unreadable raster image, preserving the historic
+    contract. DICOM is different: :class:`DicomError` propagates rather than
+    degrading to ``None``, because a ``None`` here is what routes a malformed
+    DICOM into the raster path and silently changes its preprocessing.
+    """
+    if isinstance(source, bytes):
+        if is_dicom(source):
+            return read_dicom_safe(source)[0]
+    else:
+        if Path(source).suffix.lower() in {".dcm", ".dicom"}:
+            return read_dicom_safe(source)[0]
+
     try:
         if isinstance(source, bytes):
             return _read_bytes_grayscale(source)
-        path = Path(source)
-        if path.suffix.lower() in {".dcm", ".dicom"}:
-            return _read_dicom_grayscale(path)
-        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-        return img  
+        return cv2.imread(str(Path(source)), cv2.IMREAD_GRAYSCALE)
     except Exception as exc:
-        logger.error("read_image_grayscale failed for %s: %s", source if not isinstance(source, bytes) else "<bytes>", exc)
+        logger.error(
+            "read_image_grayscale failed for %s: %s",
+            source if not isinstance(source, bytes) else "<bytes>",
+            exc,
+        )
         return None
 
 def _decode_dicom_dataset(ds) -> np.ndarray:
@@ -104,17 +260,21 @@ def _decode_dicom_dataset(ds) -> np.ndarray:
 
     return img
 
-def _read_dicom_grayscale(path: Path) -> Optional[np.ndarray]:
-    """Decode a DICOM file to 8-bit grayscale via pydicom."""
-    import pydicom 
-    return _decode_dicom_dataset(pydicom.dcmread(path))
+# _read_dicom_grayscale was removed here: it decoded a DICOM with no modality
+# check, no pixel cap and no tag stripping. Once read_image_grayscale routed
+# DICOM through read_dicom_safe it had no callers, and leaving an unguarded
+# reader in the module is an invitation to reintroduce exactly the leak this
+# change closes. Use read_dicom_safe.
 
 def _read_bytes_grayscale(data: bytes) -> Optional[np.ndarray]:
-    """Decode raw bytes to grayscale — tries DICOM first, then cv2."""
-    if len(data) > 132 and data[128:132] == b"DICM":
-        import pydicom
-        import io as _io
-        return _decode_dicom_dataset(pydicom.dcmread(_io.BytesIO(data)))
+    """Decode raw NON-DICOM bytes to grayscale.
+
+    DICOM is routed to :func:`read_dicom_safe` by the caller before reaching
+    here, so that modality gating, the pixel cap and tag stripping cannot be
+    bypassed by calling this directly.
+    """
+    if is_dicom(data):
+        return read_dicom_safe(data)[0]
 
     buf = np.frombuffer(data, dtype=np.uint8)
     img = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE)
