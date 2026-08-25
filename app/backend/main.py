@@ -465,6 +465,45 @@ _prediction_logger = None
 _prediction_logger_lock = threading.Lock()
 
 
+def _drift_baseline_confidence(model_name: str) -> Optional[float]:
+    """Mean confidence of a healthy model, from its evaluation report.
+
+    Returns None when no report records it — the caller then reports
+    status="no_baseline" rather than inventing a number. Deliberately does NOT
+    fall back to failure_analysis.high_confidence_errors.avg_confidence: that
+    is conditioned on the prediction being wrong, so it is a biased subset and
+    would understate drift.
+
+    XCLINVISION_DRIFT_BASELINE_CONFIDENCE overrides, for operators who have
+    calibrated one.
+    """
+    override = os.getenv("XCLINVISION_DRIFT_BASELINE_CONFIDENCE", "").strip()
+    if override:
+        try:
+            return float(override)
+        except ValueError:
+            logger.warning(
+                "Invalid XCLINVISION_DRIFT_BASELINE_CONFIDENCE=%r; ignoring.", override
+            )
+
+    eval_base = Path(__file__).parent.parent.parent / "outputs"
+    for report in sorted(eval_base.glob(f"*{model_name}*/*evaluation_report.json")):
+        try:
+            data = json.loads(report.read_text())
+        except Exception:
+            continue
+        for key in ("mean_confidence", "avg_confidence", "population_mean_confidence"):
+            value = data.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+        conf_block = data.get("confidence")
+        if isinstance(conf_block, dict):
+            value = conf_block.get("mean")
+            if isinstance(value, (int, float)):
+                return float(value)
+    return None
+
+
 def _get_prediction_logger():
     """Module-level PredictionLogger, created once.
 
@@ -1909,15 +1948,16 @@ def export_report_html(request: ExportReportRequest):
 @app.get("/api/v2/drift-metrics", dependencies=[Depends(require_auth)])
 async def get_drift_metrics(days: int = Query(default=30, ge=1, le=365)):
     """Return drift monitoring metrics from prediction logs."""
-    # Reference mean confidence for a healthy model. This is a configured
-    # value, not a measured one — the evaluation reports carry no mean-
-    # confidence field. Calibrate it per model before trusting drift_detected.
-    baseline_conf = float(os.getenv("XCLINVISION_DRIFT_BASELINE_CONFIDENCE", "0.85"))
+    baseline_conf = _drift_baseline_confidence(
+        os.getenv("XCLINVISION_ARCHITECTURE", "") or next(iter(_model_registry), "")
+    )
     status = "ok"
+    n_predictions = 0
     try:
         start_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         history = _get_prediction_logger().get_prediction_history(start_date=start_date)
 
+        n_predictions = len(history)
         if history:
             confidences = [h["confidence"] for h in history if "confidence" in h]
             uncertainties = [
@@ -1932,24 +1972,29 @@ async def get_drift_metrics(days: int = Query(default=30, ge=1, le=365)):
             avg_conf = sum(confidences) / len(confidences) if confidences else 0
             avg_unc = sum(uncertainties) / len(uncertainties) if uncertainties else 0
 
-            # Simple drift score: deviation from the configured mean confidence
-            drift_score = abs(avg_conf - baseline_conf) * 2
+            if baseline_conf is None:
+                # No calibrated reference: report the observed distribution but
+                # refuse to emit a drift number that would look measured.
+                status = "no_baseline"
+                drift_score = None
+            else:
+                drift_score = abs(avg_conf - baseline_conf) * 2
         else:
             # No logged predictions in the window. Say so — zeros here read as
             # "measured, and healthy", which is the opposite of the truth.
             status = "insufficient_data"
-            avg_conf = 0.0
-            avg_unc = 0.0
+            avg_conf = None
+            avg_unc = None
             pred_dist = {}
-            drift_score = 0.0
+            drift_score = None
 
     except Exception as e:
         logger.warning("Drift metric computation failed: %s", e)
         status = "error"
-        avg_conf = 0.0
-        avg_unc = 0.0
+        avg_conf = None
+        avg_unc = None
         pred_dist = {}
-        drift_score = 0.0
+        drift_score = None
 
     # Count feedback
     fb_counts = {}
@@ -1959,11 +2004,12 @@ async def get_drift_metrics(days: int = Query(default=30, ge=1, le=365)):
 
     return {
         "status": status,
+        "n_predictions": n_predictions,
         "baseline_confidence": baseline_conf,
-        "drift_score": round(drift_score, 4),
-        "drift_detected": status == "ok" and drift_score > 0.2,
-        "avg_confidence": round(avg_conf, 4),
-        "avg_uncertainty": round(avg_unc, 4),
+        "drift_score": round(drift_score, 4) if drift_score is not None else None,
+        "drift_detected": status == "ok" and drift_score is not None and drift_score > 0.2,
+        "avg_confidence": round(avg_conf, 4) if avg_conf is not None else None,
+        "avg_uncertainty": round(avg_unc, 4) if avg_unc is not None else None,
         "prediction_distribution": pred_dist,
         "feedback_counts": fb_counts,
         "total_predictions": len(_analysis_store),

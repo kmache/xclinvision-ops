@@ -10,6 +10,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 try:
     import mlflow
     import mlflow.pytorch
@@ -126,27 +128,65 @@ class PredictionLogger:
         with open(log_file, "a") as f:
             f.write(json.dumps(entry) + "\n")
             
+    @staticmethod
+    def _as_utc(value: Optional[str]) -> Optional[datetime]:
+        """Parse an ISO timestamp, treating a naive one as UTC.
+
+        Entries written before log_prediction became UTC-aware are naive, and
+        comparing those against an aware bound raises TypeError — while string
+        comparison silently mis-bounds the window by the local UTC offset.
+        """
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
     def get_prediction_history(
         self,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
     ) -> List[Dict]:
-        """Retrieve prediction history."""
+        """Retrieve prediction history.
+
+        Corrupt lines are skipped, not fatal: a single truncated write (a crash
+        mid-append) previously raised and — via the caller's broad except —
+        turned the whole drift endpoint into silent zeros.
+        """
         predictions = []
-        
+        start_dt = self._as_utc(start_date)
+        end_dt = self._as_utc(end_date)
+        skipped = 0
+
         for log_file in sorted(self.log_dir.glob("predictions_*.jsonl")):
             with open(log_file, "r") as f:
-                for line in f:
-                    entry = json.loads(line.strip())
-                    
-                    # Filter by date if specified
-                    if start_date and entry["timestamp"] < start_date:
+                for lineno, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
                         continue
-                    if end_date and entry["timestamp"] > end_date:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        skipped += 1
+                        logger.warning(
+                            "Skipping corrupt prediction log line %s:%d (%s)",
+                            log_file, lineno, exc,
+                        )
                         continue
-                        
+
+                    stamp = self._as_utc(entry.get("timestamp"))
+                    if stamp is not None:
+                        if start_dt and stamp < start_dt:
+                            continue
+                        if end_dt and stamp > end_dt:
+                            continue
+
                     predictions.append(entry)
-                    
+
+        if skipped:
+            logger.warning("Prediction history: skipped %d corrupt line(s)", skipped)
         return predictions
 
 

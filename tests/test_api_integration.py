@@ -500,7 +500,8 @@ class TestDriftMetricsV2:
         assert "prediction_distribution" in body
         assert "total_predictions" in body
         # Issue 3: an empty prediction log must not read as "measured, healthy".
-        assert body["status"] in ("ok", "insufficient_data", "error")
+        assert body["status"] in ("ok", "insufficient_data", "no_baseline", "error")
+        assert "n_predictions" in body
         assert "baseline_confidence" in body
         if body["status"] != "ok":
             assert body["drift_detected"] is False
@@ -956,3 +957,123 @@ class TestHistoryQueryCost:
             assert set(row) == set(main.storage._SUMMARY_KEYS)
             for value in row.values():
                 assert not (isinstance(value, str) and len(value) > 1000), row
+
+
+# ===========================================================================
+# Drift monitoring is actually fed (issue #3)
+# ===========================================================================
+
+class TestDriftPipelineWiring:
+    """PredictionLogger.log_prediction had no caller, so drift read an empty
+    directory and reported zeros — indistinguishable from a healthy model."""
+
+    @staticmethod
+    def _isolated_logger(tmp_path):
+        import main  # type: ignore[import-not-found]
+        from xclinvision.monitoring import PredictionLogger
+
+        original = main._prediction_logger
+        main._prediction_logger = PredictionLogger(log_dir=str(tmp_path / "preds"))
+        return original
+
+    def test_drift_reports_insufficient_data_on_empty_history(self, client, tmp_path):
+        import main  # type: ignore[import-not-found]
+
+        original = self._isolated_logger(tmp_path)
+        try:
+            body = client.get("/api/v2/drift-metrics").json()
+        finally:
+            main._prediction_logger = original
+
+        assert body["status"] == "insufficient_data"
+        assert body["n_predictions"] == 0
+        # Zeros here would read as "measured, and healthy".
+        assert body["drift_score"] is None
+        assert body["avg_confidence"] is None
+        assert body["drift_detected"] is False
+
+    def test_drift_counts_a_submitted_analysis(self, client, tmp_path, dummy_image_bytes):
+        import main  # type: ignore[import-not-found]
+
+        pipeline = MagicMock()
+        pipeline.predict.return_value = {
+            "prediction": 0,
+            "class_name": "Cardiomegaly",
+            "probabilities": [0.62, 0.1, 0.0, 0.0],
+            "confidence": 0.62,
+            "raw_probability": 0.62,
+            "calibrated": False,
+            "class_names": ["Cardiomegaly", "Aortic enlargement",
+                            "Pleural thickening", "Pulmonary fibrosis"],
+            "uncertainty": {"epistemic": 0.01},
+            "uncertainty_level": "low",
+            "explanation": {"key_findings": [], "visualization": {"region_scores": {}}},
+        }
+        pipeline.preprocess.return_value = (
+            np.zeros((3, 64, 64), dtype=np.float32),
+            np.zeros((64, 64, 3), dtype=np.uint8),
+        )
+
+        original = self._isolated_logger(tmp_path)
+        try:
+            with patch.object(main, "get_pipeline", return_value=pipeline), \
+                    patch.object(main, "_get_agent", side_effect=RuntimeError("no llm")):
+                r = client.post(
+                    "/api/v2/analyze",
+                    files={"file": ("a.jpg", dummy_image_bytes, "image/jpeg")},
+                )
+            assert r.status_code == 200
+            body = client.get("/api/v2/drift-metrics").json()
+        finally:
+            main._prediction_logger = original
+
+        assert body["n_predictions"] == 1
+        assert body["status"] in ("ok", "no_baseline")
+        assert body["avg_confidence"] == pytest.approx(0.62, abs=1e-3)
+
+    def test_corrupt_log_line_is_skipped_not_fatal(self, tmp_path):
+        """One truncated append must not take down the whole history read."""
+        from xclinvision.monitoring import PredictionLogger
+
+        log_dir = tmp_path / "preds"
+        logger_ = PredictionLogger(log_dir=str(log_dir))
+        logger_.log_prediction(
+            image_hash="a" * 8, prediction=0, probabilities=[0.9],
+            confidence=0.9, uncertainty={"epistemic": 0.01}, model_version="vit_base",
+        )
+        # Simulate a crash mid-append, then a clean record after it.
+        log_file = next(log_dir.glob("predictions_*.jsonl"))
+        with open(log_file, "a") as fh:
+            fh.write('{"timestamp": "2026-08-25T10:00:00+00:00", "conf\n')
+        logger_.log_prediction(
+            image_hash="b" * 8, prediction=1, probabilities=[0.7],
+            confidence=0.7, uncertainty={"epistemic": 0.02}, model_version="vit_base",
+        )
+
+        history = logger_.get_prediction_history()
+
+        assert len(history) == 2, "valid records lost to a corrupt neighbour"
+        assert {h["image_hash"] for h in history} == {"a" * 8, "b" * 8}
+
+    def test_naive_and_aware_timestamps_both_filter(self, tmp_path):
+        """Legacy naive entries must not raise against an aware bound."""
+        import json as _json
+        from datetime import datetime, timedelta, timezone
+
+        from xclinvision.monitoring import PredictionLogger
+
+        log_dir = tmp_path / "preds"
+        log_dir.mkdir(parents=True)
+        naive_recent = datetime.now().replace(microsecond=0).isoformat()
+        aware_old = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        with open(log_dir / "predictions_2026-08-25.jsonl", "w") as fh:
+            fh.write(_json.dumps({"timestamp": naive_recent, "confidence": 0.9}) + "\n")
+            fh.write(_json.dumps({"timestamp": aware_old, "confidence": 0.5}) + "\n")
+
+        start = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        history = PredictionLogger(log_dir=str(log_dir)).get_prediction_history(
+            start_date=start
+        )
+
+        assert len(history) == 1
+        assert history[0]["confidence"] == 0.9
