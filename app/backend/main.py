@@ -27,6 +27,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from xclinvision.config import get_class_names, get_num_classes
+
+# Imported at module scope on purpose. xclinvision.agent pulls chromadb and
+# sentence-transformers (~9.8s cold); importing it inside analyze_image made
+# the first clinical request pay that on the event loop. At module scope the
+# cost lands at process start, before uvicorn accepts traffic, and cannot be
+# skipped by XCLINVISION_WARM_START.
+from xclinvision.agent import ClinicalContext
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -107,11 +114,14 @@ def _warm_start() -> None:
         logger.info("Warm start disabled via XCLINVISION_WARM_START")
         return
     start = time.time()
+    # The agent module is already imported at module scope; this instantiates
+    # it (HybridRetriever + vector store + guardrails), which is the other half
+    # of the cold cost the first request used to absorb.
     try:
-        import xclinvision.agent  # noqa: F401
-        logger.info("Warm start: agent module imported (%.1fs)", time.time() - start)
+        _get_agent()
+        logger.info("Warm start: clinical agent ready (%.1fs)", time.time() - start)
     except Exception as exc:
-        logger.warning("Warm start: agent import failed (%s); reports degrade to rule-based", exc)
+        logger.warning("Warm start: agent init failed (%s); reports degrade to rule-based", exc)
     try:
         if get_pipeline() is not None:
             logger.info("Warm start: default model loaded (%.1fs total)", time.time() - start)
@@ -119,6 +129,7 @@ def _warm_start() -> None:
             logger.warning("Warm start: no model available to preload")
     except Exception as exc:
         logger.warning("Warm start: model preload failed (%s)", exc)
+    logger.info("Warm start complete in %.1fs", time.time() - start)
 
 
 @asynccontextmanager
@@ -817,8 +828,6 @@ def explain(
 @app.post("/api/v1/report", dependencies=[Depends(require_auth)])
 def generate_report(request: ReportRequest):
     """Generate clinical report using LLM agent."""
-    from xclinvision.agent import ClinicalContext
-
     # Fix #21: validate prediction index before using it as a list index.
     class_names = get_class_names()
     num_classes = len(class_names)
@@ -1227,8 +1236,6 @@ def analyze_image(
     # --- LLM Summary ---------------------------------------------------------
     llm_summary = ""
     try:
-        from xclinvision.agent import ClinicalContext
-
         context = ClinicalContext(
             prediction=result["class_name"],
             probabilities=probs,
@@ -1760,7 +1767,7 @@ def export_report_html(request: ExportReportRequest):
 
     # ── HTML / PDF: full ClinicalReporter pipeline ────────────────────
     try:
-        from xclinvision.agent import ClinicalContext, create_agent
+        from xclinvision.agent import create_agent
         from xclinvision.agent.reporter import ClinicalReporter
         from xclinvision.agent.xclinvisionagent import ClinicalReport
         import numpy as np
