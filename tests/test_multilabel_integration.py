@@ -187,20 +187,29 @@ def _dummy_image():
 
 
 def test_headline_finding_is_not_lowest_class_index():
-    """The headline label used to be active_indices[0] — i.e. YAML order.
+    """Tier order must beat class-index order when the two disagree.
 
-    With clinical tiering, Cardiomegaly (URGENT) leads Pulmonary fibrosis
-    (routine) despite the lower probability — that is the policy, not the old
-    index-order bug. What matters is that both positives are surfaced and the
-    ordering is deliberate.
+    The headline used to be active_indices[0] — the lowest class *index*, i.e.
+    configs/system.yaml ordering. Cardiomegaly is deliberately placed LAST here
+    and given the lower probability, so index order, probability order and tier
+    order all disagree:
+
+        index order       -> Pulmonary fibrosis (index 0)
+        probability order -> Pulmonary fibrosis (0.97)
+        tier order        -> Cardiomegaly (urgent beats routine)
+
+    Only the tier rule produces Cardiomegaly first, so this fails against the
+    pre-fix behaviour instead of passing either way.
     """
-    names = ["Cardiomegaly", "Aortic enlargement", "Pleural thickening", "Pulmonary fibrosis"]
-    pipe = _fixed_logit_pipeline(names, [0.55, 0.01, 0.01, 0.97])
+    names = ["Pulmonary fibrosis", "Aortic enlargement", "Pleural thickening", "Cardiomegaly"]
+    pipe = _fixed_logit_pipeline(names, [0.97, 0.01, 0.01, 0.55])
 
     result = pipe.predict(_dummy_image(), return_uncertainty=False, return_explanation=False)
 
+    # Urgent-at-0.55 leads routine-at-0.97, and both positives survive.
     assert result["class_names_predicted"] == ["Cardiomegaly", "Pulmonary fibrosis"]
-    assert set(result["class_names_predicted"]) == {"Cardiomegaly", "Pulmonary fibrosis"}
+    assert result["class_name"] == "Cardiomegaly"
+    assert result["confidence"] == pytest.approx(0.55, abs=1e-3)
 
 
 def test_headline_is_probability_ranked_within_a_tier():

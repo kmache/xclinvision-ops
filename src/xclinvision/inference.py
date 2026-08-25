@@ -31,8 +31,9 @@ def _resolve_device(device: Union[str, torch.device]) -> torch.device:
     return torch.device(device)
 
 
-#: Ordering used to pick the headline finding when several labels are positive.
-#: Lower sorts first.
+#: Tier ordering used to pick the headline finding when several labels are
+#: positive; lower sorts first, and probability breaks ties *within* a tier.
+#: See :meth:`InferencePipeline._rank_active` for the rule and its rationale.
 _PRIORITY_RANK: Dict[str, int] = {"critical": 0, "urgent": 1, "routine": 2}
 
 #: Cached tier map, resolved on first use when no priority_map was injected.
@@ -145,13 +146,61 @@ class InferencePipeline:
         )
 
     def _rank_active(self, active_indices: List[int], probs_row) -> List[int]:
-        """Order positive labels by clinical priority, then by probability.
+        """Order positive labels by clinical priority tier, then by probability.
 
-        Previously the headline finding was ``active_indices[0]`` — the lowest
-        class *index*, i.e. whatever ``configs/system.yaml`` happened to list
-        first. A pneumothorax at 0.55 was therefore reported behind a
-        cardiomegaly at 0.97, and the single reported label drives the LLM
-        summary, the exported report and the urgency gate.
+        THE RULE
+        --------
+        Sort key is ``(tier_rank, -probability)``: CRITICAL before URGENT before
+        routine, and within one tier the higher probability first. Tiers come from
+        the injected ``priority_map`` — the backend supplies one built from its
+        ``ThresholdProfile`` — or, for direct ``InferencePipeline`` users, from
+        :func:`_default_priority_map`, which reads ``CRITICAL_CONDITIONS`` and
+        ``URGENT_CONDITIONS`` in ``xclinvision.agent.guardrails``. Any label in
+        neither set is ``routine``. With no tier information at all the key
+        degrades to pure probability order.
+
+        THE CONSEQUENCE
+        ---------------
+        **A finding in a higher tier outranks a lower-tier finding that has a
+        higher probability.** The headline is therefore routinely *not* the
+        model's most confident label, and that is the policy rather than a bug.
+
+        Worked example — all three above their thresholds::
+
+            Pulmonary fibrosis  p=0.95  routine
+            Cardiomegaly        p=0.88  urgent
+            Pneumothorax        p=0.62  critical
+
+            ranked -> ["Pneumothorax", "Cardiomegaly", "Pulmonary fibrosis"]
+            headline = Pneumothorax at 0.62, the *lowest*-probability positive.
+
+        Within a single tier probability decides, unchanged::
+
+            two routine findings at p=0.70 and p=0.95 -> the 0.95 one leads.
+
+        WHY THE BIAS IS DELIBERATE
+        --------------------------
+        Exactly one label becomes ``class_name``, and that single label drives the
+        LLM summary, the exported report and the urgency gate. Ranking by
+        confidence buries a moderate-probability emergency behind a confident
+        chronic finding; under-triaging a pneumothorax costs more clinically than
+        over-triaging a fibrosis. Every positive is still returned in
+        ``class_names_predicted``, so nothing is hidden — only the ordering is
+        opinionated.
+
+        This replaced ``active_indices[0]`` — the lowest class *index*, i.e.
+        whatever ``configs/system.yaml`` happened to list first — under which a
+        pneumothorax at 0.55 was reported behind a cardiomegaly at 0.97 purely
+        because of YAML ordering.
+
+        NOTE — depends on the configured class list, not on this function.
+        With ``configs/system.yaml`` as shipped, only Cardiomegaly is tiered
+        (urgent); Aortic enlargement, Pleural thickening and Pulmonary fibrosis
+        are all routine, and the critical tier is unreachable because neither
+        Pneumothorax nor Consolidation is a served class. The rule therefore
+        currently reduces to "Cardiomegaly first when positive, otherwise
+        probability order". Adding a critical class to ``model.class_names``
+        changes that without any change here.
         """
         priority = self._priority_map or _default_priority_map()
         return sorted(
@@ -307,6 +356,13 @@ class InferencePipeline:
                 class_names (list[str]),
                 and optionally: uncertainty (dict), uncertainty_level (str),
                 explanation (dict).
+
+            In multilabel mode ``class_name`` is the *ranked* headline, not the
+            highest-probability label: positives are ordered by clinical tier
+            first and probability only within a tier, so a lower-probability
+            urgent finding leads a higher-probability routine one. Every
+            positive is listed in ``class_names_predicted``. See
+            :meth:`_rank_active` for the rule and why it is biased that way.
         """
         x, vis_image = self.preprocess(image)
 
