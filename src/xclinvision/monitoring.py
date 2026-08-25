@@ -1,19 +1,29 @@
 """MLOps monitoring and experiment tracking."""
 
+import logging
+
 import numpy as np
 from scipy import stats
 from collections import Counter, deque
 from typing import Any, Deque, Dict, List, Optional
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
     import mlflow
     import mlflow.pytorch
     MLFLOW_AVAILABLE = True
-except ImportError:
+except Exception as _mlflow_exc:  # noqa: BLE001
+    # Not just ImportError: mlflow.pytorch pulls torchvision, which raises
+    # RuntimeError when torch and torchvision were built against different
+    # CUDA majors. That escaped the ImportError guard and made this whole
+    # module unimportable, taking PredictionLogger down with it.
     MLFLOW_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "MLflow unavailable (%s: %s); experiment tracking disabled.",
+        type(_mlflow_exc).__name__, _mlflow_exc,
+    )
 
 
 class ModelRegistry:
@@ -92,7 +102,10 @@ class PredictionLogger:
         timestamp: Optional[str] = None,
     ):
         """Log a single prediction."""
-        now = datetime.now()
+        # UTC-aware: get_prediction_history() filters by string comparison
+        # against datetime.now(timezone.utc).isoformat(), so a naive local
+        # timestamp would mis-bound the window by the local UTC offset.
+        now = datetime.now(timezone.utc)
         if timestamp is None:
             timestamp = now.isoformat()
 

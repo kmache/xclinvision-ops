@@ -497,6 +497,11 @@ class TestDriftMetricsV2:
         assert "avg_confidence" in body
         assert "prediction_distribution" in body
         assert "total_predictions" in body
+        # Issue 3: an empty prediction log must not read as "measured, healthy".
+        assert body["status"] in ("ok", "insufficient_data", "error")
+        assert "baseline_confidence" in body
+        if body["status"] != "ok":
+            assert body["drift_detected"] is False
 
 
 # ===========================================================================

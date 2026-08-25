@@ -362,6 +362,23 @@ _agent_lock = threading.Lock()
 _reasoning_agent_instance = None
 _reasoning_agent_lock = threading.Lock()
 
+_prediction_logger = None
+_prediction_logger_lock = threading.Lock()
+
+
+def _get_prediction_logger():
+    """Module-level PredictionLogger, created once.
+
+    Nothing wrote prediction logs before, so /api/v2/drift-metrics read an
+    empty directory and reported zeros regardless of what the model was doing.
+    """
+    global _prediction_logger
+    with _prediction_logger_lock:
+        if _prediction_logger is None:
+            from xclinvision.monitoring import PredictionLogger
+            _prediction_logger = PredictionLogger()
+    return _prediction_logger
+
 
 
 
@@ -1132,6 +1149,20 @@ def analyze_image(
         },
     }
 
+    # Feed the drift monitor. Best-effort: a logging failure must not fail
+    # an analysis the clinician is waiting on.
+    try:
+        _get_prediction_logger().log_prediction(
+            image_hash=image_hash,
+            prediction=result["prediction"],
+            probabilities=result.get("probabilities", []),
+            confidence=result["confidence"],
+            uncertainty=result.get("uncertainty"),
+            model_version=model_name,
+        )
+    except Exception as exc:
+        logger.warning("Prediction logging failed for %s: %s", analysis_id, exc)
+
     # Store for later retrieval (compress stored image to save memory)
     _analysis_store_put(analysis_id, analysis_data)
     try:
@@ -1396,14 +1427,10 @@ async def submit_dashboard_feedback(feedback: DashboardFeedbackRequest):
     entry["feedback_id"] = f"fb-{uuid.uuid4().hex[:8]}"
     _feedback_store_append(entry)
 
-    # Also log via PredictionLogger
-    try:
-        from xclinvision.monitoring import PredictionLogger
-        pred_logger = PredictionLogger()
-        # Log that feedback was received (lightweight)
-        logger.info("Feedback received: %s for analysis %s", feedback.feedback_type, feedback.analysis_id)
-    except Exception:
-        pass
+    logger.info(
+        "Feedback received: %s for analysis %s",
+        feedback.feedback_type, feedback.analysis_id,
+    )
 
     return {"status": "recorded", "feedback_id": entry["feedback_id"]}
 
@@ -1719,12 +1746,14 @@ def export_report_html(request: ExportReportRequest):
 @app.get("/api/v2/drift-metrics", dependencies=[Depends(require_auth)])
 async def get_drift_metrics(days: int = Query(default=30, ge=1, le=365)):
     """Return drift monitoring metrics from prediction logs."""
+    # Reference mean confidence for a healthy model. This is a configured
+    # value, not a measured one — the evaluation reports carry no mean-
+    # confidence field. Calibrate it per model before trusting drift_detected.
+    baseline_conf = float(os.getenv("XCLINVISION_DRIFT_BASELINE_CONFIDENCE", "0.85"))
+    status = "ok"
     try:
-        from xclinvision.monitoring import PredictionLogger
-
-        pred_logger = PredictionLogger()
         start_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        history = pred_logger.get_prediction_history(start_date=start_date)
+        history = _get_prediction_logger().get_prediction_history(start_date=start_date)
 
         if history:
             confidences = [h["confidence"] for h in history if "confidence" in h]
@@ -1740,9 +1769,12 @@ async def get_drift_metrics(days: int = Query(default=30, ge=1, le=365)):
             avg_conf = sum(confidences) / len(confidences) if confidences else 0
             avg_unc = sum(uncertainties) / len(uncertainties) if uncertainties else 0
 
-            # Simple drift score: deviation from expected mean confidence
-            drift_score = abs(avg_conf - 0.85) * 2  # baseline ~0.85
+            # Simple drift score: deviation from the configured mean confidence
+            drift_score = abs(avg_conf - baseline_conf) * 2
         else:
+            # No logged predictions in the window. Say so — zeros here read as
+            # "measured, and healthy", which is the opposite of the truth.
+            status = "insufficient_data"
             avg_conf = 0.0
             avg_unc = 0.0
             pred_dist = {}
@@ -1750,6 +1782,7 @@ async def get_drift_metrics(days: int = Query(default=30, ge=1, le=365)):
 
     except Exception as e:
         logger.warning("Drift metric computation failed: %s", e)
+        status = "error"
         avg_conf = 0.0
         avg_unc = 0.0
         pred_dist = {}
@@ -1762,8 +1795,10 @@ async def get_drift_metrics(days: int = Query(default=30, ge=1, le=365)):
         fb_counts[ft] = fb_counts.get(ft, 0) + 1
 
     return {
+        "status": status,
+        "baseline_confidence": baseline_conf,
         "drift_score": round(drift_score, 4),
-        "drift_detected": drift_score > 0.2,
+        "drift_detected": status == "ok" and drift_score > 0.2,
         "avg_confidence": round(avg_conf, 4),
         "avg_uncertainty": round(avg_unc, 4),
         "prediction_distribution": pred_dist,
