@@ -104,7 +104,14 @@ def test_report_language_honours_pipeline_thresholds():
     with_profile = [
         r["clinical_term"] for r in calibrate_predictions(class_names, probabilities, profile)
     ]
-    assert all(t.startswith("Equivocal") for t in with_profile), with_profile
+    # Neither may read as present. Cardiomegaly (0.60 vs 0.7235) is far enough
+    # below to be called absent; Aortic enlargement (0.60 vs 0.6595) sits
+    # inside the equivocal margin.
+    assert with_profile == [
+        "No significant evidence",
+        "Equivocal; consider clinical correlation",
+    ], with_profile
+    assert not any(t in ("Consistent with", "Highly suggestive") for t in with_profile)
 
 
 def test_critical_findings_are_floored_to_the_sensitivity_cap():
@@ -125,3 +132,55 @@ def test_critical_findings_are_floored_to_the_sensitivity_cap():
     # Non-critical classes keep the checkpoint's calibrated value.
     assert profile.thresholds["Cardiomegaly"] == 0.7235
     assert profile.get_priority("Pneumothorax") == "critical"
+
+
+def test_subthreshold_finding_is_reported_absent_not_consistent_with():
+    """Issue 4: p=0.60 against the pipeline's 0.7235 must not read as present.
+
+    The pipeline classifies this NEGATIVE. With the reporter defaulting to
+    0.50 it was rendered "Consistent with <finding>" — the exported PDF
+    contradicting the classification.
+    """
+    from xclinvision.agent.guardrails import build_clinical_threshold_profile
+    from xclinvision.agent.reporter import calibrate_predictions, calibrate_probability
+
+    profile = build_clinical_threshold_profile(
+        ["Cardiomegaly"], custom_thresholds={"Cardiomegaly": 0.7235}
+    )
+
+    term = calibrate_predictions(["Cardiomegaly"], [0.60], profile)[0]["clinical_term"]
+
+    assert term == "No significant evidence"
+    assert term != "Consistent with"
+    # The bug in one line: the old default threshold called it present.
+    assert calibrate_probability(0.60, 0.50) == "Consistent with"
+    assert calibrate_probability(0.60, 0.7235) == "No significant evidence"
+
+
+def test_at_and_above_threshold_still_reads_as_present():
+    """The fix must not make every finding disappear."""
+    from xclinvision.agent.reporter import calibrate_probability
+
+    assert calibrate_probability(0.7235, 0.7235) == "Consistent with"
+    assert calibrate_probability(0.99, 0.7235) == "Consistent with"
+    # With the old 0.50 default the top band was reachable:
+    assert calibrate_probability(0.90, 0.50) == "Highly suggestive"
+
+
+def test_highly_suggestive_band_is_unreachable_above_a_0_65_threshold():
+    """Documents a consequence of threading real thresholds through.
+
+    calibrate_probability's top band is `threshold + 0.35`, tuned for the old
+    0.50 default. The shipped checkpoints threshold at 0.66-0.78, so the band
+    starts above 1.0 and no probability can reach it — every positive finding
+    reads "Consistent with", never "Highly suggestive".
+
+    This under-states rather than over-states, so it is safe, but the +0.35
+    offset needs re-deriving against real thresholds. Asserted here so the
+    behaviour is recorded rather than discovered in a report.
+    """
+    from xclinvision.agent.reporter import calibrate_probability
+
+    for threshold in (0.6595, 0.7119, 0.7235, 0.7796):
+        assert threshold + 0.35 > 1.0
+        assert calibrate_probability(1.0, threshold) == "Consistent with"

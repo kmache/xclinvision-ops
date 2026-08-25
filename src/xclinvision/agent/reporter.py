@@ -44,20 +44,33 @@ logger = logging.getLogger(__name__)
 # ════════════════════════════════════════════════════════════════════════════════
 
 
+#: Width of the band just below threshold where a finding is worth a second
+#: look rather than being called absent. Outside it, a sub-threshold score is
+#: reported as negative — the pipeline classified it that way.
+EQUIVOCAL_MARGIN = 0.10
+
+
 def calibrate_probability(prob: float, threshold: float = 0.50) -> str:
     """Map a raw probability to clinical language.
 
-    Thresholds
-    ----------
-    >= threshold + 0.35  → "Highly suggestive of …"
-    >= threshold         → "Consistent with …"
-    < threshold          → "Equivocal; consider clinical correlation."
+    ``threshold`` must be the same per-class threshold the pipeline used to
+    decide positive/negative, otherwise the report contradicts the
+    classification. A score below it is NEVER rendered in positive language.
+
+    Bands
+    -----
+    >= threshold + 0.35                  → "Highly suggestive"
+    >= threshold                         → "Consistent with"
+    >= threshold - EQUIVOCAL_MARGIN      → "Equivocal; consider clinical correlation"
+    otherwise                            → "No significant evidence"
     """
     if prob >= threshold + 0.35:
         return "Highly suggestive"
     if prob >= threshold:
         return "Consistent with"
-    return "Equivocal; consider clinical correlation"
+    if prob >= threshold - EQUIVOCAL_MARGIN:
+        return "Equivocal; consider clinical correlation"
+    return "No significant evidence"
 
 
 def calibrate_predictions(

@@ -64,3 +64,48 @@ def test_non_critical_high_confidence_returns_medium():
 def test_missing_prediction_returns_unable_message():
     out = ReasoningAgent._format_urgency_assessment({})
     assert "Unable to assess urgency" in out
+
+
+# ---------------------------------------------------------------------------
+# Clinical sensitivity floor (issue #4)
+# ---------------------------------------------------------------------------
+
+def test_critical_checkpoint_threshold_is_capped_at_the_clinical_floor():
+    """A checkpoint may not raise a critical class above its sensitivity cap.
+
+    DEFAULT_CLINICAL_THRESHOLDS had no caller at all before this; F1-optimised
+    checkpoint thresholds (0.66-0.78 on the shipped models) were served
+    verbatim, trading away sensitivity on exactly the findings where a false
+    negative is most costly.
+    """
+    from xclinvision.agent.guardrails import (
+        DEFAULT_CLINICAL_THRESHOLDS,
+        build_clinical_threshold_profile,
+    )
+
+    profile = build_clinical_threshold_profile(
+        ["Pneumothorax", "Consolidation", "Cardiomegaly"],
+        custom_thresholds={
+            "Pneumothorax": 0.90,
+            "Consolidation": 0.77,
+            "Cardiomegaly": 0.7235,
+        },
+    )
+
+    assert profile.thresholds["Pneumothorax"] == DEFAULT_CLINICAL_THRESHOLDS["Pneumothorax"]
+    assert profile.thresholds["Pneumothorax"] == 0.25
+    assert profile.thresholds["Consolidation"] == 0.30
+    # Non-critical classes keep the calibrated value.
+    assert profile.thresholds["Cardiomegaly"] == 0.7235
+    assert profile.get_priority("Pneumothorax") == "critical"
+
+
+def test_floor_never_raises_an_already_sensitive_threshold():
+    """The cap is an upper bound, not an assignment."""
+    from xclinvision.agent.guardrails import build_clinical_threshold_profile
+
+    profile = build_clinical_threshold_profile(
+        ["Pneumothorax"], custom_thresholds={"Pneumothorax": 0.10}
+    )
+
+    assert profile.thresholds["Pneumothorax"] == 0.10

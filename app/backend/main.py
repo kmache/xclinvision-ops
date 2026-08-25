@@ -243,25 +243,12 @@ def _clinical_threshold_profile(checkpoint_thresholds: Optional[Dict[str, float]
     sensitivity for precision in the wrong direction, so a class in
     CRITICAL_CONDITIONS is capped at its DEFAULT_CLINICAL_THRESHOLDS value.
     """
-    from xclinvision.agent.guardrails import (
-        CRITICAL_CONDITIONS,
-        DEFAULT_CLINICAL_THRESHOLDS,
-        build_clinical_threshold_profile,
-    )
+    from xclinvision.agent.guardrails import build_clinical_threshold_profile
 
-    class_names = get_class_names()
     merged = {k: float(v) for k, v in (checkpoint_thresholds or {}).items()}
-    for name in class_names:
-        if name not in CRITICAL_CONDITIONS:
-            continue
-        cap = DEFAULT_CLINICAL_THRESHOLDS.get(name)
-        if cap is not None and merged.get(name, 0.5) > cap:
-            logger.warning(
-                "Critical finding '%s': capping threshold %.4f -> %.2f to preserve sensitivity",
-                name, merged.get(name, 0.5), cap,
-            )
-            merged[name] = cap
-    return build_clinical_threshold_profile(class_names, custom_thresholds=merged)
+    # The sensitivity floor for CRITICAL_CONDITIONS is applied inside
+    # build_clinical_threshold_profile, so every caller gets it.
+    return build_clinical_threshold_profile(get_class_names(), custom_thresholds=merged)
 
 
 def _build_pipeline(

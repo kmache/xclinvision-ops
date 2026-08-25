@@ -319,6 +319,23 @@ def build_clinical_threshold_profile(
     # Only keep thresholds for classes the model actually uses
     thresholds = {name: merged.get(name, 0.50) for name in class_names}
 
+    # Sensitivity floor. custom_thresholds are the checkpoint's F1-optimised
+    # values and can sit high (0.66-0.78 for the shipped models). For a
+    # life-threatening finding a high threshold trades sensitivity away in
+    # exactly the wrong direction, so cap a critical class at its
+    # DEFAULT_CLINICAL_THRESHOLDS value. Non-critical classes keep the
+    # calibrated threshold untouched.
+    for name in class_names:
+        if name not in CRITICAL_CONDITIONS:
+            continue
+        cap = DEFAULT_CLINICAL_THRESHOLDS.get(name)
+        if cap is not None and thresholds[name] > cap:
+            logger.warning(
+                "Critical finding '%s': capping threshold %.4f -> %.2f to preserve sensitivity",
+                name, thresholds[name], cap,
+            )
+            thresholds[name] = cap
+
     # Build priority map
     priority_map: Dict[str, str] = {}
     for name in class_names:
