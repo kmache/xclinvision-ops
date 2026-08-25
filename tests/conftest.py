@@ -36,6 +36,10 @@ os.environ.setdefault("XCLINVISION_IMAGE_DIR", str(_TMP_STORAGE_DIR / "images"))
 _TEST_TOKEN = "test-token-please-change"
 os.environ.setdefault("XCLINVISION_API_TOKEN", _TEST_TOKEN)
 
+# Skip the boot-time agent import / model preload: it costs ~9 s and every test
+# mocks get_pipeline anyway. Production defaults to warm start enabled.
+os.environ.setdefault("XCLINVISION_WARM_START", "0")
+
 
 # ---------------------------------------------------------------------------
 # Shared fixtures

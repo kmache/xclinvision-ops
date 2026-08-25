@@ -95,15 +95,42 @@ _IMAGE_STORE_MAX = int(os.environ.get("IMAGE_STORE_MAX", 200))
 _IMAGE_STORE_MAX_BYTES = int(os.environ.get("IMAGE_STORE_MAX_BYTES", 256 * 1024 * 1024))
 
 
+def _warm_start() -> None:
+    """Pay the agent import and first model load at boot, not in request #1.
+
+    ``import xclinvision.agent`` pulls chromadb + sentence-transformers and
+    costs ~9 s cold; it used to run inside the first /api/v2/analyze call, on
+    the event loop, stalling every concurrent request. Set
+    ``XCLINVISION_WARM_START=0`` to skip (the test suite does).
+    """
+    if os.getenv("XCLINVISION_WARM_START", "1").strip().lower() in ("0", "false", "no"):
+        logger.info("Warm start disabled via XCLINVISION_WARM_START")
+        return
+    start = time.time()
+    try:
+        import xclinvision.agent  # noqa: F401
+        logger.info("Warm start: agent module imported (%.1fs)", time.time() - start)
+    except Exception as exc:
+        logger.warning("Warm start: agent import failed (%s); reports degrade to rule-based", exc)
+    try:
+        if get_pipeline() is not None:
+            logger.info("Warm start: default model loaded (%.1fs total)", time.time() - start)
+        else:
+            logger.warning("Warm start: no model available to preload")
+    except Exception as exc:
+        logger.warning("Warm start: model preload failed (%s)", exc)
+
+
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
     """Application lifespan — replaces the deprecated @app.on_event('startup').
 
-    ``log_dataset_info`` is defined later in the module; Python resolves the
-    name at call time (server start-up), not at definition time, so the
-    forward reference is safe.
+    ``log_dataset_info`` and ``_warm_start`` are defined later in the module;
+    Python resolves the names at call time (server start-up), not at
+    definition time, so the forward references are safe.
     """
     await log_dataset_info()
+    _warm_start()
     yield
 
 
@@ -537,7 +564,7 @@ async def list_models():
 
 
 @app.post("/api/v1/predict", response_model=PredictionResponse, dependencies=[Depends(require_auth)])
-async def predict(
+def predict(
     file: UploadFile = File(...),
     model_name: str = "convnext_small",
     return_explanation: bool = True,
@@ -551,7 +578,7 @@ async def predict(
         raise HTTPException(400, "Invalid file type. Please upload an image.")
 
     # Fix #4: enforce upload size limit before reading into memory.
-    contents = await file.read(MAX_UPLOAD_BYTES + 1)
+    contents = file.file.read(MAX_UPLOAD_BYTES + 1)
     if len(contents) > MAX_UPLOAD_BYTES:
         raise HTTPException(
             413,
@@ -632,7 +659,7 @@ async def predict(
 
 
 @app.post("/api/v1/explain", dependencies=[Depends(require_auth)])
-async def explain(
+def explain(
     file: UploadFile = File(...),
     model_name: str = "convnext_small",
     target_class: Optional[int] = None,
@@ -643,7 +670,7 @@ async def explain(
         raise HTTPException(400, "Invalid file type")
 
     # Fix #2: enforce the same upload size limit as /predict.
-    contents = await file.read(MAX_UPLOAD_BYTES + 1)
+    contents = file.file.read(MAX_UPLOAD_BYTES + 1)
     if len(contents) > MAX_UPLOAD_BYTES:
         raise HTTPException(
             413,
@@ -683,7 +710,7 @@ async def explain(
 
 
 @app.post("/api/v1/report", dependencies=[Depends(require_auth)])
-async def generate_report(request: ReportRequest):
+def generate_report(request: ReportRequest):
     """Generate clinical report using LLM agent."""
     from xclinvision.agent import ClinicalContext
 
@@ -934,7 +961,7 @@ def _generate_heatmap_overlay(
 # ---------------------------------------------------------------------------
 
 @app.post("/api/v2/analyze", dependencies=[Depends(require_auth)])
-async def analyze_image(
+def analyze_image(
     file: UploadFile = File(...),
     patient_id: str = Form(default="UNKNOWN"),
     study_date: str = Form(default=""),
@@ -956,7 +983,7 @@ async def analyze_image(
         raise HTTPException(400, f"Invalid file type '{file.content_type}'. Please upload an image.")
 
     # Fix #4: enforce upload size limit on /api/v2/analyze as well.
-    contents = await file.read(MAX_UPLOAD_BYTES + 1)
+    contents = file.file.read(MAX_UPLOAD_BYTES + 1)
     if len(contents) > MAX_UPLOAD_BYTES:
         raise HTTPException(
             413,
@@ -1125,7 +1152,7 @@ async def analyze_image(
 # Dashboard v2: Compare two uploaded images
 # ---------------------------------------------------------------------------
 
-async def _run_single_analysis(
+def _run_single_analysis(
     contents: bytes, model_name: str, xai_method: str,
 ) -> dict:
     """Run inference + XAI on raw image bytes and return an analysis dict.
@@ -1214,7 +1241,7 @@ async def _run_single_analysis(
 
 
 @app.post("/api/v2/compare", dependencies=[Depends(require_auth)])
-async def compare_images(
+def compare_images(
     file_a: UploadFile = File(...),
     file_b: UploadFile = File(...),
     model_name: str = Form(default="convnext_small"),
@@ -1229,15 +1256,15 @@ async def compare_images(
         if f.content_type and f.content_type not in allowed_types:
             raise HTTPException(400, f"{label}: invalid file type '{f.content_type}'.")
 
-    contents_a = await file_a.read(MAX_UPLOAD_BYTES + 1)
+    contents_a = file_a.file.read(MAX_UPLOAD_BYTES + 1)
     if len(contents_a) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, f"Image A too large. Max {MAX_UPLOAD_MB} MB.")
-    contents_b = await file_b.read(MAX_UPLOAD_BYTES + 1)
+    contents_b = file_b.file.read(MAX_UPLOAD_BYTES + 1)
     if len(contents_b) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, f"Image B too large. Max {MAX_UPLOAD_MB} MB.")
 
-    analysis_a = await _run_single_analysis(contents_a, model_name, xai_method)
-    analysis_b = await _run_single_analysis(contents_b, model_name, xai_method)
+    analysis_a = _run_single_analysis(contents_a, model_name, xai_method)
+    analysis_b = _run_single_analysis(contents_b, model_name, xai_method)
 
     return {"image_a": analysis_a, "image_b": analysis_b}
 
@@ -1247,7 +1274,7 @@ async def compare_images(
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v2/explain/{analysis_id}", dependencies=[Depends(require_auth)])
-async def get_dashboard_explanation(
+def get_dashboard_explanation(
     analysis_id: str,
     method: str = Query(default="gradcam++"),
     threshold: float = Query(default=0.5, ge=0.0, le=1.0),
@@ -1386,7 +1413,7 @@ async def submit_dashboard_feedback(feedback: DashboardFeedbackRequest):
 # ---------------------------------------------------------------------------
 
 @app.post("/api/v2/chat", dependencies=[Depends(require_auth)])
-async def llm_chat(request: ChatRequest):
+def llm_chat(request: ChatRequest):
     """Context-aware LLM chat powered by the reasoning agent.
 
     The reasoning agent classifies user intent, selects & executes tools,
@@ -1519,7 +1546,7 @@ async def generate_dashboard_report(request: DashboardReportRequest):
 
 
 @app.post("/api/v2/export-report", dependencies=[Depends(require_auth)])
-async def export_report_html(request: ExportReportRequest):
+def export_report_html(request: ExportReportRequest):
     """Generate a clinical report in HTML, PDF, or JSON format."""
     stored = _analysis_store.get(request.analysis_id)
     if not stored:
