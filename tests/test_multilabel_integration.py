@@ -161,3 +161,114 @@ def test_inference_predict_multilabel_keys():
     result = mock_pipeline.predict(np.zeros((384, 384, 3), dtype=np.uint8))
     assert "predictions_multilabel" in result
     assert "class_names_predicted" in result
+
+# ---- Issue 1: headline finding selection ----------------------------------
+
+def _fixed_logit_pipeline(class_names, probabilities, priority_map=None):
+    """InferencePipeline over a model that always emits the given probabilities."""
+    import math
+    import torch
+    import torch.nn as nn
+    from xclinvision.inference import InferencePipeline
+
+    logits = torch.tensor(
+        [[math.log(p / (1 - p)) for p in probabilities]], dtype=torch.float32
+    )
+
+    class _Fixed(nn.Module):
+        def forward(self, x):
+            return logits
+
+    return InferencePipeline(
+        model=_Fixed(),
+        architecture="test",
+        device="cpu",
+        image_size=64,
+        class_names=class_names,
+        thresholds={n: 0.5 for n in class_names},
+        priority_map=priority_map,
+    )
+
+
+def _dummy_image():
+    return (np.random.rand(64, 64, 3) * 255).astype(np.uint8)
+
+
+def test_headline_finding_is_not_lowest_class_index():
+    """The headline label used to be active_indices[0] — i.e. YAML order."""
+    names = ["Cardiomegaly", "Aortic enlargement", "Pleural thickening", "Pulmonary fibrosis"]
+    pipe = _fixed_logit_pipeline(names, [0.55, 0.01, 0.01, 0.97])
+
+    result = pipe.predict(_dummy_image(), return_uncertainty=False, return_explanation=False)
+
+    assert result["class_name"] == "Pulmonary fibrosis"
+    assert result["confidence"] == pytest.approx(0.97, abs=1e-3)
+    assert set(result["class_names_predicted"]) == {"Cardiomegaly", "Pulmonary fibrosis"}
+
+
+def test_critical_finding_outranks_a_higher_probability_routine_one():
+    """Clinical priority beats probability: a pneumothorax must not be buried."""
+    names = ["Cardiomegaly", "Aortic enlargement", "Pneumothorax", "Pulmonary fibrosis"]
+    priority = {
+        "Cardiomegaly": "urgent",
+        "Aortic enlargement": "routine",
+        "Pneumothorax": "critical",
+        "Pulmonary fibrosis": "routine",
+    }
+    pipe = _fixed_logit_pipeline(names, [0.97, 0.01, 0.55, 0.60], priority_map=priority)
+
+    result = pipe.predict(_dummy_image(), return_uncertainty=False, return_explanation=False)
+
+    assert result["class_name"] == "Pneumothorax"
+    assert result["class_names_predicted"][0] == "Pneumothorax"
+
+
+def test_no_priority_map_degrades_to_probability_order():
+    names = ["A", "B", "C"]
+    pipe = _fixed_logit_pipeline(names, [0.55, 0.60, 0.99], priority_map=None)
+
+    result = pipe.predict(_dummy_image(), return_uncertainty=False, return_explanation=False)
+
+    assert result["class_names_predicted"] == ["C", "B", "A"]
+
+
+def test_analyze_response_carries_every_positive_label(client):
+    """Issue 1: /api/v2/analyze dropped predictions_multilabel entirely."""
+    import io
+    from unittest.mock import MagicMock, patch
+
+    from PIL import Image
+
+    pipeline = MagicMock()
+    pipeline.predict.return_value = {
+        "prediction": 3,
+        "class_name": "Pulmonary fibrosis",
+        "probabilities": [0.55, 0.01, 0.01, 0.97],
+        "confidence": 0.97,
+        "class_names": ["Cardiomegaly", "Aortic enlargement", "Pleural thickening", "Pulmonary fibrosis"],
+        "uncertainty": {"epistemic": 0.01},
+        "uncertainty_level": "low",
+        "predictions_multilabel": [1, 0, 0, 1],
+        "class_names_predicted": ["Pulmonary fibrosis", "Cardiomegaly"],
+        "explanation": {"key_findings": [], "visualization": {"region_scores": {}}},
+    }
+    pipeline.preprocess.return_value = (
+        np.zeros((3, 64, 64), dtype=np.float32),
+        np.zeros((64, 64, 3), dtype=np.uint8),
+    )
+
+    buf = io.BytesIO()
+    Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8)).save(buf, format="JPEG")
+
+    import main  # noqa: PLC0415
+
+    with patch.object(main, "get_pipeline", return_value=pipeline), \
+            patch.object(main, "_get_agent", side_effect=RuntimeError("no llm")):
+        response = client.post(
+            "/api/v2/analyze", files={"file": ("a.jpg", buf.getvalue(), "image/jpeg")}
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["class_names_predicted"] == ["Pulmonary fibrosis", "Cardiomegaly"]
+    assert body["predictions_multilabel"] == [1, 0, 0, 1]

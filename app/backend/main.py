@@ -333,6 +333,7 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
         dataset_std=list(norm_stats["std"]),
         temperature_scaler=temperature_value,
         thresholds=thresholds_dict,
+        priority_map=profile.priority_map,
     )
 
 
@@ -1169,6 +1170,11 @@ def analyze_image(
         "uncertainty": result.get("uncertainty", {}),
         "uncertainty_level": result.get("uncertainty_level", "unknown"),
         "top_k_predictions": top_k,
+        # Every label that crossed its threshold, not just the headline one.
+        # These were computed by the pipeline and then dropped here, so a
+        # co-occurring finding never reached the dashboard or the report.
+        "predictions_multilabel": result.get("predictions_multilabel"),
+        "class_names_predicted": result.get("class_names_predicted"),
         "heatmap_gradcam": heatmap_b64,
         "heatmap_overlay": overlay_b64,
         "scorecam_heatmap": scorecam_heatmap_b64,

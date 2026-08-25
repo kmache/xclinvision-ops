@@ -31,6 +31,13 @@ def _resolve_device(device: Union[str, torch.device]) -> torch.device:
     return torch.device(device)
 
 
+#: Ordering used to pick the headline finding when several labels are positive.
+#: Lower sorts first. Mirrors guardrails.ThresholdProfile.get_priority(), which
+#: is not imported here: pulling xclinvision.agent would drag the chromadb
+#: import chain into the inference path.
+_PRIORITY_RANK: Dict[str, int] = {"critical": 0, "urgent": 1, "routine": 2}
+
+
 def _enable_mc_dropout(model: nn.Module) -> None:
     """Set Dropout layers to train mode to enable MC-Dropout inference."""
     model.eval()
@@ -65,6 +72,7 @@ class InferencePipeline:
         dataset_mean: Optional[List[float]] = None,
         dataset_std: Optional[List[float]] = None,
         thresholds: Optional[Dict[str, float]] = None,
+        priority_map: Optional[Dict[str, str]] = None,
     ):
         """
         Args:
@@ -96,9 +104,29 @@ class InferencePipeline:
         else:
             self._thresholds = {n: 0.5 for n in self.class_names}
         self._threshold_array = np.array([self._thresholds.get(n, 0.5) for n in self.class_names])
+        # class_name -> "critical" | "urgent" | "routine". Absent entries sort
+        # as "routine", so an unsupplied map degrades to probability ranking.
+        self._priority_map = priority_map or {}
         # Cache a torch tensor version on the correct device for GPU-side comparison
         self._threshold_tensor = torch.tensor(
             self._threshold_array, device=self.device, dtype=torch.float32
+        )
+
+    def _rank_active(self, active_indices: List[int], probs_row) -> List[int]:
+        """Order positive labels by clinical priority, then by probability.
+
+        Previously the headline finding was ``active_indices[0]`` — the lowest
+        class *index*, i.e. whatever ``configs/system.yaml`` happened to list
+        first. A pneumothorax at 0.55 was therefore reported behind a
+        cardiomegaly at 0.97, and the single reported label drives the LLM
+        summary, the exported report and the urgency gate.
+        """
+        return sorted(
+            active_indices,
+            key=lambda i: (
+                _PRIORITY_RANK.get(self._priority_map.get(self.class_names[i], "routine"), 2),
+                -float(probs_row[i]),
+            ),
         )
 
     # -----------------------------------------------------------------------
@@ -250,6 +278,7 @@ class InferencePipeline:
                 probs = torch.sigmoid(logits)
                 preds_binary = (probs >= self._threshold_tensor).int()[0]  # (num_classes,)
                 active_indices = preds_binary.nonzero(as_tuple=True)[0].tolist()
+                active_indices = self._rank_active(active_indices, probs[0])
                 pred_class = active_indices[0] if active_indices else int(torch.argmax(probs, dim=1).item())
                 confidence = float(probs[0, pred_class].item())
                 predicted_names = [
@@ -351,7 +380,7 @@ class InferencePipeline:
             for i, (vis_image, prob) in enumerate(zip(vis_images, probs_batch)):
                 if self.multilabel:
                     preds_binary = (prob >= self._threshold_array).astype(int)
-                    active_indices = np.where(preds_binary)[0].tolist()
+                    active_indices = self._rank_active(np.where(preds_binary)[0].tolist(), prob)
                     pred_class = active_indices[0] if active_indices else int(np.argmax(prob))
                     predicted_names = [
                         self.class_names[j] for j in active_indices
