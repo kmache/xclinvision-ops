@@ -221,9 +221,32 @@ pip install -e ".[dev]"   # with linting & test tools
 ```
 
 > **Note:** PyTorch is not included automatically due to CUDA variant selection.
-> Install separately before the above:
+> Install the resolved pair separately, **before** the above:
 > ```bash
-> pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+> pip install torch==2.11.0+cu130 torchvision==0.26.0+cu130 \
+>     --index-url https://download.pytorch.org/whl/cu130
+> ```
+>
+> **The pair is not interchangeable.** `torchvision 0.26.0` pins `torch==2.11.0`, and
+> both wheels must carry the **same CUDA build (`cu130`)**. torchvision checks this at
+> *import* time, so a mismatch breaks every model load before a checkpoint is even read:
+>
+> ```
+> RuntimeError: Detected that PyTorch and torchvision were compiled with different
+> CUDA major versions. PyTorch has CUDA Version=13.0 and torchvision has CUDA Version=12.8.
+> ```
+>
+> `pyproject.toml` pins the bare versions (`torch==2.11.0`, `torchvision==0.26.0`) because a
+> `+cu130` local-version tag is unsatisfiable from plain PyPI. The `+cu130` build comes from
+> the `--index-url` above — which is why this step is separate. For a CPU-only or different
+> CUDA install, swap `cu130` for the matching channel (e.g. `cpu`) on **both** packages.
+>
+> **Gotcha — user-site shadowing.** A `torch` installed in `~/.local` (user site) takes
+> precedence over the one in your conda/venv env and will silently shadow it, producing the
+> CUDA-mismatch error above even when the env itself is consistent. Verify what actually
+> loads:
+> ```bash
+> python -c "import torch, torchvision; print(torch.__version__, torch.__file__); print(torchvision.__version__)"
 > ```
 
 ### 4. Create `.env`

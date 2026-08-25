@@ -23,8 +23,8 @@ classifiers = [
 
 dependencies = [
     # Deep Learning
-    "torch>=2.0.0",
-    "torchvision>=0.15.0",
+    "torch==2.11.0",          # CUDA build must match torchvision's — see README "Installation"
+    "torchvision==0.26.0",    # 0.26.0 pins torch==2.11.0; a CUDA-major mismatch fails at import
     "pytorch-lightning>=2.0.0",
     "timm>=0.9.0",
     
