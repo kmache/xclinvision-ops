@@ -956,11 +956,17 @@ async def get_metrics():
 # them directly continue to work unchanged.
 
 try:
-    from .storage import build_storage_from_env  # type: ignore[import-not-found]
+    from .storage import (  # type: ignore[import-not-found]
+        BLOB_KIND_HEATMAP,
+        build_storage_from_env,
+    )
 except ImportError:
     # Tests load this file as a top-level ``main`` module (sys.path injected
     # to ``app/backend``); fall back to absolute import in that case.
-    from storage import build_storage_from_env  # type: ignore[import-not-found,no-redef]
+    from storage import (  # type: ignore[import-not-found,no-redef]
+        BLOB_KIND_HEATMAP,
+        build_storage_from_env,
+    )
 
 storage = build_storage_from_env()
 
@@ -1062,38 +1068,95 @@ _HEATMAP_FIELDS = (
 )
 
 
+#: Records which heatmap fields this analysis actually produced. Without it a
+#: missing blob is ambiguous: an analysis that never generated a Score-CAM is
+#: indistinguishable from one whose Score-CAM was evicted, and a reader cannot
+#: tell "no spatial evidence was computed" from "the evidence expired".
+_HEATMAP_MANIFEST_KEY = "heatmap_blobs"
+#: Per-field "present" | "evicted" | "absent" | "unknown", attached on read.
+_HEATMAP_STATUS_KEY = "heatmap_status"
+
+
+def _heatmap_blob_key(analysis_id: str, field: str) -> str:
+    return f"{analysis_id}__{field}"
+
+
 def _analysis_store_put(analysis_id: str, data: dict) -> None:
     """Persist an analysis, diverting heatmap payloads to the blob store."""
     row = dict(data)
+    produced: List[str] = []
     for field in _HEATMAP_FIELDS:
         payload = row.get(field)
         if not payload:
             row[field] = None
             continue
+        # The analysis produced this heatmap, whether or not the blob write
+        # below succeeds — record it either way so eviction stays detectable.
+        produced.append(field)
         try:
-            storage.put_image(f"{analysis_id}__{field}", payload.encode("ascii"))
+            storage.put_image(
+                _heatmap_blob_key(analysis_id, field),
+                payload.encode("ascii"),
+                kind=BLOB_KIND_HEATMAP,
+            )
             row[field] = None
         except Exception as exc:
             # Never lose the analysis over a blob write; fall back to inline.
             logger.warning("Could not store %s for %s out-of-band: %s", field, analysis_id, exc)
+    row[_HEATMAP_MANIFEST_KEY] = produced
     storage.put_analysis(analysis_id, row)
 
 
 def _rehydrate_heatmaps(analysis_id: str, stored: Optional[dict]) -> Optional[dict]:
     """Re-attach out-of-band heatmap payloads to a stored analysis.
 
-    Blobs are evicted independently of analyses rows (see storage.py image
-    caps), so a missing blob yields None rather than an error.
+    Heatmap blobs are evicted independently of the analyses rows that reference
+    them, so a payload can legitimately be gone. A bare None could not be told
+    apart from "this analysis never had that heatmap", which is what let older
+    studies lose their spatial evidence silently. Each field therefore gets a
+    status alongside the payload:
+
+    ``present``  payload is attached
+    ``evicted``  the analysis produced it, but retention has reclaimed the blob
+    ``absent``   the analysis never produced it
+    ``unknown``  row predates the manifest, so the two cannot be distinguished
     """
     if not stored:
         return stored
     out = dict(stored)
+    manifest = out.get(_HEATMAP_MANIFEST_KEY)
+    have_manifest = isinstance(manifest, (list, tuple))
+    status: Dict[str, str] = {}
+
     for field in _HEATMAP_FIELDS:
         if out.get(field):
+            status[field] = "present"
             continue
-        blob = storage.get_image(f"{analysis_id}__{field}")
-        out[field] = blob.decode("ascii") if blob else None
+        blob = storage.get_image(
+            _heatmap_blob_key(analysis_id, field), kind=BLOB_KIND_HEATMAP
+        )
+        if blob:
+            out[field] = blob.decode("ascii")
+            status[field] = "present"
+            continue
+        out[field] = None
+        if not have_manifest:
+            status[field] = "unknown"
+        elif field in manifest:
+            status[field] = "evicted"
+        else:
+            status[field] = "absent"
+
+    out[_HEATMAP_STATUS_KEY] = status
     return out
+
+
+def _evicted_heatmap_fields(stored: Optional[dict]) -> List[str]:
+    """Heatmap fields this analysis produced but whose blobs are now gone."""
+    if not stored:
+        return []
+    status = stored.get(_HEATMAP_STATUS_KEY) or {}
+    return [f for f, st in status.items() if st == "evicted"]
 
 
 def _feedback_store_append(entry: dict) -> None:
@@ -1979,6 +2042,21 @@ def export_report_html(request: ExportReportRequest):
         profile = _threshold_profiles.get(stored.get("model_version", ""))
         if profile is None:
             profile = _clinical_threshold_profile(None)
+        # Heatmap blobs outlive nothing: they are evicted independently of the
+        # analyses row that references them. Say so in the report rather than
+        # letting the panel disappear, which a reviewer would read as "no
+        # spatial evidence was ever produced for this study".
+        _evicted = _evicted_heatmap_fields(stored)
+        xai_unavailable_reason = ""
+        if _evicted:
+            xai_unavailable_reason = (
+                "Spatial evidence unavailable: this study generated "
+                f"{len(_evicted)} XAI overlay(s) ({', '.join(sorted(_evicted))}), "
+                "but the imagery has since been reclaimed by the retention "
+                "policy and cannot be re-rendered from the stored analysis. "
+                "Re-run the analysis to regenerate it."
+            )
+
         reporter = ClinicalReporter(threshold_profile=profile)
         html = reporter.generate_html(
             report=clinical_report,
@@ -1988,6 +2066,7 @@ def export_report_html(request: ExportReportRequest):
             indication=request.indication,
             conversation_log=request.conversation_log,
             comments=request.comments,
+            xai_unavailable_reason=xai_unavailable_reason,
         )
 
         # ── PDF conversion ────────────────────────────────────────────

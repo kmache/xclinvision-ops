@@ -1295,3 +1295,136 @@ class TestCompareAnalyzeParity:
 
         # Headline still matches what the pipeline ranked first.
         assert image_a["prediction"] == class_names[positives[0]]
+
+
+# ===========================================================================
+# Heatmap retention: evicted must be distinguishable from never-existed
+# ===========================================================================
+
+class TestHeatmapEvictionSignal:
+    """Heatmap blobs are evicted independently of the analyses row.
+
+    Before this fix the read path returned a bare None either way, so an
+    older study that lost its spatial evidence looked identical to one that
+    never produced any — silent loss of clinical evidence, not just storage.
+    """
+
+    @staticmethod
+    def _put(analysis_id, **fields):
+        import main  # type: ignore[import-not-found]
+
+        payload = {
+            "analysis_id": analysis_id,
+            "prediction": "Cardiomegaly",
+            "confidence": 0.82,
+            "uncertainty_level": "low",
+            "region_scores": {"cardiac": 0.8},
+            "key_findings": ["Enlarged cardiac silhouette"],
+            "llm_summary": "",
+            "top_k_predictions": [
+                {"class_name": "Cardiomegaly", "probability": 0.82},
+                {"class_name": "Aortic enlargement", "probability": 0.10},
+            ],
+        }
+        payload.update(fields)
+        main._analysis_store_put(analysis_id, payload)
+
+    def test_evicted_heatmap_is_distinguishable_from_never_existed(self, client):
+        import main  # type: ignore[import-not-found]
+
+        # gradcam produced; scorecam never was.
+        self._put("XCL-EVICT-AAA", heatmap_gradcam="Zm9vYmFy")
+
+        hydrated = main._rehydrate_heatmaps(
+            "XCL-EVICT-AAA", main._analysis_store["XCL-EVICT-AAA"]
+        )
+        status = hydrated["heatmap_status"]
+        assert status["heatmap_gradcam"] == "present"
+        assert status["scorecam_heatmap"] == "absent"
+        assert hydrated["heatmap_gradcam"] == "Zm9vYmFy"
+
+        # Force real eviction through the budget rather than deleting by hand.
+        original_cap = main.storage.heatmap_max_count
+        try:
+            main.storage.heatmap_max_count = 1
+            self._put("XCL-EVICT-BBB", heatmap_gradcam="YmFyYmF6")
+        finally:
+            main.storage.heatmap_max_count = original_cap
+
+        evicted = main._rehydrate_heatmaps(
+            "XCL-EVICT-AAA", main._analysis_store["XCL-EVICT-AAA"]
+        )
+        assert evicted["heatmap_gradcam"] is None
+        assert evicted["heatmap_status"]["heatmap_gradcam"] == "evicted", (
+            "an evicted heatmap is indistinguishable from one that never existed"
+        )
+        # A heatmap this study never produced stays 'absent', not 'evicted'.
+        assert evicted["heatmap_status"]["scorecam_heatmap"] == "absent"
+        assert main._evicted_heatmap_fields(evicted) == ["heatmap_gradcam"]
+
+    def test_row_without_a_manifest_reports_unknown_not_absent(self, client):
+        """Rows written before the manifest existed cannot be classified."""
+        import main  # type: ignore[import-not-found]
+
+        # Bypass _analysis_store_put, so no heatmap_blobs key is recorded.
+        main._analysis_store["XCL-LEGACY-ROW"] = {
+            "analysis_id": "XCL-LEGACY-ROW",
+            "prediction": "Cardiomegaly",
+            "confidence": 0.5,
+        }
+        hydrated = main._rehydrate_heatmaps(
+            "XCL-LEGACY-ROW", main._analysis_store["XCL-LEGACY-ROW"]
+        )
+        assert set(hydrated["heatmap_status"].values()) == {"unknown"}
+        # 'unknown' must not be reported as eviction.
+        assert main._evicted_heatmap_fields(hydrated) == []
+
+    @patch("main._get_agent")
+    def test_report_states_spatial_evidence_unavailable_when_evicted(
+        self, mock_get_agent, client
+    ):
+        """An evicted overlay must be stated, not silently dropped from the report."""
+        import main  # type: ignore[import-not-found]
+
+        mock_get_agent.return_value = _stub_agent()
+
+        self._put("XCL-EVICT-RPT", heatmap_gradcam="Zm9vYmFy")
+        original_cap = main.storage.heatmap_max_count
+        try:
+            main.storage.heatmap_max_count = 1
+            self._put("XCL-EVICT-RPT2", heatmap_gradcam="YmFyYmF6")
+        finally:
+            main.storage.heatmap_max_count = original_cap
+
+        hydrated = main._rehydrate_heatmaps(
+            "XCL-EVICT-RPT", main._analysis_store["XCL-EVICT-RPT"]
+        )
+        assert hydrated["heatmap_status"]["heatmap_gradcam"] == "evicted"
+
+        r = client.post(
+            "/api/v2/export-report",
+            json={"analysis_id": "XCL-EVICT-RPT", "format": "html"},
+        )
+        assert r.status_code == 200
+        html = r.json()["html"]
+        assert "Spatial evidence unavailable" in html, (
+            "report dropped the panel instead of stating the evidence was reclaimed"
+        )
+        assert "heatmap_gradcam" in html
+
+    @patch("main._get_agent")
+    def test_report_says_nothing_when_no_heatmap_was_ever_produced(
+        self, mock_get_agent, client
+    ):
+        """The notice is for lost evidence only — not for studies without XAI."""
+        import main  # type: ignore[import-not-found]
+
+        mock_get_agent.return_value = _stub_agent()
+        self._put("XCL-NOXAI-RPT")
+
+        r = client.post(
+            "/api/v2/export-report",
+            json={"analysis_id": "XCL-NOXAI-RPT", "format": "html"},
+        )
+        assert r.status_code == 200
+        assert "Spatial evidence unavailable" not in r.json()["html"]

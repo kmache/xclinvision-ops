@@ -280,6 +280,7 @@ class ClinicalReporter:
         indication: str = "",
         conversation_log: Optional[List[Dict[str, str]]] = None,
         comments: str = "",
+        xai_unavailable_reason: str = "",
     ) -> str:
         """Produce a self-contained HTML string with embedded images/charts.
 
@@ -302,6 +303,11 @@ class ClinicalReporter:
             Optional list of ``{"role": "...", "content": "..."}`` dicts.
         comments:
             Additional free-text comments for the report.
+        xai_unavailable_reason:
+            Set when XAI imagery that this study *did* produce is no longer
+            retrievable (blob retention reclaimed it). The report then states
+            that the spatial evidence is unavailable instead of dropping the
+            panel, which would read as "no evidence was ever generated".
         """
         class_names: List[str] = vision_data.get("class_names", self.class_names)
         probabilities: List[float] = vision_data.get("probabilities", [])
@@ -365,6 +371,7 @@ class ClinicalReporter:
             indication=indication or "",
             conversation_log=conversation_log or [],
             comments=comments or "",
+            xai_unavailable_reason=xai_unavailable_reason or "",
             report_id=report_id,
             generated_at=generated_at,
         )

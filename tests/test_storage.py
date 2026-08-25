@@ -201,3 +201,143 @@ def test_summaries_query_plan_uses_the_index_when_filtering(store):
     ).fetchall()
 
     assert "idx_analyses_patient" in " ".join(str(r[3]) for r in plan)
+
+
+# ---------------------------------------------------------------------------
+# Per-kind blob retention (heatmaps vs uploaded images)
+# ---------------------------------------------------------------------------
+
+from storage import BLOB_KIND_HEATMAP, BLOB_KIND_UPLOAD  # noqa: E402
+
+
+@pytest.fixture
+def split_store(tmp_path):
+    """Small upload budget, generous heatmap budget — the shipped shape."""
+    s = Storage(
+        db_path=tmp_path / "x.db",
+        image_dir=tmp_path / "img",
+        image_max_count=3,
+        image_max_bytes=10 ** 9,
+        heatmap_max_count=1000,
+        heatmap_max_bytes=10 ** 9,
+    )
+    yield s
+    s.close()
+
+
+def test_heatmaps_survive_past_the_old_shared_image_cap(split_store):
+    """The regression: heatmaps shared the 200-file upload cap at 4 per analysis.
+
+    Writing more heatmap blobs than the old cap must now retain all of them.
+    """
+    n = 250  # comfortably past the old DEFAULT_IMAGE_MAX_COUNT of 200
+    for i in range(n):
+        split_store.put_image(f"XCL-{i:05d}__heatmap_gradcam", b"h" * 32,
+                              kind=BLOB_KIND_HEATMAP)
+
+    assert split_store.count_images(BLOB_KIND_HEATMAP) == n
+    for i in range(n):
+        assert split_store.get_image(
+            f"XCL-{i:05d}__heatmap_gradcam", kind=BLOB_KIND_HEATMAP
+        ) == b"h" * 32, f"heatmap {i} was evicted under the new budget"
+
+
+def test_upload_and_heatmap_eviction_are_independent(split_store):
+    """Filling one budget must not evict the other kind."""
+    for i in range(3):
+        split_store.put_image(f"HM-{i}", b"h" * 32, kind=BLOB_KIND_HEATMAP)
+
+    # Overrun the upload cap (3) many times over.
+    for i in range(30):
+        split_store.put_image(f"IMG-{i:03d}", b"u" * 32, kind=BLOB_KIND_UPLOAD)
+
+    assert split_store.count_images(BLOB_KIND_UPLOAD) == 3, "upload cap not enforced"
+    for i in range(3):
+        assert split_store.get_image(f"HM-{i}", kind=BLOB_KIND_HEATMAP) is not None, (
+            "uploads evicted a heatmap — the budgets are not independent"
+        )
+
+    # And the reverse direction.
+    kept_uploads = {
+        f"IMG-{i:03d}"
+        for i in range(30)
+        if split_store.get_image(f"IMG-{i:03d}", kind=BLOB_KIND_UPLOAD) is not None
+    }
+    for i in range(500):
+        split_store.put_image(f"HM2-{i:04d}", b"h" * 32, kind=BLOB_KIND_HEATMAP)
+    for key in kept_uploads:
+        assert split_store.get_image(key, kind=BLOB_KIND_UPLOAD) is not None, (
+            "heatmaps evicted an upload — the budgets are not independent"
+        )
+
+
+def test_count_cap_retains_exactly_max_count(split_store):
+    """Exactly image_max_count files are kept, not max_count - 1."""
+    cap = split_store.image_max_count
+    for i in range(cap * 3):
+        split_store.put_image(f"IMG-{i:03d}", b"u" * 16, kind=BLOB_KIND_UPLOAD)
+    assert split_store.count_images(BLOB_KIND_UPLOAD) == cap
+
+
+def test_replacing_an_existing_blob_does_not_evict_another(split_store):
+    """A same-key rewrite adds no file, so it must not push anything out.
+
+    _evict_blobs_if_needed counted the file it was about to replace as a new
+    arrival, so at the cap a rewrite dropped the store to max_count - 1.
+    """
+    cap = split_store.image_max_count
+    for i in range(cap):
+        split_store.put_image(f"IMG-{i}", b"u" * 16, kind=BLOB_KIND_UPLOAD)
+    assert split_store.count_images(BLOB_KIND_UPLOAD) == cap
+
+    split_store.put_image(f"IMG-{cap - 1}", b"v" * 16, kind=BLOB_KIND_UPLOAD)
+
+    assert split_store.count_images(BLOB_KIND_UPLOAD) == cap, (
+        "rewriting an existing key evicted an unrelated blob"
+    )
+    assert split_store.get_image("IMG-0", kind=BLOB_KIND_UPLOAD) is not None
+
+
+def test_replacing_a_blob_reclaims_its_bytes(tmp_path):
+    """The byte cap must not charge the incoming write on top of what it replaces."""
+    s = Storage(
+        db_path=tmp_path / "b.db",
+        image_dir=tmp_path / "img",
+        image_max_count=10 ** 6,
+        image_max_bytes=200,
+    )
+    try:
+        s.put_image("A", b"x" * 80, kind=BLOB_KIND_UPLOAD)
+        s.put_image("B", b"x" * 80, kind=BLOB_KIND_UPLOAD)
+        s.put_image("B", b"y" * 80, kind=BLOB_KIND_UPLOAD)  # same size, in place
+        assert s.get_image("A", kind=BLOB_KIND_UPLOAD) is not None, (
+            "a same-size rewrite double-counted its bytes and evicted A"
+        )
+        assert s.get_image("B", kind=BLOB_KIND_UPLOAD) == b"y" * 80
+    finally:
+        s.close()
+
+
+def test_has_image_distinguishes_retained_from_evicted(split_store):
+    """has_image reports current retention without reading the payload back."""
+    for i in range(split_store.image_max_count * 3):
+        split_store.put_image(f"IMG-{i:03d}", b"u" * 16, kind=BLOB_KIND_UPLOAD)
+
+    assert split_store.has_image("IMG-000", kind=BLOB_KIND_UPLOAD) is False
+    newest = f"IMG-{split_store.image_max_count * 3 - 1:03d}"
+    assert split_store.has_image(newest, kind=BLOB_KIND_UPLOAD) is True
+    assert split_store.has_image("NEVER-WRITTEN", kind=BLOB_KIND_UPLOAD) is False
+
+
+def test_legacy_flat_blobs_are_still_readable(tmp_path):
+    """Blobs written before the per-kind split live flat and must still load."""
+    image_dir = tmp_path / "img"
+    image_dir.mkdir(parents=True)
+    (image_dir / "OLD-1.bin").write_bytes(b"legacy")
+
+    s = Storage(db_path=tmp_path / "l.db", image_dir=image_dir)
+    try:
+        assert s.get_image("OLD-1", kind=BLOB_KIND_UPLOAD) == b"legacy"
+        assert s.get_image("OLD-1", kind=BLOB_KIND_HEATMAP) == b"legacy"
+    finally:
+        s.close()
