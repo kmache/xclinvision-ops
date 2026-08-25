@@ -28,7 +28,7 @@ def _get_llm_manager():
     return get_llm_manager()
 
 
-@router.get("/providers")
+@router.get("/providers", dependencies=[Depends(require_auth)])
 async def list_llm_providers():
     """List available LLM providers and the current active provider."""
     try:
@@ -56,9 +56,15 @@ async def switch_llm_provider(provider: str = Form(...)):
         raise HTTPException(500, detail=f"Provider switch failed: {e}")
 
 
-@router.get("/health")
-async def llm_provider_health():
-    """Health check for all registered LLM providers."""
+@router.get("/health", dependencies=[Depends(require_auth)])
+def llm_provider_health():
+    """Health check for all registered LLM providers.
+
+    Authenticated: each provider probe is a real (billed) completion, so an
+    open endpoint here is an unauthenticated cost-amplification vector.
+    Declared ``def`` rather than ``async def`` so the blocking provider
+    round-trips run in the threadpool instead of on the event loop.
+    """
     try:
         manager = _get_llm_manager()
         return {

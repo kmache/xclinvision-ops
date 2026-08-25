@@ -10,10 +10,15 @@ import json
 import logging
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Generator, Iterator, Optional
 
 logger = logging.getLogger(__name__)
+
+#: How long a health-check verdict stays valid. The probe below is a real
+#: billed completion, so it must not run once per inbound request.
+HEALTH_CACHE_TTL_SECONDS = 60.0
 
 
 def _completion_tokens_kwarg(model: str, value: int = 700) -> Dict[str, int]:
@@ -60,8 +65,12 @@ class LLMProvider(ABC):
     ) -> Iterator[str]:
         """Streaming LLM call — yields text chunks as they arrive."""
 
-    def health_check(self) -> bool:
-        """Return True if the provider is reachable and functional."""
+    def _probe(self) -> bool:
+        """Issue one minimal live completion to confirm the provider works.
+
+        This costs a real, billed request — call it through
+        :meth:`health_check`, which caches the verdict.
+        """
         try:
             response = self.call(
                 "You are a test assistant.",
@@ -71,6 +80,21 @@ class LLMProvider(ABC):
             return bool(response and response.strip())
         except Exception:
             return False
+
+    def health_check(self) -> bool:
+        """Return True if the provider is reachable and functional.
+
+        The verdict is cached for :data:`HEALTH_CACHE_TTL_SECONDS`. A racing
+        pair of callers may both probe once; that is bounded and harmless,
+        whereas probing per request is not.
+        """
+        cached = getattr(self, "_health_cache", None)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < HEALTH_CACHE_TTL_SECONDS:
+            return cached[1]
+        result = self._probe()
+        self._health_cache = (now, result)
+        return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

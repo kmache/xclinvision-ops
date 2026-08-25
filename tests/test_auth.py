@@ -82,6 +82,13 @@ def test_model_card_open(unauth_client):
     assert r.status_code == 200
 
 
-def test_llm_providers_open(unauth_client):
+def test_llm_providers_requires_auth(unauth_client):
+    """/api/v2/llm/providers discloses backend LLM configuration."""
     r = unauth_client.get("/api/v2/llm/providers")
-    assert r.status_code == 200
+    assert r.status_code == 401
+
+
+def test_llm_health_requires_auth(unauth_client):
+    """Each provider probe is a real billed completion — never leave it open."""
+    r = unauth_client.get("/api/v2/llm/health")
+    assert r.status_code == 401
