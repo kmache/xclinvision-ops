@@ -1136,6 +1136,101 @@ def _per_class_detail(result: dict) -> List[dict]:
     return detail
 
 
+def _build_analysis_data(
+    *,
+    analysis_id: str,
+    result: dict,
+    model_name: str,
+    xai_method: str,
+    image_hash: str,
+    inference_ms: float,
+    heatmap_b64: Optional[str] = None,
+    overlay_b64: Optional[str] = None,
+    scorecam_heatmap_b64: Optional[str] = None,
+    scorecam_overlay_b64: Optional[str] = None,
+    thumbnail_b64: Optional[str] = None,
+    llm_summary: str = "",
+    patient_id: str = "",
+    modality: str = "",
+    body_part: str = "",
+    clinical_history: str = "",
+) -> dict:
+    """Single source of truth for the stored analysis record.
+
+    /api/v2/analyze and /api/v2/compare both write into the same analysis key
+    space, and /api/v2/chat, /api/v2/explain and /api/v2/export-report read
+    that space without knowing which endpoint produced a record. When compare
+    assembled its own dict it silently dropped ``class_names_predicted``,
+    ``predictions_multilabel``, ``calibration_status`` and ``raw_probability``,
+    so the multilabel under-triage fix (issue #1) and the uncalibrated
+    confidence fix (issue #7) did not reach anything served from a
+    compare-produced analysis.
+
+    Every field is derived from ``result`` here rather than at the call sites,
+    so the two endpoints cannot drift apart again. Endpoint-specific extras
+    (LLM summary, Score-CAM heatmaps, thumbnail, patient metadata) are passed
+    in and default to an empty value, which keeps the key set identical
+    regardless of caller.
+    """
+    explanation = result.get("explanation") or {}
+    vis = explanation.get("visualization") or {}
+
+    probs = result.get("probabilities", [])
+    class_names = result.get("class_names", get_class_names())
+    top_k = sorted(
+        [{"class_name": cn, "probability": float(p)} for cn, p in zip(class_names, probs)],
+        key=lambda x: x["probability"],
+        reverse=True,
+    )
+
+    region_scores = vis.get("region_scores") or {}
+
+    return {
+        "analysis_id": analysis_id,
+        "patient_id": patient_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        # Headline label. The pipeline ranks this by clinical priority then
+        # probability (issue #1); both endpoints therefore inherit the same
+        # ranking by reading result["class_name"] rather than re-deriving it.
+        "prediction": result["class_name"],
+        # raw_probability is the accurate name; confidence is a deprecated
+        # alias retained so existing consumers and stored analyses keep working.
+        "raw_probability": result.get("raw_probability", result["confidence"]),
+        "confidence": result["confidence"],
+        "uncertainty": result.get("uncertainty", {}),
+        "uncertainty_level": result.get("uncertainty_level", "unknown"),
+        # Whether `confidence`/`raw_probability` is a calibrated probability or
+        # a raw model output. No shipped checkpoint carries a fitted
+        # temperature, so this is "uncalibrated" for every served model today.
+        "calibrated": result.get("calibrated", False),
+        "calibration_status": result.get("calibration_status", "uncalibrated"),
+        "top_k_predictions": top_k,
+        # Every label that crossed its threshold, not just the headline one.
+        # These were computed by the pipeline and then dropped here, so a
+        # co-occurring finding never reached the dashboard or the report.
+        "predictions_multilabel": _per_class_detail(result),
+        "class_names_predicted": result.get("class_names_predicted") or [],
+        "heatmap_gradcam": heatmap_b64,
+        "heatmap_overlay": overlay_b64,
+        "scorecam_heatmap": scorecam_heatmap_b64,
+        "scorecam_overlay": scorecam_overlay_b64,
+        "thumbnail": thumbnail_b64,
+        "xai_method": xai_method,
+        "region_scores": region_scores if isinstance(region_scores, dict) else {},
+        "key_findings": explanation.get("key_findings", []),
+        "llm_summary": llm_summary,
+        "inference_time_ms": round(inference_ms, 1),
+        "model_version": model_name,
+        "image_hash": image_hash,
+        "patient_meta": {
+            "Patient ID": patient_id or "N/A",
+            "Modality": modality or "N/A",
+            "Body Part": body_part or "N/A",
+            "Clinical History": clinical_history or "N/A",
+        },
+    }
+
+
 def _img_to_base64(img_array: np.ndarray) -> str:
     """Convert a numpy image array to a base64-encoded PNG string."""
     from PIL import Image as PILImage
@@ -1276,18 +1371,12 @@ def analyze_image(
         sc_overlay_img = _generate_heatmap_overlay(vis_image, scorecam_cam, opacity=0.45)
         scorecam_overlay_b64 = _img_to_base64(sc_overlay_img)
 
-    # --- Build top-k predictions ---------------------------------------------
+    # --- Values the LLM context needs ----------------------------------------
+    # top_k / key_findings are no longer derived here: _build_analysis_data
+    # computes them from `result`, so there is one definition, not two.
     probs = result.get("probabilities", [])
     class_names = result.get("class_names", get_class_names())
-    top_k = sorted(
-        [{"class_name": cn, "probability": float(p)} for cn, p in zip(class_names, probs)],
-        key=lambda x: x["probability"],
-        reverse=True,
-    )
-
-    # --- Region scores -------------------------------------------------------
     region_scores = vis.get("region_scores") or {}
-    key_findings = explanation.get("key_findings", [])
 
     # --- LLM Summary ---------------------------------------------------------
     llm_summary = ""
@@ -1317,46 +1406,25 @@ def analyze_image(
         )
 
     # --- Build response -------------------------------------------------------
-    analysis_data = {
-        "analysis_id": analysis_id,
-        "patient_id": patient_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "prediction": result["class_name"],
-        # raw_probability is the accurate name; confidence is a deprecated
-        # alias retained so existing consumers and stored analyses keep working.
-        "raw_probability": result.get("raw_probability", result["confidence"]),
-        "confidence": result["confidence"],
-        "uncertainty": result.get("uncertainty", {}),
-        "uncertainty_level": result.get("uncertainty_level", "unknown"),
-        # Whether `confidence`/`raw_probability` is a calibrated probability or
-        # a raw model output. No shipped checkpoint carries a fitted
-        # temperature, so this is "uncalibrated" for every served model today.
-        "calibrated": result.get("calibrated", False),
-        "calibration_status": result.get("calibration_status", "uncalibrated"),
-        "top_k_predictions": top_k,
-        # Every label that crossed its threshold, not just the headline one.
-        # These were computed by the pipeline and then dropped here, so a
-        # co-occurring finding never reached the dashboard or the report.
-        "predictions_multilabel": _per_class_detail(result),
-        "class_names_predicted": result.get("class_names_predicted") or [],
-        "heatmap_gradcam": heatmap_b64,
-        "heatmap_overlay": overlay_b64,
-        "scorecam_heatmap": scorecam_heatmap_b64,
-        "scorecam_overlay": scorecam_overlay_b64,
-        "xai_method": xai_method,
-        "region_scores": region_scores if isinstance(region_scores, dict) else {},
-        "key_findings": key_findings,
-        "llm_summary": llm_summary,
-        "inference_time_ms": round(inference_ms, 1),
-        "model_version": model_name,
-        "image_hash": image_hash,
-        "patient_meta": {
-            "Patient ID": patient_id or "N/A",
-            "Modality": modality or "N/A",
-            "Body Part": body_part or "N/A",
-            "Clinical History": clinical_history or "N/A",
-        },
-    }
+    # Shared with /api/v2/compare so both endpoints write an identical record
+    # shape into the analysis store. See _build_analysis_data.
+    analysis_data = _build_analysis_data(
+        analysis_id=analysis_id,
+        result=result,
+        model_name=model_name,
+        xai_method=xai_method,
+        image_hash=image_hash,
+        inference_ms=inference_ms,
+        heatmap_b64=heatmap_b64,
+        overlay_b64=overlay_b64,
+        scorecam_heatmap_b64=scorecam_heatmap_b64,
+        scorecam_overlay_b64=scorecam_overlay_b64,
+        llm_summary=llm_summary,
+        patient_id=patient_id,
+        modality=modality,
+        body_part=body_part,
+        clinical_history=clinical_history,
+    )
 
     # Feed the drift monitor. Best-effort: a logging failure must not fail
     # an analysis the clinician is waiting on.
@@ -1445,30 +1513,22 @@ def _run_single_analysis(
     # Encode the original uploaded image as a thumbnail
     thumbnail_b64 = _img_to_base64(image_np)
 
-    probs = result.get("probabilities", [])
-    class_names = result.get("class_names", get_class_names())
-    top_k = sorted(
-        [{"class_name": cn, "probability": float(p)} for cn, p in zip(class_names, probs)],
-        key=lambda x: x["probability"], reverse=True,
-    )
-
     analysis_id = f"XCL-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
-    analysis_data = {
-        "analysis_id": analysis_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "prediction": result["class_name"],
-        "confidence": result["confidence"],
-        "uncertainty_level": result.get("uncertainty_level", "unknown"),
-        "top_k_predictions": top_k,
-        "heatmap_gradcam": heatmap_b64,
-        "heatmap_overlay": overlay_b64,
-        "thumbnail": thumbnail_b64,
-        "region_scores": (vis.get("region_scores") or {}),
-        "key_findings": explanation.get("key_findings", []),
-        "inference_time_ms": round(inference_ms, 1),
-        "model_version": model_name,
-        "image_hash": image_hash,
-    }
+    # Same builder /api/v2/analyze uses. Compare records land in the same key
+    # space and are read back by chat / explain / export-report, so they must
+    # carry the multilabel and calibration fields too — assembling a separate
+    # dict here is what silently dropped them.
+    analysis_data = _build_analysis_data(
+        analysis_id=analysis_id,
+        result=result,
+        model_name=model_name,
+        xai_method=xai_method,
+        image_hash=image_hash,
+        inference_ms=inference_ms,
+        heatmap_b64=heatmap_b64,
+        overlay_b64=overlay_b64,
+        thumbnail_b64=thumbnail_b64,
+    )
 
     # Store so the analysis can be retrieved later (e.g. for XAI, chat, report)
     _analysis_store_put(analysis_id, analysis_data)

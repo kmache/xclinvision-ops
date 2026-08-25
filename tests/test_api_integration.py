@@ -1077,3 +1077,221 @@ class TestDriftPipelineWiring:
 
         assert len(history) == 1
         assert history[0]["confidence"] == 0.9
+
+
+# ===========================================================================
+# Compare / analyze record parity
+# ===========================================================================
+
+def _multilabel_pipeline(class_names, positives):
+    """Mock pipeline whose predict() calls `positives` (indices) positive.
+
+    Built from the configured class names rather than hardcoded labels, so the
+    test follows configs/system.yaml like the rest of the system does.
+    """
+    n = len(class_names)
+    probs = [0.91 if i in positives else 0.04 for i in range(n)]
+    binary = [1 if i in positives else 0 for i in range(n)]
+    headline = class_names[positives[0]]
+
+    pipeline = MagicMock()
+    pipeline.predict.return_value = {
+        "prediction": positives[0],
+        "class_name": headline,
+        "class_names": list(class_names),
+        "probabilities": probs,
+        "thresholds": [0.5] * n,
+        "confidence": probs[positives[0]],
+        "raw_probability": probs[positives[0]],
+        "calibrated": False,
+        "calibration_status": "uncalibrated",
+        "uncertainty": {"epistemic": 0.02, "aleatoric": 0.01},
+        "uncertainty_level": "low",
+        "explanation": {
+            "key_findings": ["Finding present"],
+            "visualization": {
+                "grayscale_cam": np.random.rand(64, 64).astype(np.float32),
+                "region_scores": {"cardiac": 0.8},
+                "method": "gradcam++",
+            },
+        },
+        "predictions_multilabel": binary,
+        "class_names_predicted": [class_names[i] for i in positives],
+    }
+    pipeline.preprocess.return_value = (
+        np.random.rand(3, 384, 384).astype(np.float32),
+        np.random.randint(0, 255, (384, 384, 3), dtype=np.uint8),
+    )
+    return pipeline
+
+
+def _stub_agent():
+    agent = MagicMock()
+    agent.generate_report.return_value = {
+        "findings": "Findings text.",
+        "impression": "Impression text.",
+        "key_findings": ["Finding present"],
+        "reasoning_trace": "",
+        "differential_diagnosis": [],
+        "urgency": "Medium",
+        "next_steps": ["Clinical correlation recommended."],
+        "citations": [],
+    }
+    return agent
+
+
+class TestCompareAnalyzeParity:
+    """/api/v2/compare wrote a different record shape than /api/v2/analyze.
+
+    Both endpoints store into the same analysis key space, and chat / explain /
+    export-report read that space without knowing which endpoint produced a
+    record. Compare's hand-rolled dict omitted class_names_predicted,
+    predictions_multilabel, calibration_status and raw_probability, so the
+    multilabel under-triage fix (issue #1) and the uncalibrated-confidence fix
+    (issue #7) never reached anything served from a compare-produced analysis.
+    """
+
+    @patch("main._get_agent")
+    @patch("main.get_pipeline")
+    def test_compare_and_analyze_store_identical_key_sets(
+        self, mock_get_pipe, mock_get_agent, client, dummy_image_bytes
+    ):
+        """The regression guard: the two endpoints must not drift apart again."""
+        mock_get_pipe.return_value = _fake_pipeline()
+        mock_get_agent.return_value = _stub_agent()
+
+        from main import _analysis_store  # type: ignore[import-not-found]
+
+        r_analyze = client.post(
+            "/api/v2/analyze",
+            files={"file": ("xray.jpg", dummy_image_bytes, "image/jpeg")},
+            data={"patient_id": "PARITY-001", "model_name": "efficientnet_b0"},
+        )
+        assert r_analyze.status_code == 200
+        analyze_id = r_analyze.json()["analysis_id"]
+
+        r_compare = client.post(
+            "/api/v2/compare",
+            files={
+                "file_a": ("a.jpg", dummy_image_bytes, "image/jpeg"),
+                "file_b": ("b.jpg", dummy_image_bytes, "image/jpeg"),
+            },
+            data={"model_name": "efficientnet_b0"},
+        )
+        assert r_compare.status_code == 200
+        compare_id = r_compare.json()["image_a"]["analysis_id"]
+
+        analyze_keys = set(_analysis_store[analyze_id].keys())
+        compare_keys = set(_analysis_store[compare_id].keys())
+
+        assert compare_keys == analyze_keys, (
+            "compare/analyze stored-record shapes diverged; "
+            f"only in analyze: {sorted(analyze_keys - compare_keys)}; "
+            f"only in compare: {sorted(compare_keys - analyze_keys)}"
+        )
+
+        # The four fields whose absence made the earlier fixes inert.
+        for field in (
+            "class_names_predicted",
+            "predictions_multilabel",
+            "calibration_status",
+            "raw_probability",
+        ):
+            assert field in compare_keys, f"{field} missing from compare record"
+
+        # Both images of a comparison get the same treatment.
+        compare_id_b = r_compare.json()["image_b"]["analysis_id"]
+        assert set(_analysis_store[compare_id_b].keys()) == analyze_keys
+
+    @patch("main._get_agent")
+    @patch("main.get_pipeline")
+    def test_compare_analysis_exports_report_without_calibrated_language(
+        self, mock_get_pipe, mock_get_agent, client, dummy_image_bytes
+    ):
+        """A compare-produced record must reach the reporter as uncalibrated.
+
+        The reporter downgrades every probability to "Raw model probability:
+        ... (not calibrated)" unless calibration_status == "calibrated". With
+        the field missing from the stored record this relied on a defaulting
+        `.get`, so the guarantee was accidental rather than carried by the data.
+        """
+        from xclinvision.config import get_class_names
+
+        class_names = get_class_names()
+        mock_get_pipe.return_value = _multilabel_pipeline(class_names, positives=[0])
+        mock_get_agent.return_value = _stub_agent()
+
+        from main import _analysis_store  # type: ignore[import-not-found]
+
+        r_compare = client.post(
+            "/api/v2/compare",
+            files={
+                "file_a": ("a.jpg", dummy_image_bytes, "image/jpeg"),
+                "file_b": ("b.jpg", dummy_image_bytes, "image/jpeg"),
+            },
+            data={"model_name": "efficientnet_b0"},
+        )
+        assert r_compare.status_code == 200
+        compare_id = r_compare.json()["image_a"]["analysis_id"]
+
+        stored = _analysis_store[compare_id]
+        assert stored["calibration_status"] == "uncalibrated"
+        assert stored["calibrated"] is False
+
+        r_report = client.post(
+            "/api/v2/export-report",
+            json={"analysis_id": compare_id, "format": "html"},
+        )
+        assert r_report.status_code == 200
+        html = r_report.json()["html"]
+
+        assert "not calibrated" in html
+        assert "Consistent with" not in html, (
+            "uncalibrated compare output was rendered in calibrated clinical language"
+        )
+        assert "Highly suggestive" not in html
+
+    @patch("main._get_agent")
+    @patch("main.get_pipeline")
+    def test_compare_surfaces_all_positive_labels(
+        self, mock_get_pipe, mock_get_agent, client, dummy_image_bytes
+    ):
+        """Co-occurring findings must survive the compare path, not just the headline.
+
+        Compare previously returned only `prediction`, so a second positive
+        label was invisible to the dashboard and to any report generated from
+        that analysis — the under-triage this fix exists to prevent.
+        """
+        from xclinvision.config import get_class_names
+
+        class_names = get_class_names()
+        if len(class_names) < 2:
+            pytest.skip("multilabel assertions need at least two configured classes")
+
+        positives = [0, 1]
+        mock_get_pipe.return_value = _multilabel_pipeline(class_names, positives)
+        mock_get_agent.return_value = _stub_agent()
+
+        r_compare = client.post(
+            "/api/v2/compare",
+            files={
+                "file_a": ("a.jpg", dummy_image_bytes, "image/jpeg"),
+                "file_b": ("b.jpg", dummy_image_bytes, "image/jpeg"),
+            },
+            data={"model_name": "efficientnet_b0"},
+        )
+        assert r_compare.status_code == 200
+        image_a = r_compare.json()["image_a"]
+
+        expected = [class_names[i] for i in positives]
+        assert image_a["class_names_predicted"] == expected, (
+            "compare surfaced only the headline label"
+        )
+
+        positive_names = [
+            row["class_name"] for row in image_a["predictions_multilabel"] if row["positive"]
+        ]
+        assert positive_names == expected
+
+        # Headline still matches what the pipeline ranked first.
+        assert image_a["prediction"] == class_names[positives[0]]
