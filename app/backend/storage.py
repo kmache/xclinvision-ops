@@ -179,27 +179,46 @@ class Storage:
             rows = self._conn.execute(sql, params).fetchall()
         return [json.loads(row[0]) for row in rows]
 
-    #: Columns the agent tools actually read off the analysis store. Projecting
-    #: to these avoids materialising every row's base64 heatmaps per request.
-    _SUMMARY_KEYS = ("analysis_id", "patient_id", "timestamp", "prediction", "confidence")
+    #: Scalar fields the agent tools actually read off the analysis store.
+    #: Projecting to these keeps every row's base64 heatmaps out of Python.
+    _SUMMARY_KEYS = (
+        "analysis_id", "patient_id", "timestamp",
+        "prediction", "confidence", "model_version",
+    )
+    #: id / patient_id / timestamp are real columns; the rest live in the JSON.
+    _SUMMARY_SQL = (
+        "id AS analysis_id, patient_id, timestamp, "
+        "json_extract(data_json, '$.prediction')    AS prediction, "
+        "json_extract(data_json, '$.confidence')    AS confidence, "
+        "json_extract(data_json, '$.model_version') AS model_version"
+    )
 
-    def summaries(self) -> Dict[str, Dict[str, Any]]:
-        """Scalar-only snapshot of all analyses, keyed by id.
+    def summaries(
+        self,
+        patient_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Scalar-only snapshot of analyses, keyed by id.
 
-        ``all_analyses()`` decodes every stored heatmap; the reasoning tools
-        (``_tool_get_monitoring_status``, ``_tool_compare_with_history``) need
-        only the fields in :attr:`_SUMMARY_KEYS`.
+        ``all_analyses()`` json.loads every row, each carrying base64 heatmap
+        PNGs. The reasoning tools (``_tool_get_monitoring_status``,
+        ``_tool_compare_with_history``) need only :attr:`_SUMMARY_KEYS`, so
+        project to those in SQL and never decode the payload.
+
+        Filtering by ``patient_id`` uses ``idx_analyses_patient``.
         """
-        projection = ", ".join(
-            f"json_extract(data_json, '$.{k}')" for k in self._SUMMARY_KEYS
-        )
+        sql = f"SELECT {self._SUMMARY_SQL} FROM analyses"
+        params: List[Any] = []
+        if patient_id is not None:
+            sql += " WHERE patient_id = ?"
+            params.append(patient_id)
+        sql += " ORDER BY inserted_at ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
         with self._lock:
-            rows = self._conn.execute(
-                f"SELECT id, {projection} FROM analyses ORDER BY inserted_at ASC"
-            ).fetchall()
-        # json_extract pulls the scalars inside SQLite, so the stored base64
-        # heatmaps are never decoded into Python at all.
-        return {row[0]: dict(zip(self._SUMMARY_KEYS, row[1:])) for row in rows}
+            rows = self._conn.execute(sql, params).fetchall()
+        return {row[0]: dict(zip(self._SUMMARY_KEYS, row)) for row in rows}
 
     # --------------------------------------------------------------- feedback
     def append_feedback(self, entry: Dict[str, Any]) -> None:

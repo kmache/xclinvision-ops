@@ -884,3 +884,75 @@ class TestModelCheckpointIntegrity:
 
         registry = main._discover_models()
         assert set(registry) >= {"convnext_small", "vit_base"}
+
+
+# ===========================================================================
+# History / chat query cost (issue #10)
+# ===========================================================================
+
+class TestHistoryQueryCost:
+    @staticmethod
+    def _seed(count: int, target: str = "P-TARGET", target_rows: int = 5):
+        """Fill the store with `count` rows carrying realistic heatmap payloads."""
+        import main  # type: ignore[import-not-found]
+
+        blob = "A" * 200_000  # ~200 KB base64 PNG, as /api/v2/analyze produces
+        for i in range(count):
+            pid = target if i < target_rows else f"P-OTHER-{i}"
+            main._analysis_store_put(f"XCL-HIST-{i:05d}", {
+                "analysis_id": f"XCL-HIST-{i:05d}",
+                "patient_id": pid,
+                "timestamp": f"2026-08-{(i % 28) + 1:02d}T10:00:00+00:00",
+                "prediction": "Cardiomegaly",
+                "confidence": 0.8,
+                "uncertainty": {},
+                "uncertainty_level": "low",
+                "model_version": "vit_base",
+                "top_k_predictions": [],
+                "key_findings": [],
+                "llm_summary": "",
+                "heatmap_gradcam": blob,
+                "heatmap_overlay": blob,
+            })
+
+    def test_history_is_bounded_with_many_unrelated_rows(self, client):
+        import time
+
+        self._seed(1000)
+
+        start = time.perf_counter()
+        r = client.get("/api/v2/history/P-TARGET")
+        elapsed = time.perf_counter() - start
+
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body) == 5
+        assert {row["analysis_id"] for row in body} == {
+            f"XCL-HIST-{i:05d}" for i in range(5)
+        }
+        # Pre-fix this decoded all 1000 rows (~400 MB of base64) in Python.
+        assert elapsed < 0.1, f"history took {elapsed:.3f}s for 1000 stored rows"
+
+    def test_history_still_returns_heatmaps(self, client):
+        """Moving blobs out of data_json must not drop them from the response."""
+        self._seed(3, target="P-HEAT", target_rows=3)
+
+        body = client.get("/api/v2/history/P-HEAT").json()
+
+        assert body, "expected rows for P-HEAT"
+        assert body[0]["heatmap_overlay"], "overlay lost in the round-trip"
+        assert body[0]["thumbnail"], "thumbnail lost in the round-trip"
+
+    def test_history_chat_context_carries_no_base64_payloads(self):
+        """The reasoning tools must never receive heatmap blobs."""
+        import main  # type: ignore[import-not-found]
+
+        self._seed(20, target="P-CTX", target_rows=2)
+
+        context = main.storage.summaries(limit=main._CHAT_CONTEXT_MAX)
+
+        assert context, "expected summaries"
+        for row in context.values():
+            assert set(row) == set(main.storage._SUMMARY_KEYS)
+            for value in row.values():
+                assert not (isinstance(value, str) and len(value) > 1000), row

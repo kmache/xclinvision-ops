@@ -1012,9 +1012,53 @@ _feedback_store = _FeedbackStoreProxy()
 _image_store = _ImageStoreProxy()
 
 
+#: Base64 PNG fields that must not live inside the analyses row. Keeping them
+#: in data_json meant every all_analyses()/by_patient() read decoded hundreds
+#: of KB per row; they are written to the blob store under
+#: "<analysis_id>__<field>" and rehydrated only where actually rendered.
+#: Upper bound on rows fed to the reasoning tools as conversational context.
+_CHAT_CONTEXT_MAX = int(os.getenv("XCLINVISION_CHAT_CONTEXT_MAX", "500"))
+
+_HEATMAP_FIELDS = (
+    "heatmap_gradcam",
+    "heatmap_overlay",
+    "scorecam_heatmap",
+    "scorecam_overlay",
+)
+
+
 def _analysis_store_put(analysis_id: str, data: dict) -> None:
-    """Persist an analysis through the Storage layer."""
-    storage.put_analysis(analysis_id, data)
+    """Persist an analysis, diverting heatmap payloads to the blob store."""
+    row = dict(data)
+    for field in _HEATMAP_FIELDS:
+        payload = row.get(field)
+        if not payload:
+            row[field] = None
+            continue
+        try:
+            storage.put_image(f"{analysis_id}__{field}", payload.encode("ascii"))
+            row[field] = None
+        except Exception as exc:
+            # Never lose the analysis over a blob write; fall back to inline.
+            logger.warning("Could not store %s for %s out-of-band: %s", field, analysis_id, exc)
+    storage.put_analysis(analysis_id, row)
+
+
+def _rehydrate_heatmaps(analysis_id: str, stored: Optional[dict]) -> Optional[dict]:
+    """Re-attach out-of-band heatmap payloads to a stored analysis.
+
+    Blobs are evicted independently of analyses rows (see storage.py image
+    caps), so a missing blob yields None rather than an error.
+    """
+    if not stored:
+        return stored
+    out = dict(stored)
+    for field in _HEATMAP_FIELDS:
+        if out.get(field):
+            continue
+        blob = storage.get_image(f"{analysis_id}__{field}")
+        out[field] = blob.decode("ascii") if blob else None
+    return out
 
 
 def _feedback_store_append(entry: dict) -> None:
@@ -1471,8 +1515,9 @@ def get_dashboard_explanation(
         overlay_img = _generate_heatmap_overlay(vis_image, thresholded, opacity=opacity, colormap=colormap_cv)
         overlay_b64 = _img_to_base64(overlay_img)
     else:
-        heatmap_b64 = stored.get("heatmap_gradcam")
-        overlay_b64 = stored.get("heatmap_overlay")
+        _hydrated = _rehydrate_heatmaps(analysis_id, stored)
+        heatmap_b64 = _hydrated.get("heatmap_gradcam")
+        overlay_b64 = _hydrated.get("heatmap_overlay")
 
     return {
         "heatmap": heatmap_b64,
@@ -1493,7 +1538,10 @@ async def get_patient_history(patient_id: str, limit: int = Query(default=50, le
     """Retrieve all historical analyses for a patient (temporal comparison)."""
     # Indexed lookup (idx_analyses_patient) instead of decoding every stored
     # analysis — rows embed base64 heatmaps and the table caps at 5000.
-    history = storage.by_patient(patient_id, limit=limit)
+    history = [
+        _rehydrate_heatmaps(h["analysis_id"], h)
+        for h in storage.by_patient(patient_id, limit=limit)
+    ]
 
     return [
         {
@@ -1560,7 +1608,7 @@ def llm_chat(request: ChatRequest):
 
         # Extra context the tools may need
         extra_context = {
-            "analysis_store": storage.summaries(),
+            "analysis_store": storage.summaries(limit=_CHAT_CONTEXT_MAX),
             "feedback_store": storage.all_feedback(),
         }
 
@@ -1675,7 +1723,9 @@ async def generate_dashboard_report(request: DashboardReportRequest):
 @app.post("/api/v2/export-report", dependencies=[Depends(require_auth)])
 def export_report_html(request: ExportReportRequest):
     """Generate a clinical report in HTML, PDF, or JSON format."""
-    stored = _analysis_store.get(request.analysis_id)
+    stored = _rehydrate_heatmaps(
+        request.analysis_id, _analysis_store.get(request.analysis_id)
+    )
     if not stored:
         raise HTTPException(404, "Analysis not found")
 
@@ -2068,7 +2118,7 @@ async def llm_chat_stream(request: ChatRequest):
             ]
 
             extra_context = {
-                "analysis_store": storage.summaries(),
+                "analysis_store": storage.summaries(limit=_CHAT_CONTEXT_MAX),
                 "feedback_store": storage.all_feedback(),
             }
 

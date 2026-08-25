@@ -143,6 +143,7 @@ def test_summaries_projects_scalars_only(store):
         "timestamp": "2024-01-01",
         "prediction": "Cardiomegaly",
         "confidence": 0.9,
+        "model_version": "vit_base",
         "heatmap_gradcam": "x" * 4096,
         "heatmap_overlay": "y" * 4096,
         "top_k_predictions": [{"class_name": "Cardiomegaly", "probability": 0.9}],
@@ -155,6 +156,48 @@ def test_summaries_projects_scalars_only(store):
         "timestamp": "2024-01-01",
         "prediction": "Cardiomegaly",
         "confidence": 0.9,
+        "model_version": "vit_base",
     }
     # The heavy fields are still retrievable through the full accessor.
     assert store.get_analysis("a1")["heatmap_gradcam"] == "x" * 4096
+
+
+def test_by_patient_uses_the_patient_index(store):
+    """Issue 10: the point of by_patient is the index, not just the filter."""
+    store.put_analysis("a1", {"patient_id": "P1", "timestamp": "2024-01-01"})
+
+    plan = store._conn.execute(
+        "EXPLAIN QUERY PLAN "
+        "SELECT data_json FROM analyses WHERE patient_id = ? ORDER BY timestamp DESC",
+        ("P1",),
+    ).fetchall()
+
+    detail = " ".join(str(row[3]) for row in plan)
+    assert "idx_analyses_patient" in detail, detail
+    assert "SCAN analyses" not in detail, detail
+
+
+def test_summaries_filters_by_patient_and_limits(store):
+    for i in range(4):
+        store.put_analysis(f"a{i}", {
+            "analysis_id": f"a{i}",
+            "patient_id": "P1" if i % 2 else "P2",
+            "timestamp": f"2024-01-0{i + 1}",
+            "prediction": "Cardiomegaly",
+            "confidence": 0.5,
+            "model_version": "vit_base",
+        })
+
+    assert set(store.summaries(patient_id="P1")) == {"a1", "a3"}
+    assert len(store.summaries(limit=2)) == 2
+
+
+def test_summaries_query_plan_uses_the_index_when_filtering(store):
+    store.put_analysis("a1", {"patient_id": "P1", "timestamp": "2024-01-01"})
+
+    plan = store._conn.execute(
+        f"EXPLAIN QUERY PLAN SELECT {store._SUMMARY_SQL} FROM analyses WHERE patient_id = ?",
+        ("P1",),
+    ).fetchall()
+
+    assert "idx_analyses_patient" in " ".join(str(r[3]) for r in plan)
