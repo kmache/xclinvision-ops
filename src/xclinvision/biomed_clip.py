@@ -1,3 +1,7 @@
+# TODO: dead-code review — no importer anywhere in src/, app/ or scripts/
+# (repo-wide grep, production-readiness review). 636 LOC at 0% coverage.
+# Kept in place pending confirmation that no notebook or offline job
+# depends on it; do not delete without that check.
 """BiomedCLIP custom models and wrappers."""
 
 import logging
