@@ -880,10 +880,17 @@ class TestModelCheckpointIntegrity:
         assert any("Refusing model" in r.message for r in caplog.records)
 
     def test_model_registry_accepts_the_shipped_models(self):
-        """The guard must not reject the real models/best_models/ set."""
+        """The guard must not reject the real models/best_models/ set.
+
+        Skipped when no checkpoints are present. models/ is gitignored, so a
+        clean clone has none and asserting here turned "you have not trained
+        yet" into a red suite 60 seconds after cloning.
+        """
         import main  # type: ignore[import-not-found]
 
         registry = main._discover_models()
+        if not registry:
+            pytest.skip("no exported checkpoints on this machine")
         assert set(registry) >= {"convnext_small", "vit_base"}
 
 

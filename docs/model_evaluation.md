@@ -38,6 +38,48 @@ Per-class ROC-AUC. Calibration is a strictly increasing per-class map, so it can
 change ranking — these values are identical before and after, which is the point: the
 models always ranked well. What was broken was the number attached to the ranking.
 
+### Average precision
+
+| Model | Cardiomegaly | Aortic enl. | Pleural thick. | Pulm. fibrosis |
+|---|---:|---:|---:|---:|
+| convnext_small | 0.644 | 0.754 | 0.390 | 0.419 |
+| densenet | 0.649 | 0.726 | 0.332 | 0.305 |
+| efficientnet_b0 | 0.629 | 0.716 | 0.299 | 0.391 |
+| vit_base | **0.757** | **0.809** | **0.429** | **0.523** |
+| *baseline (prevalence)* | *0.128* | *0.165* | *0.062* | *0.072* |
+
+Also identical before and after calibration, and for the same reason — AP is rank-based.
+Every class clears its prevalence baseline by 4.3-7.3x. Note the gap between the two
+mediastinal classes (AP 0.63-0.81) and the two peripheral ones (0.30-0.52): that gap,
+not the calibration error, is what limits the system.
+
+### Precision at 90% recall
+
+The operating point that matters for a sensitivity-first reading. Rank-based, so like AUC
+and AP it is unchanged by calibration.
+
+| Model | Cardiomegaly | Aortic enl. | Pleural thick. | Pulm. fibrosis |
+|---|---:|---:|---:|---:|
+| convnext_small | 0.444 | 0.497 | 0.168 | 0.140 |
+| densenet | 0.416 | 0.450 | 0.140 | 0.158 |
+| efficientnet_b0 | 0.406 | 0.472 | 0.155 | 0.157 |
+| vit_base | **0.568** | **0.605** | 0.179 | 0.183 |
+
+At 0.18 precision a class returns roughly five false positives per true finding. That is
+the number that decides whether a class is usable, not its AUC.
+
+### Macro F1 by checkpoint
+
+| Model | macro AUC | macro F1 (served thresholds) |
+|---|---:|---:|
+| convnext_small | 0.900 | 0.563 |
+| densenet | 0.889 | 0.530 |
+| efficientnet_b0 | 0.896 | 0.539 |
+| vit_base | **0.930** | **0.626** |
+
+The `best_val_auc` field in each `_meta.json` is **not** AUC — it stores `val_f1_macro`,
+matching the source checkpoint filename to four decimals. Read AUC from this table.
+
 ## The calibration problem
 
 Every checkpoint shipped with `temperature: null`, so `_apply_temperature` was a no-op
@@ -151,6 +193,33 @@ on are no longer inflated. A lower number on a calibrated scale is not a laxer t
 Calibration was not undertaken to raise F1 — ranking is unchanged, so the gain comes only
 from thresholds now sitting in the right place. The real result is that a served
 probability now means what it says.
+
+## Horizontal flip at inference
+
+`configs/system.yaml:9` sets `horizontal_flip: true`. It is a **training-time**
+augmentation only — `get_val_transforms` (dataset.py:84) resizes and normalises with no
+flip. Evaluating flipped inputs therefore measures how much left/right invariance the
+augmentation taught, which matters because `xai.py:49-58` labels activation regions by
+anatomical side.
+
+Per-class change in validation AUC when the input is horizontally flipped:
+
+| Model | Cardiomegaly | Aortic enl. | Pleural thick. | Pulm. fibrosis | mean \|Δp\| per image |
+|---|---:|---:|---:|---:|---:|
+| convnext_small | +0.0042 | +0.0018 | −0.0010 | −0.0187 | 0.062 |
+| densenet | +0.0026 | −0.0001 | −0.0256 | −0.0255 | 0.093 |
+| efficientnet_b0 | −0.0030 | −0.0016 | −0.0063 | +0.0015 | 0.087 |
+| vit_base | −0.0012 | −0.0008 | −0.0023 | +0.0016 | 0.032 |
+
+Ranking is nearly flip-invariant: the largest per-class loss is **0.026** AUC (densenet,
+the two lower-zone classes) and most are under 0.005. The two mediastinal classes are
+essentially unaffected, which is expected — a cardiac or aortic silhouette stays
+diagnostic when mirrored.
+
+Per-image probabilities are not invariant, moving **0.03–0.09** mean absolute. So the
+models are largely insensitive to the laterality the XAI region labels assert, while
+still being pointwise unstable under the flip. Treat side-specific attribution in reports
+as unverified.
 
 ## What this does not fix
 

@@ -1,419 +1,248 @@
 # XClinVision-Ops
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.103+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Streamlit](https://img.shields.io/badge/Streamlit-1.28+-FF4B4B.svg)](https://streamlit.io/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+An end-to-end chest X-ray analysis system: multilabel classification across four
+findings, Grad-CAM++/Score-CAM explainability, MC-Dropout uncertainty, per-class
+calibration, an LLM reasoning agent with RAG retrieval over radiology reports, and
+HTML/PDF report generation — served as a FastAPI backend with a Streamlit dashboard.
+Built as a portfolio and research artifact.
 
-**AI-powered Medical Imaging Platform with Clinical Decision Support**
+> **Not for clinical use.** This is not a medical device and has no regulatory clearance.
+> It was never validated prospectively or on any population outside its training dataset,
+> and two of its four findings are below usable precision (see
+> [Known limitations](#known-limitations)). Do not use it for any decision affecting a
+> patient, and do not send it real patient data — analyses and images are stored
+> unencrypted with no de-identification.
 
-XClinVision-Ops is a production-grade chest X-ray analysis platform combining multi-model deep learning inference, visual explainability, uncertainty quantification, an LLM-powered reasoning agent with RAG, and full report generation. It ships as a FastAPI backend + Streamlit dashboard, containerised with Docker. [Demo](https://youtu.be/4_3VytZUHDE?si=rAhWslSZANGs_5Tl)
-
-> **Disclaimer:** This system is intended for research and clinical decision support only. It does not provide autonomous medical diagnoses and must be used under qualified clinician supervision. Not certified for clinical use.
-
----
-
-## Table of Contents
-
-- [Key Features](#key-features)
-- [Technology Stack](#️-technology-stack)
-- [Architecture](#architecture)
-- [Project Structure](#project-structure)
-- [Installation](#installation)
-- [Running the Project](#running-the-project)
-- [Environment Variables](#environment-variables)
-- [LLM Integration](#llm-integration)
-- [RAG Pipeline](#rag-pipeline)
-- [Usage Guide](#usage-guide)
-- [API Reference](#api-reference)
-- [Report Generation](#report-generation)
-- [Docker & Deployment](#docker--deployment)
-- [Configuration](#configuration)
-- [Testing](#testing)
-- [Development Notes](#development-notes)
-- [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
+[Demo video](https://youtu.be/4_3VytZUHDE?si=rAhWslSZANGs_5Tl) ·
+[Model card](docs/MODEL_CARD.md) ·
+[Full evaluation](docs/model_evaluation.md) ·
+[Review log](docs/reviews/)
 
 ---
 
-## Key Features
+## Measured performance
 
-| Area | Capabilities |
-|---|---|
-| **Model Inference** | 4 production architectures (ConvNeXt-Small, DenseNet-121, EfficientNet-B0, ViT-Base); auto-discovered model registry; multilabel classification across 5 chest pathology classes |
-| **Explainability** | Grad-CAM++ and Score-CAM heatmap overlays; attention maps; per-region clinical scoring; adjustable threshold & opacity |
-| **Uncertainty** | MC Dropout epistemic uncertainty; temperature scaling is implemented (`evaluator.TemperatureScaler`) but **no shipped checkpoint carries a fitted temperature**, so served scores are uncalibrated. Responses expose `raw_probability` with `calibration_status: "uncalibrated"`; `confidence` remains as a deprecated alias. Refit tracked as TODO(calibration-refit) |
-| **LLM Agent** | Intent classification → tool planning → execution → LLM synthesis loop; 7 callable tools; streaming chat with quick-action chips |
-| **RAG** | ChromaDB + BM25 hybrid retrieval (RRF fusion) over 3 900+ IU CXR radiology reports; retrieval grounded in clinical evidence |
-| **Report Generation** | Full clinical reports via Jinja2 template; Grad-CAM++ overlay + radar chart; export as HTML, PDF (WeasyPrint), or JSON |
-| **History & Comparison** | Per-patient analysis history; side-by-side temporal comparison; manual multi-image upload comparison |
-| **Evaluation & Monitoring** | Per-class AUC, F1, sensitivity, specificity; ECE calibration; threshold optimisation; drift detection |
-| **MLOps** | MLflow experiment tracking; prediction logging; clinician feedback loop; audit trails |
+Validation split, n = 2,133. Best checkpoint (`vit_base`). Average precision must be read
+against prevalence, not against 0.5.
 
-**Target pathologies:** No Finding · Cardiomegaly · Aortic Enlargement · Pleural Thickening · Pulmonary Fibrosis
+| Class | Prevalence | AUC | AP | P @ 90% recall | Usable alone? |
+|---|---:|---:|---:|---:|---|
+| Cardiomegaly | 12.80% | 0.957 | 0.757 | 0.568 | yes |
+| Aortic enlargement | 16.50% | 0.959 | 0.809 | 0.605 | yes |
+| Pleural thickening | 6.19% | 0.904 | 0.429 | 0.179 | **no** |
+| Pulmonary fibrosis | 7.17% | 0.898 | 0.523 | 0.183 | **no** |
+
+| Checkpoint | macro AUC | macro F1 | mean test ECE |
+|---|---:|---:|---:|
+| `vit_base` | **0.930** | **0.626** | 0.0151 |
+| `convnext_small` | 0.900 | 0.563 | 0.0147 |
+| `efficientnet_b0` | 0.896 | 0.539 | 0.0148 |
+| `densenet` | 0.889 | 0.530 | 0.0161 |
+
+Per-class figures for all four checkpoints, ECE before/after, fitted parameters and
+thresholds: [`docs/model_evaluation.md`](docs/model_evaluation.md).
+
+### Calibration
+
+**Calibrated.** All four checkpoints carry a fitted per-class affine map,
+`p = sigmoid(z / T + b)`, fitted on the validation split and stored in the checkpoint
+payload. Mean ECE fell from **0.199–0.291 to 0.0147–0.0161** on the held-out test split.
+
+Served responses expose `raw_probability` alongside `calibration_status`. A checkpoint
+only reports `calibrated` when its held-out ECE both improves and lands at or below 0.05;
+one that fails the bar keeps its parameters, still applies them, and continues reporting
+`uncalibrated` so the report layer keeps hedging its language.
+
+Caveat: calibration was fitted on the same split used for model selection. There is no
+separate calibration split.
 
 ---
 
-## 🛠️ Technology Stack
+## Subsystems
 
-| Category | Tools & Frameworks |
-|---|---|
-| **Deep Learning** | PyTorch 2.0+, torchvision, timm (ConvNeXt, DenseNet, EfficientNet, ViT, Swin Transformer) |
-| **Explainability** | Grad-CAM++, Score-CAM, Attention Rollout, PyTorch hooks |
-| **Uncertainty** | MC Dropout; temperature scaling available but not fitted for the shipped checkpoints |
-| **LLM / Agent** | OpenAI API compatible LLMs, custom tool-calling agent loop |
-| **RAG & Vector DB** | ChromaDB, BM25, Reciprocal Rank Fusion (RRF), Sentence Transformers |
-| **Backend API** | FastAPI, Uvicorn, Pydantic |
-| **Frontend Dashboard** | Streamlit |
-| **Report Generation** | Jinja2, WeasyPrint, Matplotlib, Plotly |
-| **MLOps & Tracking** | MLflow, PSI drift detection, custom feedback loop |
-| **Data** | VinBigData Chest X-ray dataset, NLM-CXR reports (3 900+ records) |
-| **Infrastructure** | Docker, Docker Compose, Nginx |
-| **Language & Tooling** | Python 3.10+, YAML configs, pyproject.toml |
+| Subsystem | Lines | Files | Test coverage |
+|---|---:|---:|---:|
+| `src/xclinvision/` core ML — modeling, training, inference, XAI, evaluation | 12,225 | 24 | **24%** |
+| `src/xclinvision/agent/` — LLM providers, RAG, reasoning, reporting | (of the above) | 11 | **38%** |
+| `app/backend/` — FastAPI, storage, auth | 3,247 | 6 | **74%** |
+| `app/frontend/` — Streamlit dashboard | 3,306 | 9 | **0%** |
+| `tests/` | 4,052 | 13 | — |
 
----
-
-## Architecture
+Overall statement coverage across measured packages: **38%** (6,425 statements, 3,974
+uncovered). The distribution is uneven and worth stating plainly: the API surface is well
+covered (`auth.py` 94%, `storage.py` 90%, `main.py` 71%), while `trainer.py`,
+`modeling.py` and `dataset.py` sit at **0%** and `xai.py` at **14%** — the training and
+explainability paths are exercised by hand, not by tests. The Streamlit frontend has no
+tests at all.
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      Streamlit Dashboard                            │
-│  Inference & XAI │ History & Comparison │ Reports │ Audit          │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │ HTTP / SSE (streaming)
-┌────────────────────────────▼────────────────────────────────────────┐
-│                        FastAPI Backend                              │
-│  /api/v1/*  predict · explain · report · feedback · metrics        │
-│  /api/v2/*  analyze · chat · chat/stream · compare ·               │
-│             generate-report · export-report ·                       │
-│             llm/providers · drift-metrics · model-card             │
-└──┬──────────────┬──────────────┬──────────────┬──────────────┬─────┘
-   │              │              │              │              │
-   ▼              ▼              ▼              ▼              ▼
-Inference    XAI Engine    Evaluator    ReasoningAgent    Monitoring
-Pipeline    (Grad-CAM++,  (Metrics,    (Intent → Plan →  (Drift,
-(PyTorch,    Score-CAM,   Calibration, Execute →         Feedback,
- TIMM,       Heatmaps,    Thresholds)  Synthesise)       Audit)
- GeM Pool)   Regions)                  │
-                                       ├─ LLM Provider
-                                       │   (OpenAI / local)
-                                       └─ RAG Retriever
-                                           (ChromaDB + BM25)
+Streamlit view ──HTTP/SSE──▶ FastAPI ──▶ InferencePipeline (PyTorch + MC-Dropout)
+                                    ├──▶ xai (Grad-CAM++ / Score-CAM)
+                                    ├──▶ XClinVisionAgent ──▶ LLM provider
+                                    │                    └──▶ HybridRetriever (Chroma + BM25, RRF)
+                                    └──▶ ClinicalReporter (Jinja2 → HTML/PDF)
 ```
 
 ---
 
-## Project Structure
+## Quickstart
+
+Verified from a clean clone into an empty virtualenv. **Read the ceiling first:** this
+gets you a running stack and a passing test suite, not working inference — model weights
+are not in the repository.
+
+```bash
+git clone <repo-url> xclinvision-ops && cd xclinvision-ops
+python -m venv .venv && source .venv/bin/activate
+
+# PyTorch is installed separately: the CUDA build is not in pyproject.toml.
+# The pair is not interchangeable — see the note in Installation below.
+pip install torch==2.11.0+cu130 torchvision==0.26.0+cu130 \
+    --index-url https://download.pytorch.org/whl/cu130
+
+pip install -e ".[dev]"
+
+python -m pytest tests/ -q          # 190 passed, 5 skipped
+```
+
+Five skips rather than three: three tests need the dataset on disk, and two need trained
+checkpoints. With both present the suite reports **192 passed, 3 skipped**.
+
+Then start the services:
+
+```bash
+cp .env.example .env                # set XCLINVISION_API_TOKEN or protected routes 503
+make api                            # backend on :8000
+make dashboard                      # dashboard on :8501, separate shell
+curl localhost:8000/health          # {"status":"healthy","version":"0.1.0",...}
+```
+
+Every command above was run against a fresh clone in an empty virtualenv before being
+written here. `/health` returns healthy; `/api/v2/analyze` returns the 503 described
+below.
+
+### What a clean clone cannot do
+
+`models/` is gitignored and ships only a `.gitkeep`, so **there are no checkpoints**.
+The services start and `/health` is green, but `/api/v1/predict`, `/api/v2/analyze` and
+`/api/v2/compare` return **503 "No model loaded"** until a `<name>.pth` plus matching
+`<name>_meta.json` exists in `models/best_models/`. Verified:
 
 ```
-xclinvision-ops/
-├── app/
-│   ├── backend/                        # FastAPI inference service
-│   │   ├── main.py                     #   All API endpoints (v1 + v2)
-│   │   ├── schemas.py                  #   Pydantic request/response models
-│   │   ├── Dockerfile                  #   Backend container image
-│   │   └── requirements.txt            #   Backend-specific dependencies
-│   └── frontend/                       # Streamlit clinician dashboard
-│       ├── main.py                     #   App entrypoint & page navigation
-│       ├── api_client.py               #   Backend HTTP client
-│       ├── config.py                   #   Frontend configuration & endpoints
-│       ├── styles.py                   #   Medical-themed CSS
-│       ├── Dockerfile                  #   Frontend container image
-│       ├── requirements.txt
-│       └── views/                      #   Dashboard pages
-│           ├── page_inference.py       #     Inference, XAI & chat
-│           ├── page_history.py         #     Historical comparison
-│           ├── page_report.py          #     Report generation & export
-│           └── page_audit.py           #     Audit & transparency
-├── src/xclinvision/                    # Core Python package
-│   ├── modeling.py                     #   Model architectures (GeM pooling, build_model)
-│   ├── inference.py                    #   Inference pipeline with uncertainty
-│   ├── processing.py                   #   DICOM/image processing pipeline
-│   ├── dataset.py                      #   PyTorch Dataset & Lightning DataModule
-│   ├── trainer.py                      #   Lightning training & transfer learning
-│   ├── evaluator.py                    #   Metrics, ECE calibration, threshold optimisation
-│   ├── xai.py                          #   Grad-CAM++ & Score-CAM explainability
-│   ├── config.py                       #   Configuration loading & class registry
-│   ├── monitoring.py                   #   Drift detection & prediction logging
-│   ├── reliability.py                  #   Uncertainty & failure analysis
-│   └── agent/                          #   Clinical decision-support agent
-│       ├── xclinvisionagent.py         #     Full LLM + RAG agent
-│       ├── reasoning.py                #     Intent → plan → execute → synthesise
-│       ├── tools.py                    #     7 callable tools + ToolRegistry
-│       ├── reporter.py                 #     Clinical HTML/PDF report generation
-│       ├── ingest_knowledge.py         #     RAG knowledge ingestion pipeline
-│       ├── dialogue.py                 #     Streaming dialogue management
-│       ├── guardrails.py               #     Safety guardrails
-│       ├── llm_provider.py             #     LLM provider abstraction (OpenAI, local)
-│       ├── audit.py                    #     Agent audit logging
-│       └── templates/
-│           └── clinical_report.html    #     Jinja2 clinical report template
-├── configs/                            # YAML configuration files
-│   ├── system.yaml                     #   Global: classes, paths, clinical rules
-│   ├── guardrail_terms.yaml            #   Agent safety vocabulary
-│   ├── convnext_small.yaml             #   ConvNeXt-Small (recommended)
-│   ├── densenet.yaml                   #   DenseNet-121
-│   ├── efficientnet_b0.yaml            #   EfficientNet-B0
-│   └── vit_base.yaml                   #   ViT-Base
-├── scripts/                            # CLI entry points
-│   ├── train.py                        #   Training
-│   ├── evaluate.py                     #   Evaluation with calibration & threshold tuning
-│   ├── generate_xai.py                 #   Grad-CAM++ / Score-CAM heatmap generation
-│   ├── download_data.py                #   Dataset download
-│   ├── organize_data.py                #   Data preparation & splitting
-│   ├── clean_system.sh                 #   Cache & temp cleanup
-│   └── run_training/                   #   Shell launchers (train all 4 models)
-├── data/                               # Data (gitignored)
-│   ├── raw/                            #   Original images
-│   ├── processed_384/                  #   Processed 384px
-│   ├── processed_1024_1024/            #   Processed 1024px
-│   └── vector_db/                      #   ChromaDB + BM25 for RAG
-├── models/
-│   └── best_models/                    # Production checkpoints (.pth + _meta.json)
-├── NLMCXR_reports/                     # IU CXR radiology reports (RAG source, gitignored)
-├── outputs/                            # Evaluation & XAI outputs (gitignored)
-├── logs/                               # Runtime logs (gitignored)
-├── notebooks/                          # Analysis notebooks
-├── deployment/                         # Production deployment
-│   ├── docker-compose.yml              #   Prod compose (backend + frontend + nginx)
-│   └── nginx.conf                      #   Reverse proxy with rate limiting
-├── tests/                              # Test suite
-├── docs/                               # Extended documentation & model card
-├── docker-compose.yml                  # Development compose
-├── Makefile                            # Common commands
-└── pyproject.toml                      # Package metadata
+$ curl -X POST localhost:8000/api/v2/analyze -H "Authorization: Bearer $TOKEN" -F file=@chest.png
+{"detail":"No model loaded. Ensure models exist in models/best_models/ and restart."}
 ```
+
+To get there you must train:
+
+```bash
+# 1. obtain VinBigData Chest X-ray (Kaggle) and organise it
+python scripts/organize_data.py --help
+# 2. train — GPU hours
+python scripts/train.py --config configs/convnext_small.yaml
+# 3. fit calibration and thresholds into the exported checkpoint
+python scripts/calibrate_checkpoints.py
+```
+
+`data/test_sample/` ships ~35 chest X-ray PNGs for exercising the UI once weights exist.
+
+The dev stack also runs under Docker, which has the same weights requirement:
+
+```bash
+docker-compose up --build           # backend + dashboard, volume-mounts models/ and data/
+```
+
+---
+
+## Known limitations
+
+**Two of the four classes are not usable on their own.** Pleural thickening and Pulmonary
+fibrosis reach 0.18 precision at 90% recall — roughly five false positives per true
+finding — against 0.57–0.61 for the two mediastinal classes. Their ranking is real
+(AUC 0.898–0.904); their precision at any clinically meaningful recall is not. This is a
+two-finding system, and calibration does not change that: the limit is separability.
+
+**Calibration is fitted, not independent.** ECE is now 0.015 on held-out test, but the fit
+used the same validation split as model selection and early stopping. No separate
+calibration split exists.
+
+**`horizontal_flip: true` contradicts the XAI layer's laterality claims.**
+`configs/system.yaml:9` flips images during training, teaching partial left/right
+invariance, while `src/xclinvision/xai.py:49-58` maps regions by anatomical side
+("Patient LEFT lung is on RIGHT of image") and reports render those labels as spatial
+evidence. Measured: flipping at inference costs at most 0.026 AUC and usually under
+0.005, but shifts per-image probabilities by 0.03–0.09. The model is largely insensitive
+to the laterality the XAI layer asserts. Current resolution: the flip stays enabled, the
+labels stay side-specific, and left/right attribution in reports should be treated as
+unverified.
+
+**XAI faithfulness is unvalidated.** Grad-CAM++, Score-CAM and attention rollout are
+displayed and embedded into exported reports, and **no faithfulness metric exists in the
+codebase** — no deletion/insertion curves, no sanity checks, no agreement against the
+bounding boxes the dataset ships. A convincing heatmap over a wrong prediction is the
+expected failure mode and nothing would catch it.
+
+**Patient-level leakage cannot be excluded.** No image appears in two splits, and a
+perceptual-hash sweep found 0 real duplicates across train/val among 96 candidates. But
+VinBigData ships no patient identifier, so the split is image-level; multiple studies of
+one patient could straddle splits undetected.
+
+**Authentication is one shared token.** `app/backend/auth.py` enforces a single bearer
+token and fails closed when unset, but there is no per-patient scoping, no RBAC, no
+per-user identity and no audit trail. Any holder of the token reads every stored analysis.
+
+**Also:** ImageNet pretraining rather than medical-domain; one institution, one country,
+no external validation; no subgroup analysis by age or sex (the dataset ships neither);
+MC-Dropout uncertainty reported but its calibration unvalidated.
+
+Full detail and ethical considerations: [`docs/MODEL_CARD.md`](docs/MODEL_CARD.md).
 
 ---
 
 ## Installation
 
-### Prerequisites
+Python 3.10+ (developed on 3.12). Optional NVIDIA GPU — CPU inference works.
 
-- Python 3.10+
-- Docker & Docker Compose (for containerised deployment)
-- NVIDIA GPU + CUDA (optional — CPU inference is supported)
+**The torch/torchvision pair is not interchangeable.** `torchvision 0.26.0` pins
+`torch==2.11.0`, and both wheels must carry the same CUDA build. torchvision checks this
+at *import* time, so a mismatch breaks every model load before a checkpoint is read:
 
-### 1. Clone
+```
+RuntimeError: Detected that PyTorch and torchvision were compiled with different
+CUDA major versions. PyTorch has CUDA Version=13.0 and torchvision has CUDA Version=12.8.
+```
+
+`pyproject.toml` pins the bare versions because a `+cu130` local tag is unsatisfiable
+from plain PyPI; the build comes from the `--index-url`. For CPU-only, swap `cu130` for
+`cpu` on **both** packages.
+
+*Gotcha:* a `torch` installed in `~/.local` (user site) takes precedence over your venv
+and will shadow it, producing the error above even when the environment is internally
+consistent. Check what actually loads:
 
 ```bash
-git clone https://github.com/your-org/xclinvision-ops.git
-cd xclinvision-ops
+python -c "import torch, torchvision; print(torch.__version__, torch.__file__); print(torchvision.__version__)"
 ```
 
-### 2. Create environment
+WeasyPrint (PDF export) needs system pango/cairo. On Debian/Ubuntu:
+`libpango-1.0-0 libpangoft2-1.0-0 libgdk-pixbuf-2.0-0 libffi-dev`.
 
-```bash
-# Conda (recommended)
-conda create -n xclinvision python=3.12 -y
-conda activate xclinvision
+### Environment
 
-# Or virtualenv
-python -m venv .venv && source .venv/bin/activate
-```
+`.env` is loaded by the backend and by docker-compose (compose env wins in Docker). See
+`.env.example` for the full list — none are strictly required except the API token:
 
-### 3. Install
-
-```bash
-pip install -e .          # production
-pip install -e ".[dev]"   # with linting & test tools
-```
-
-> **Note:** PyTorch is not included automatically due to CUDA variant selection.
-> Install the resolved pair separately, **before** the above:
-> ```bash
-> pip install torch==2.11.0+cu130 torchvision==0.26.0+cu130 \
->     --index-url https://download.pytorch.org/whl/cu130
-> ```
->
-> **The pair is not interchangeable.** `torchvision 0.26.0` pins `torch==2.11.0`, and
-> both wheels must carry the **same CUDA build (`cu130`)**. torchvision checks this at
-> *import* time, so a mismatch breaks every model load before a checkpoint is even read:
->
-> ```
-> RuntimeError: Detected that PyTorch and torchvision were compiled with different
-> CUDA major versions. PyTorch has CUDA Version=13.0 and torchvision has CUDA Version=12.8.
-> ```
->
-> `pyproject.toml` pins the bare versions (`torch==2.11.0`, `torchvision==0.26.0`) because a
-> `+cu130` local-version tag is unsatisfiable from plain PyPI. The `+cu130` build comes from
-> the `--index-url` above — which is why this step is separate. For a CPU-only or different
-> CUDA install, swap `cu130` for the matching channel (e.g. `cpu`) on **both** packages.
->
-> **Gotcha — user-site shadowing.** A `torch` installed in `~/.local` (user site) takes
-> precedence over the one in your conda/venv env and will silently shadow it, producing the
-> CUDA-mismatch error above even when the env itself is consistent. Verify what actually
-> loads:
-> ```bash
-> python -c "import torch, torchvision; print(torch.__version__, torch.__file__); print(torchvision.__version__)"
-> ```
-
-### 4. Create `.env`
-
-```bash
-cp .env.example .env
-# Then fill in OPENAI_API_KEY (optional but required for LLM features)
-```
-
----
-
-## Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `OPENAI_API_KEY` | — | Required for LLM-powered agent and report generation |
-| `OPENAI_MODEL` | `gpt-5.4-nano` | Primary chat/reasoning model |
-| `OPENAI_API_BASE` | OpenAI default | Custom base URL (Azure OpenAI, DeepSeek, etc.) |
-| `XCLINVISION_MODELS_DIR` | `models/best_models` | Directory scanned for `.pth` model checkpoints |
-| `XCLINVISION_DATA_DIR` | `data/processed_384` | Processed image data root |
-| `XCLINVISION_OUTPUTS_DIR` | `outputs/evaluation` | Evaluation output directory |
-| `XCLINVISION_ARCHITECTURE` | `convnext_small` | Default model architecture |
-| `XCLINVISION_IMAGE_SIZE` | `384` | Input image size |
-| `API_URL` | `http://localhost:8000` | Backend URL (used by the frontend) |
-
-All variables have defaults. The system will start without a `.env` file,but LLM features will fall back to rule-based responses.
-
----
-
-## LLM Integration
-
-### Supported Providers
-
-The `LLMProvider` abstraction in `src/xclinvision/agent/llm_provider.py`supports the following backends:
-
-| Provider | Class | How to Enable |
-|---|---|---|
-| **OpenAI** | `OpenAIProvider` | Set `OPENAI_API_KEY` |
-| **DeepSeek** | `OpenAIProvider` (compatible) | Set `OPENAI_API_KEY` + `OPENAI_API_BASE=https://api.deepseek.com/v1` |
-| **Gemini** | `OpenAIProvider` (compatible) | Set `OPENAI_API_KEY` + `OPENAI_API_BASE=https://generativelanguage.googleapis.com/v1beta/openai` |
-| **Local (Ollama/vLLM)** | `LocalProvider` | Set `OPENAI_API_BASE=http://localhost:11434/v1` (no key needed) |
-
-### Model selection & fallback
-
-```
-Primary model:   OPENAI_MODEL (default: gpt-5.4-nano)
-Fallback model:  gpt-4o-mini (automatic if primary fails)
-```
-
-The provider automatically:
-- Uses `max_completion_tokens` for gpt-5/o-series models and `max_tokens` for others
-- Falls back to `gpt-4o-mini` if the primary model returns a model-not-found error
-- Tests TCP reachability for local providers before attempting inference
-
-### Streaming
-
-The backend exposes Server-Sent Events (SSE) at `POST /api/v2/chat/stream`.The frontend chat panel consumes the stream via `requests` chunked transfer.Streaming falls back to non-streaming if the provider doesn't support it.
-
-### Switch providers at runtime
-
-```bash
-# List available providers
-curl http://localhost:8000/api/v2/llm/providers
-
-# Switch active provider
-curl -X POST http://localhost:8000/api/v2/llm/switch \
-  -H "Content-Type: application/json" \
-  -d '{"provider": "openai"}'
-
-# Health check
-curl http://localhost:8000/api/v2/llm/health
-```
-
----
-
-## RAG Pipeline
-
-The **HybridRetriever** combines ChromaDB semantic search with BM25 keyword search, fused via Reciprocal Rank Fusion (RRF).
-
-### Knowledge ingestion
-
-```bash
-python -m xclinvision.agent.ingest_knowledge \
-  --reports-dir NLMCXR_reports/ecgen-radiology \
-  --output-dir data/vector_db \
-  --embedding-model BAAI/bge-m3 \
-  --validate
-```
-
-This ingests:
-- **Indiana University CXR reports** (XML) — findings + impression sections
-- **Clinical guidelines** (PDF, HTML)
-- **Tabular annotations** (CSV, Excel)
-- **Synthetic clinical signals** (built-in)
-
-Output:
-- `data/vector_db/chroma/` — ChromaDB persistent store
-- `data/vector_db/bm25_index.pkl` — Serialised BM25 index
-
-### Retrieval during inference
-
-Each agent request retrieves the top-k relevant passages. These are injectedas context into the LLM system prompt, grounding responses in clinical evidence rather than hallucination.
-
-When `OPENAI_API_KEY` is not set, the agent uses rule-based synthesis withoutRAG retrieval.
-
----
-
-## Usage Guide
-
-### 1. Run an analysis
-
-Upload a chest X-ray via the **Inference & Explanation** dashboard page orsend it directly to the API:
-
-```bash
-curl -X POST http://localhost:8000/api/v2/analyze \
-  -F "file=@chest_xray.jpg" \
-  -F "patient_id=P-0001" \
-  -F "model_name=convnext_small"
-```
-
-You'll receive predictions, confidence scores, uncertainty level, an LLM summary, and XAI region scores.
-
-### 2. View explainability
-
-On the dashboard, the Grad-CAM++ overlay appears automatically after inference. To fetch it separately:
-
-```bash
-curl http://localhost:8000/api/v2/explain/{analysis_id}
-```
-
-You can switch between **Grad-CAM++**, **Score-CAM**, and **Attention** methods via the XAI method selector on the inference page.
-
-### 3. Chat with the agent
-
-Type free-text questions in the chat panel, or click quick-action chips:
-- *"Explain this prediction"*
-- *"What should be done next?"*
-- *"Assess urgency"*
-- *"Generate report"*
-
-Alternatively, call the streaming API:
-
-```bash
-curl -X POST http://localhost:8000/api/v2/chat/stream \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Explain the prediction", "analysis_id": "XCL-...", "context_type": "clinical"}'
-```
-
-### 4. Generate and export reports
-
-Navigate to **Report Generation**, edit findings/impressions/comments, then click:
-
-| Button | Action |
+| Variable | Purpose |
 |---|---|
-| **Save Draft** | Stores current text to session state |
-| **Generate AI Report** | Calls `/api/v2/generate-report` to auto-fill findings from the agent |
-| **Export HTML** | Calls `/api/v2/export-report` → downloads self-contained HTML with Grad-CAM overlays |
-| **Export PDF** | Calls `/api/v2/export-report` (WeasyPrint) → downloads PDF |
-| **Export JSON** | Downloads structured JSON report from local session data |
-
-### 5. Compare analyses
-
-On the **History** page, select a patient ID to view all past analyses. Use the **Manual Comparison** tab to upload two images side-by-side for direct comparison.
+| `XCLINVISION_API_TOKEN` | **Required.** Unset → every protected v2 endpoint returns 503 |
+| `OPENAI_API_KEY` | Optional. Without it, LLM features fall back to rule-based responses |
+| `OPENAI_API_BASE` | Points the OpenAI-compatible client elsewhere (DeepSeek, Gemini, Ollama, vLLM) |
+| `XCLINVISION_MODELS_DIR` | Checkpoint directory (default `models/best_models/`) |
+| `HEATMAP_STORE_MAX` | Heatmap blob retention (default 20,000 ≈ 4 GB) |
 
 ---
 
-## API Reference
+## API reference
 
 ### Core
 
@@ -428,300 +257,86 @@ On the **History** page, select a patient ID to view all past analyses. Use the 
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/api/v1/predict` | Simple prediction (image file) |
-| `POST` | `/api/v1/explain` | Grad-CAM++ explanation (image + model) |
-| `POST` | `/api/v2/analyze` | Full analysis: prediction + uncertainty + XAI + LLM summary |
-| `POST` | `/api/v2/compare` | Side-by-side comparison of two uploaded images |
-| `GET` | `/api/v2/explain/{analysis_id}` | Fetch explanation for stored analysis |
+| `POST` | `/api/v1/predict` | Simple prediction |
+| `POST` | `/api/v1/explain` | Grad-CAM++ explanation |
+| `POST` | `/api/v2/analyze` | Prediction + uncertainty + XAI + LLM summary |
+| `POST` | `/api/v2/compare` | Side-by-side comparison of two images |
+| `GET` | `/api/v2/explain/{analysis_id}` | Explanation for a stored analysis |
 | `GET` | `/api/v2/history/{patient_id}` | Patient analysis history |
 
-### Chat & Agent
+### Chat, reports, monitoring
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/api/v2/chat` | Non-streaming chat |
-| `POST` | `/api/v2/chat/stream` | Streaming chat (SSE) |
-| `GET` | `/api/v2/llm/providers` | List LLM providers |
-| `POST` | `/api/v2/llm/switch` | Switch active LLM provider |
-| `GET` | `/api/v2/llm/health` | LLM provider health check |
-
-### Reports
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/v2/generate-report` | Generate structured report sections |
-| `POST` | `/api/v2/export-report` | Export as HTML, PDF, or JSON |
-
-**Export-report request:**
-```json
-{
-  "analysis_id": "XCL-abc12345",
-  "format": "html",
-  "include_xai": true,
-  "include_uncertainty": true
-}
-```
-
-**Export-report response (HTML):**
-```json
-{
-  "html": "<html>...</html>",
-  "report_id": "RPT-a1b2c3d4",
-  "format": "html",
-  "timestamp": "2026-04-03T12:00:00"
-}
-```
-
-**Export-report response (PDF):**
-```json
-{
-  "pdf_base64": "JVBERi0x...",
-  "report_id": "RPT-a1b2c3d4",
-  "format": "pdf",
-  "timestamp": "2026-04-03T12:00:00"
-}
-```
-
-### Monitoring
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/v1/feedback` | Submit clinician feedback |
-| `POST` | `/api/v2/feedback` | Submit v2 feedback |
-| `GET` | `/api/v2/feedback-stats` | Aggregated feedback statistics |
-| `GET` | `/api/v2/drift-metrics` | Dataset drift monitoring metrics |
+| `POST` | `/api/v2/chat` · `/api/v2/chat/stream` | Chat, non-streaming and SSE |
+| `GET` | `/api/v2/llm/providers` · `/api/v2/llm/health` | Provider list and health |
+| `POST` | `/api/v2/llm/switch` | Switch active provider at runtime |
+| `POST` | `/api/v2/generate-report` | Structured report sections |
+| `POST` | `/api/v2/export-report` | Export HTML, PDF or JSON |
+| `POST` | `/api/v1/feedback` · `/api/v2/feedback` | Clinician feedback |
+| `GET` | `/api/v2/feedback-stats` · `/api/v2/drift-metrics` | Aggregates and drift |
 | `GET` | `/api/v2/model-card` | Model documentation + live stats |
 
----
+Both API versions are live: `/api/v1/*` is the simple predict/explain surface, `/api/v2/*`
+adds analyze, chat, streaming, compare, report export and drift.
 
-## Report Generation
-
-Clinical reports are generated via the `ClinicalReporter` class using a Jinja2 template (`src/xclinvision/agent/templates/clinical_report.html`). The template produces a fully self-contained HTML document with:
-
-- AI findings table showing the raw model probability per class (calibration pending refit — see TODO(calibration-refit))
-- Grad-CAM++ overlay embedded as base64 PNG
-- Radar/spider chart (prediction profile vs. normal baseline)
-- Reasoning trace and differential diagnosis
-- Impression, urgency, and next steps
-- Citations and clinical disclaimer
-- `@media print` CSS for browser/WeasyPrint PDF fidelity
-
-**PDF generation** requires WeasyPrint, installed automatically via `requirements.txt`. System libraries (`libpango`, `libcairo2`, etc.) are installed in the Docker image.
+**Export-report** takes `{analysis_id, format: html|pdf|json, include_xai,
+include_uncertainty}` and returns `{html|pdf_base64|json, report_id, format, timestamp}`.
 
 ---
 
-## Docker & Deployment
-
-### Development (docker-compose.yml)
+## Development
 
 ```bash
-# Build and start
-docker-compose up --build
-
-# Stop
-docker-compose down
+python -m pytest tests/ -v                                   # full suite
+python -m pytest tests/test_api_integration.py -v            # API only, no GPU or weights
+python -m pytest tests/ --cov=xclinvision --cov-report=term-missing
+make lint      # black --check + isort --check + flake8 + mypy
+make format    # black + isort
 ```
 
-Services:
-- `backend` → port `8000`
-- `frontend` → port `8501`
+Most API tests run without torch weights or a GPU — `tests/conftest.py` patches the
+pipeline with a mock. Preserve that when adding tests.
 
-Volumes: `models/best_models/` is mounted read-only into the backend.
+### Conventions worth knowing
 
-### Production (deployment/docker-compose.yml)
+- **Class names are config-driven.** Always go through `xclinvision.config.get_class_names()`
+  / `get_class_map()` / `is_multilabel()`; the source of truth is
+  `configs/system.yaml → model.class_names`. In multilabel mode `"No finding"` is filtered
+  out automatically, which is why four classes are served from a five-name list.
+- **Lazy imports in `src/xclinvision/__init__.py`.** Heavy ML deps load only when their
+  symbol is accessed.
+- **Models are auto-discovered** from `XCLINVISION_MODELS_DIR`. Drop `<name>.pth` plus
+  `<name>_meta.json` and the registry picks it up.
+- **Per-model YAMLs override `system.yaml`** at runtime; CLI flags override both.
 
-```bash
-docker-compose -f deployment/docker-compose.yml up -d
-```
+### Extending
 
-Adds an **nginx** reverse proxy on port `80`:
-- Rate limiting: 10 req/s per IP on `/api/*`
-- Upload limit: 20 MB
-- WebSocket passthrough for Streamlit
-
-### Environment variables in Docker
-
-Pass variables via `.env` file or inline:
-
-```yaml
-# docker-compose.yml
-services:
-  backend:
-    env_file: .env
-    environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-```
-
-### Required system libraries (backend image)
-
-The backend Dockerfile installs these for OpenCV and WeasyPrint:
-
-```
-libgl1  libglib2.0-0  libsm6  libxext6  libxrender-dev
-libpango-1.0-0  libpangocairo-1.0-0  libgdk-pixbuf-2.0-0
-libcairo2  libffi-dev
-```
-
----
-
-## Configuration
-
-### 1. `configs/system.yaml` — Global settings
-
-```yaml
-classification:
-  mode: multilabel
-  classes: [No finding, Cardiomegaly, Aortic enlargement, Pleural thickening, Pulmonary fibrosis]
-  n_classes: 5
-paths:
-  models_dir: models/best_models
-  data_dir: data/processed_384
-training:
-  batch_size: 16
-  image_size: 384
-```
-
-### 2. `configs/{model}.yaml` — Per-model training config
-
-```yaml
-name: convnext_small
-architecture:
-  backbone: convnext_small
-  pretrained: true
-  dropout_rate: 0.3
-input:
-  size: [384, 384]
-training:
-  loss: focal
-  pooling: gem
-transfer_learning:
-  differential_lr:
-    backbone_lr: 5.0e-5
-    head_lr: 5.0e-4
-```
-
-Model configs override system.yaml at runtime. Override any field via CLI:
-
-```bash
-python scripts/train.py --config configs/convnext_small.yaml \
-  --lr 1e-4 --epochs 50 --batch-size 32
-```
-
----
-
-## Testing
-
-```bash
-# Run all tests
-python -m pytest tests/ -v
-
-# Skip tests requiring GPU/torch
-python -m pytest tests/test_api_integration.py -v
-
-# Run with coverage
-python -m pytest tests/ --cov=src/xclinvision --cov-report=term-missing
-```
-
-All API integration tests use mocked inference pipelines — no GPU or weightsrequired.
-
----
-
-## Development Notes
-
-### Extending the system
-
-**Adding a new model:**
-1. Create `configs/{name}.yaml`
-2. Register the backbone in `src/xclinvision/modeling.py` → `build_model()`
-3. Train: `python scripts/train.py --config configs/{name}.yaml`
-4. Evaluate: `python scripts/evaluate.py ...`
-5. Copy `.pth` + `_meta.json` to `models/best_models/` — the backend auto-discovers it
-
-**Adding a new agent tool:**
-1. Define a function in `src/xclinvision/agent/tools.py` returning a `ToolResult`
-2. Register it in `build_default_tool_registry()`
-3. Map it to intents in `reasoning.py` → `_INTENT_TOOL_MAP`
-
-**Adding a new explainability method:**
-1. Implement in `src/xclinvision/xai.py`
-2. Register as a selectable method in the backend `explain` endpoint
-3. Expose via the XAI method selector in `page_inference.py`
-
-**Adding a new report template:**
-1. Create a Jinja2 HTML file in `src/xclinvision/agent/templates/`
-2. Load it by name in `ClinicalReporter.__init__()` or pass `template_name` to `generate_html()`
-
-### Request flow
-
-```
-Frontend button click
-  → api_client.py (requests.Session)
-  → FastAPI endpoint (main.py)
-  → xclinvision.inference.InferencePipeline  (model prediction)
-  → xclinvision.xai                          (heatmap generation)
-  → xclinvision.agent.XClinVisionAgent       (LLM + RAG synthesis)
-  → xclinvision.agent.reporter.ClinicalReporter  (HTML/PDF report)
-  → HTTP response → Streamlit widget
-```
-
----
-
-## Troubleshooting
-
-### Docker build
-
-| Error | Fix |
+| Goal | Steps |
 |---|---|
-| `Package 'libgdk-pixbuf2.0-0' has no installation candidate` | Debian Trixie renamed this package. Use `libgdk-pixbuf-2.0-0` (with dash before 2) in the Dockerfile |
-| `exit code: 100` during apt-get | A listed package doesn't exist in the base image's apt repo — check package names against the current Debian release |
+| New architecture | `configs/<name>.yaml` → register in `modeling.py::build_model` → train → drop into `models/best_models/` |
+| New agent tool | Add to `agent/tools.py` returning `ToolResult` → register in `build_default_tool_registry()` → map intent in `agent/reasoning.py::_INTENT_TOOL_MAP` |
+| New XAI method | Implement in `xai.py` → expose in the backend `explain` endpoint → add to the selector in `page_inference.py` |
+| New report template | Drop a Jinja2 file in `agent/templates/` → pass `template_name` to `ClinicalReporter.generate_html()` |
 
-### Runtime errors
+### Deployment
 
-| Error | Fix |
-|---|---|
-| `No module named 'tiktoken'` | Add `tiktoken>=0.5.0` to `app/backend/requirements.txt` and rebuild the Docker image |
-| `No module named 'dotenv'` | Add `python-dotenv>=1.0.0` to requirements |
-| `max_tokens is not supported` | OpenAI o-series/gpt-5 models require `max_completion_tokens`. The provider handles this automatically via `_completion_tokens_kwarg()` |
-| `500 Internal Server Error` on `/api/v2/export-report` | Check backend logs (`docker-compose logs backend`). Common causes: missing `tiktoken`, missing model weights, or agent import failure |
-| `Connection refused` to backend | Ensure the backend is healthy before the frontend starts. Use `depends_on: condition: service_healthy` in docker-compose |
-| Streaming response not appearing | Ensure the client is consuming SSE chunks incrementally (not buffering). The backend uses `StreamingResponse` with `text/event-stream` |
-
-### Configuration
-
-| Issue | Fix |
-|---|---|
-| "No models found" at startup | Set `XCLINVISION_MODELS_DIR` to the folder containing `.pth` files with matching `_meta.json` descriptors |
-| Agent responses are generic/non-medical | Set `OPENAI_API_KEY`. Without it the system falls back to rule-based response generation. Run the RAG ingestion pipeline to improve retrieval quality |
-| GPU not detected | Install NVIDIA Container Toolkit and add `deploy.resources.reservations.devices` to the backend service in docker-compose |
+`deployment/docker-compose.yml` is the production stack (adds nginx with rate limiting
+and a 20 MB upload cap); the root `docker-compose.yml` is dev-only. Neither lists
+`OPENAI_*` in its `environment:` block — an explicit entry there would override
+`env_file` and mask your `.env`.
 
 ---
 
-## Contributing
+## Documentation
 
-1. Fork and clone the repository
-2. Create a feature branch: `git checkout -b feat/your-feature`
-3. Install dev dependencies: `pip install -e ".[dev]"`
-4. Make changes, add or update tests
-5. Run the test suite: `python -m pytest tests/ -v`
-6. Format code: `black src/ app/ tests/ && isort src/ app/ tests/`
-7. Submit a pull request with a clear description of the change
-
-Please follow the existing code organisation:
-- ML logic → `src/xclinvision/`
-- API layer → `app/backend/main.py`
-- UI layer → `app/frontend/views/`
-
----
+| Document | Contents |
+|---|---|
+| [`docs/MODEL_CARD.md`](docs/MODEL_CARD.md) | Intended and out-of-scope use, training data, metrics, limitations, ethics |
+| [`docs/model_evaluation.md`](docs/model_evaluation.md) | Every measured number: per-class AUC/AP/ECE, calibration parameters, thresholds |
+| [`docs/reviews/`](docs/reviews/) | Review log — each issue mapped to the commit that fixed it |
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
-
----
-
-> These AI-generated findings are intended to assist — not replace — clinical judgement.
-> Always correlate with clinical presentation and consult a qualified radiologist.
-
----
-
-<div align="center">Built with ❤️ for better healthcare AI</div>
+MIT for the code. The dataset carries its own terms — see
+[`docs/MODEL_CARD.md`](docs/MODEL_CARD.md#training-data).

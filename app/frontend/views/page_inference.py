@@ -19,10 +19,10 @@ from styles import COLORS
 
 # Available trained models — maps UI label → architecture name sent to API
 AVAILABLE_MODELS = {
-    "ViT-Base (best — F1 0.59, AUC 0.925)": "vit_base",
-    "ConvNeXt-Small (F1 0.55, AUC 0.901)": "convnext_small",
-    "EfficientNet-B0 (F1 0.54, AUC 0.902)": "efficientnet_b0",
-    "DenseNet-121 (F1 0.52, AUC 0.890)": "densenet",
+    "ViT-Base (best — macro F1 0.63, AUC 0.93)": "vit_base",
+    "ConvNeXt-Small (macro F1 0.56, AUC 0.90)": "convnext_small",
+    "EfficientNet-B0 (macro F1 0.54, AUC 0.90)": "efficientnet_b0",
+    "DenseNet-121 (macro F1 0.53, AUC 0.89)": "densenet",
 }
 
 # Default XAI method per model architecture

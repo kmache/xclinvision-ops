@@ -2203,7 +2203,7 @@ async def get_drift_metrics(days: int = Query(default=30, ge=1, le=365)):
 @app.get("/api/v2/model-card")
 async def get_model_card():
     """Return structured model documentation and live stats."""
-    model_card_path = Path(__file__).parent.parent.parent / "docs" / "model_card.md"
+    model_card_path = Path(__file__).parent.parent.parent / "docs" / "MODEL_CARD.md"
     model_card_text = ""
     if model_card_path.exists():
         model_card_text = model_card_path.read_text()[:2000]
@@ -2243,14 +2243,23 @@ async def get_model_card():
         "performance": performance if performance else {
             "note": "No evaluation reports found. Run scripts/evaluate.py",
         },
+        # Measured limitations only. The previous list asserted specifics that
+        # were never measured ("subtle findings <5mm", "degrades on non-standard
+        # equipment"); an invented number is worse than no number. Figures below
+        # trace to docs/model_evaluation.md.
         "limitations": [
-            "Not validated for pediatric populations (<18 years)",
-            "Reduced performance for subtle findings <5mm",
-            "Trained on frontal view only (PA/AP)",
-            "May miss subtle interstitial patterns",
-            "Performance degrades on images from non-standard equipment",
+            "Not for clinical use — no regulatory clearance, no prospective validation",
+            "Pleural thickening and Pulmonary fibrosis reach only 0.18 precision at 90% "
+            "recall and are not usable as standalone findings",
+            "Calibration was fitted on the same validation split used for model selection",
+            "XAI heatmaps have no faithfulness validation",
+            "Trained on one institution's data (VinBigData, Vietnam); no external validation",
+            "Split is image-level — the dataset ships no patient identifier, so "
+            "patient-level leakage cannot be excluded",
+            "Single shared bearer token: no per-patient scoping, RBAC or audit trail",
         ],
-        "training_data": "VinBigData Chest X-ray (2021) — 14,304 frontal radiographs, 5-class multilabel (train 10,020 / val 2,133 / test 2,151)",
+        "training_data": "VinBigData Chest X-ray — 14,304 frontal radiographs, 4 served "
+                         "findings, multilabel (train 10,020 / val 2,133 / test 2,151)",
         "architectures_available": [
             "vit_base", "convnext_small", "efficientnet_b0", "densenet",
         ],

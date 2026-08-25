@@ -213,7 +213,7 @@ def build_model(
     classification_mode: str = "multilabel",
     pooling: str = "gem",
 ) -> nn.Module:
-    """Factory function to build state-of-the-art architectures.
+    """Factory function to build the supported backbone architectures.
     
     Supports both multilabel and multiclass classification:
       - multilabel: classifier bias initialised to -2.0 so sigmoid outputs
