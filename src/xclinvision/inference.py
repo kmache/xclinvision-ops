@@ -296,11 +296,17 @@ class InferencePipeline:
             if pred_class < len(self.class_names)
             else "Unknown",
             "probabilities": probs[0].cpu().numpy().tolist(),
+            # Honest name for the top-1 score. Until a temperature is fitted
+            # this is a raw sigmoid/softmax output, not a calibrated
+            # probability, so calling it "confidence" overstates it.
+            "raw_probability": confidence,
+            # Deprecated alias, kept populated so existing consumers (frontend,
+            # agent tools, stored analyses) keep working. Prefer
+            # raw_probability.
             "confidence": confidence,
             "class_names": self.class_names,
-            # False when no temperature was fitted: `confidence` is then a raw
-            # sigmoid/softmax output, not a calibrated probability. Every
-            # shipped checkpoint currently carries temperature=None.
+            # True only when a temperature was fitted. Every shipped checkpoint
+            # currently carries temperature=None.
             "calibrated": self.temperature_scaler is not None,
         }
         if self.multilabel:
@@ -400,8 +406,10 @@ class InferencePipeline:
                     if pred_class < len(self.class_names)
                     else "Unknown",
                     "probabilities": prob.tolist(),
-                    "confidence": float(prob[pred_class]),
+                    "raw_probability": float(prob[pred_class]),
+                    "confidence": float(prob[pred_class]),  # deprecated alias
                     "class_names": self.class_names,
+                    "calibrated": self.temperature_scaler is not None,
                 }
                 if self.multilabel:
                     result["predictions_multilabel"] = preds_binary.tolist()

@@ -306,3 +306,59 @@ def test_predict_reports_whether_probabilities_are_calibrated():
         _dummy_image(), return_uncertainty=False, return_explanation=False
     )
     assert result["calibrated"] is True
+
+
+def test_predict_exposes_raw_probability_with_confidence_alias():
+    """Issue 7: the served score is a raw sigmoid output, so name it accurately.
+
+    `confidence` stays populated — the frontend, the agent tools and already
+    stored analyses all read it, and the analyze response is additive-only.
+    """
+    pipe = _fixed_logit_pipeline(["A", "B"], [0.9, 0.2])
+
+    result = pipe.predict(_dummy_image(), return_uncertainty=False, return_explanation=False)
+
+    assert result["raw_probability"] == pytest.approx(0.9, abs=1e-3)
+    assert result["confidence"] == result["raw_probability"]
+    assert result["calibrated"] is False
+
+
+def test_analyze_response_exposes_raw_probability(client):
+    import io
+    from unittest.mock import MagicMock, patch
+
+    from PIL import Image
+
+    pipeline = MagicMock()
+    pipeline.predict.return_value = {
+        "prediction": 0,
+        "class_name": "Cardiomegaly",
+        "probabilities": [0.9, 0.1],
+        "raw_probability": 0.9,
+        "confidence": 0.9,
+        "calibrated": False,
+        "class_names": ["Cardiomegaly", "Aortic enlargement"],
+        "uncertainty": {"epistemic": 0.01},
+        "uncertainty_level": "low",
+        "explanation": {"key_findings": [], "visualization": {"region_scores": {}}},
+    }
+    pipeline.preprocess.return_value = (
+        np.zeros((3, 64, 64), dtype=np.float32),
+        np.zeros((64, 64, 3), dtype=np.uint8),
+    )
+
+    buf = io.BytesIO()
+    Image.fromarray(np.zeros((64, 64, 3), dtype=np.uint8)).save(buf, format="JPEG")
+
+    import main  # noqa: PLC0415
+
+    with patch.object(main, "get_pipeline", return_value=pipeline), \
+            patch.object(main, "_get_agent", side_effect=RuntimeError("no llm")):
+        response = client.post(
+            "/api/v2/analyze", files={"file": ("a.jpg", buf.getvalue(), "image/jpeg")}
+        )
+
+    body = response.json()
+    assert body["raw_probability"] == 0.9
+    assert body["confidence"] == 0.9      # decision 2: additive only
+    assert body["calibrated"] is False

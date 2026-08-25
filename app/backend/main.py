@@ -1173,6 +1173,9 @@ def analyze_image(
         "patient_id": patient_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "prediction": result["class_name"],
+        # raw_probability is the accurate name; confidence is a deprecated
+        # alias retained so existing consumers and stored analyses keep working.
+        "raw_probability": result.get("raw_probability", result["confidence"]),
         "confidence": result["confidence"],
         "uncertainty": result.get("uncertainty", {}),
         "uncertainty_level": result.get("uncertainty_level", "unknown"),

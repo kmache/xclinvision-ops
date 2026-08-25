@@ -43,7 +43,7 @@ XClinVision-Ops is a production-grade chest X-ray analysis platform combining mu
 |---|---|
 | **Model Inference** | 4 production architectures (ConvNeXt-Small, DenseNet-121, EfficientNet-B0, ViT-Base); auto-discovered model registry; multilabel classification across 5 chest pathology classes |
 | **Explainability** | Grad-CAM++ and Score-CAM heatmap overlays; attention maps; per-region clinical scoring; adjustable threshold & opacity |
-| **Uncertainty** | MC Dropout epistemic uncertainty; temperature scaling is implemented (`evaluator.TemperatureScaler`) but **no shipped checkpoint carries a fitted temperature**, so served probabilities are uncalibrated — responses report this as `calibrated: false` |
+| **Uncertainty** | MC Dropout epistemic uncertainty; temperature scaling is implemented (`evaluator.TemperatureScaler`) but **no shipped checkpoint carries a fitted temperature**, so served scores are uncalibrated. Responses expose `raw_probability` (the accurate name) with `calibrated: false`; `confidence` remains as a deprecated alias |
 | **LLM Agent** | Intent classification → tool planning → execution → LLM synthesis loop; 7 callable tools; streaming chat with quick-action chips |
 | **RAG** | ChromaDB + BM25 hybrid retrieval (RRF fusion) over 3 900+ IU CXR radiology reports; retrieval grounded in clinical evidence |
 | **Report Generation** | Full clinical reports via Jinja2 template; Grad-CAM++ overlay + radar chart; export as HTML, PDF (WeasyPrint), or JSON |
