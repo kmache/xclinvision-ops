@@ -316,10 +316,26 @@ def _build_pipeline(
     model.eval()
 
     temperature_value = None
+    calibration_status = None
     thresholds_dict = None
     if isinstance(checkpoint, dict):
         raw_temp = checkpoint.get("temperature")
-        if raw_temp is not None:
+        calibration_status = checkpoint.get("calibration_status")
+        if isinstance(raw_temp, (list, tuple)):
+            # Per-class affine calibration: one temperature and one bias per
+            # class. float() would raise here, which is why the sequence case
+            # is handled before the scalar one.
+            temperature_value = {
+                "temperature": [float(t) for t in raw_temp],
+                "bias": [float(b) for b in (checkpoint.get("calibration_bias") or [0.0] * len(raw_temp))],
+            }
+            logger.info(
+                "Loaded per-class calibration from payload: T=%s bias=%s status=%s",
+                [round(t, 4) for t in temperature_value["temperature"]],
+                [round(b, 4) for b in temperature_value["bias"]],
+                calibration_status or "(unset)",
+            )
+        elif raw_temp is not None:
             temperature_value = float(raw_temp)
             logger.info("Loaded temperature from payload: T=%.4f", temperature_value)
         else:
@@ -376,6 +392,7 @@ def _build_pipeline(
         dataset_mean=list(norm_stats["mean"]),
         dataset_std=list(norm_stats["std"]),
         temperature_scaler=temperature_value,
+        calibration_status=calibration_status,
         thresholds=thresholds_dict,
         priority_map=profile.priority_map,
         class_names=serving_class_names,

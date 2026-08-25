@@ -104,6 +104,7 @@ class InferencePipeline:
         dataset_std: Optional[List[float]] = None,
         thresholds: Optional[Dict[str, float]] = None,
         priority_map: Optional[Dict[str, str]] = None,
+        calibration_status: Optional[str] = None,
     ):
         """
         Args:
@@ -140,6 +141,14 @@ class InferencePipeline:
         self._priority_map = priority_map or {}
         #: One warning per pipeline, not per inference.
         self._warned_uncalibrated = False
+        #: Explicit verdict from the fit, carried in the checkpoint payload.
+        #: A fitted scaler is necessary but NOT sufficient to call the output
+        #: calibrated: the fit also has to have worked. Checkpoints whose
+        #: held-out ECE stayed above the quality bar keep "uncalibrated" even
+        #: though they carry parameters, so the report layer keeps hedging the
+        #: language. None falls back to "a scaler exists", which is what a
+        #: caller constructing a pipeline by hand means.
+        self._calibration_status = calibration_status
         # Cache a torch tensor version on the correct device for GPU-side comparison
         self._threshold_tensor = torch.tensor(
             self._threshold_array, device=self.device, dtype=torch.float32
@@ -214,6 +223,57 @@ class InferencePipeline:
     # -----------------------------------------------------------------------
     # Temperature scaling helper (DRY — used by predict, predict_batch, compute_uncertainty)
     # -----------------------------------------------------------------------
+    def _is_calibrated(self) -> bool:
+        """Whether served probabilities may be described as calibrated.
+
+        Requires both a fitted scaler and, when the checkpoint states one, a
+        calibration_status of "calibrated". A checkpoint whose fit failed to
+        clear the ECE bar carries its parameters but stays "uncalibrated".
+        """
+        if self.temperature_scaler is None:
+            return False
+        if self._calibration_status is not None:
+            return self._calibration_status == "calibrated"
+        return True
+
+    def _per_class_calibration(self):
+        """Return ``(T, bias)`` tensors when calibration is per-class, else None.
+
+        Accepts the three shapes a checkpoint or caller can supply: a fitted
+        ``TemperatureScaler`` whose ``temperature`` is a sequence, a bare
+        sequence of temperatures, or a ``{"temperature": [...], "bias": [...]}``
+        mapping as stored in the exported ``.pth`` payload.
+        """
+        scaler = self.temperature_scaler
+        temps = bias = None
+
+        if isinstance(scaler, dict):
+            temps, bias = scaler.get("temperature"), scaler.get("bias")
+        elif isinstance(scaler, (list, tuple)):
+            temps, bias = scaler, None
+        elif hasattr(scaler, "temperature") and isinstance(
+            getattr(scaler, "temperature"), (list, tuple)
+        ):
+            temps, bias = scaler.temperature, getattr(scaler, "bias", None)
+
+        if not isinstance(temps, (list, tuple)):
+            return None
+
+        n = len(self.class_names)
+        if len(temps) != n:
+            logger.warning(
+                "Per-class temperature has %d entries but the model serves %d "
+                "classes; ignoring calibration.", len(temps), n,
+            )
+            return None
+
+        t = torch.tensor([max(float(x), 1e-4) for x in temps], dtype=torch.float32)
+        b = torch.zeros(n, dtype=torch.float32)
+        if isinstance(bias, (list, tuple)) and len(bias) == n:
+            b = torch.tensor([float(x) for x in bias], dtype=torch.float32)
+        self._calibration_is_per_class = True
+        return t, b
+
     def _apply_temperature(self, logits: torch.Tensor) -> torch.Tensor:
         """Apply temperature scaling to raw logits BEFORE activation.
 
@@ -222,9 +282,16 @@ class InferencePipeline:
         or softmax is applied.  This must happen before any activation.
 
         Supports:
-        - TemperatureScaler objects (.temperature float attribute)
+        - TemperatureScaler objects (.temperature float attribute, optional .bias)
         - Raw float/int temperature values
+        - Per-class sequences: ``[T0, T1, ...]`` or ``{"temperature": [...],
+          "bias": [...]}`` — applied elementwise as ``z / T + b``
         - Torch Tensor temperature values
+
+        The bias term matters here. Temperature alone can only pull logits
+        toward or away from zero, so it cannot remove a systematic offset;
+        these checkpoints trained with pos_weight 5.1-15.2 and carry exactly
+        such an offset. See ``TemperatureScaler.fit_per_class``.
         """
         if self.temperature_scaler is None:
             if not self._warned_uncalibrated:
@@ -234,6 +301,12 @@ class InferencePipeline:
                     "are uncalibrated.", self.architecture,
                 )
             return logits
+
+        # --- per-class affine: z / T + b, one T and b per class ------------
+        vec = self._per_class_calibration()
+        if vec is not None:
+            t_vec, b_vec = vec
+            return logits / t_vec.to(logits.device) + b_vec.to(logits.device)
 
         # Extract the scalar T from whichever representation we have
         if isinstance(self.temperature_scaler, (int, float)):
@@ -401,12 +474,11 @@ class InferencePipeline:
             "confidence": confidence,
             "class_names": self.class_names,
             "thresholds": [float(t) for t in self._threshold_array],
-            # True only when a temperature was fitted. Every shipped checkpoint
-            # currently carries temperature=None.
-            "calibrated": self.temperature_scaler is not None,
-            "calibration_status": (
-                "calibrated" if self.temperature_scaler is not None else "uncalibrated"
-            ),
+            # A fitted scaler is necessary but not sufficient: the checkpoint
+            # also has to have passed the held-out ECE bar at fit time. See
+            # self._calibration_status.
+            "calibrated": self._is_calibrated(),
+            "calibration_status": ("calibrated" if self._is_calibrated() else "uncalibrated"),
         }
         if self.multilabel:
             result["predictions_multilabel"] = preds_binary.cpu().tolist()

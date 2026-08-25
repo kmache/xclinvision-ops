@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -518,7 +519,15 @@ class TemperatureScaler:
 
     def __init__(self):
         self.temperature: float = 1.0
+        #: Per-class bias, populated only by :meth:`fit_per_class`. ``None``
+        #: means pure temperature scaling (the b = 0 special case).
+        self.bias: Optional[List[float]] = None
         self._is_fitted: bool = False
+
+    @property
+    def is_per_class(self) -> bool:
+        """True when :attr:`temperature` holds one value per class."""
+        return isinstance(self.temperature, (list, tuple, np.ndarray))
 
     def fit(
         self,
@@ -574,6 +583,79 @@ class TemperatureScaler:
         )
         return self.temperature
 
+    def fit_per_class(
+        self,
+        logits: np.ndarray,
+        y_true: np.ndarray,
+        *,
+        with_bias: bool = True,
+    ) -> Tuple[List[float], List[float]]:
+        """Fit one affine calibrator per class: ``p = sigmoid(z / T + b)``.
+
+        A single global temperature averages every class's miscalibration into
+        one scalar, which on this task fits T ~ 1.0 and does nothing. Fitting
+        per class recovers the per-label scale.
+
+        ``with_bias`` is what makes this usable here. Temperature scaling can
+        only pull logits toward or away from zero; it cannot *shift* them, so
+        it cannot correct a systematic offset. These models carry exactly such
+        an offset — training used pos_weight 5.1-15.2, which biases every head
+        toward positive — and the fitted bias comes out strongly negative on
+        every class. With b fixed at 0 the residual ECE stays around 0.17-0.28;
+        with b free it drops to roughly 0.015. Pass ``with_bias=False`` for
+        textbook temperature scaling (T only).
+
+        Both parameters are fitted by L-BFGS on per-class binary NLL. Fit this
+        on a validation split, never on test.
+
+        Args:
+            logits: Raw model logits, shape (N, C).
+            y_true: Binary ground truth, shape (N, C).
+            with_bias: Fit the offset. False gives temperature-only.
+
+        Returns:
+            ``(temperatures, biases)`` — one entry per class. Biases are all
+            zero when ``with_bias`` is False.
+        """
+        logits = np.asarray(logits, dtype=np.float32)
+        y_true = np.asarray(y_true, dtype=np.float32)
+        if logits.shape != y_true.shape:
+            raise ValueError(
+                f"logits {logits.shape} and y_true {y_true.shape} must have the same shape"
+            )
+
+        temps: List[float] = []
+        biases: List[float] = []
+
+        for c in range(logits.shape[1]):
+            z = torch.from_numpy(logits[:, c])
+            y = torch.from_numpy(y_true[:, c])
+
+            log_t = torch.zeros(1, requires_grad=True)
+            b = torch.zeros(1, requires_grad=True)
+            params = [log_t, b] if with_bias else [log_t]
+            optimizer = torch.optim.LBFGS(params, lr=0.1, max_iter=200)
+
+            def eval_fn():
+                optimizer.zero_grad()
+                scaled = z / torch.exp(log_t) + (b if with_bias else 0.0)
+                loss = F.binary_cross_entropy_with_logits(scaled, y)
+                loss.backward()
+                return loss
+
+            optimizer.step(eval_fn)
+            temps.append(max(float(torch.exp(log_t).item()), 1e-4))
+            biases.append(float(b.item()) if with_bias else 0.0)
+
+        self.temperature = temps
+        self.bias = biases
+        self._is_fitted = True
+        logger.info(
+            "Per-class calibration fitted: T=%s bias=%s",
+            [round(t, 4) for t in temps], [round(x, 4) for x in biases],
+        )
+        return temps, biases
+
     def scale(self, logits: np.ndarray) -> np.ndarray:
         """Divide raw logits by the learned temperature.
 
@@ -588,6 +670,10 @@ class TemperatureScaler:
                 "TemperatureScaler.scale() called before fit() – "
                 "returning unscaled logits (T=1.0)."
             )
+        if self.is_per_class:
+            t = np.asarray(self.temperature, dtype=np.float32)
+            b = np.asarray(self.bias if self.bias is not None else 0.0, dtype=np.float32)
+            return logits / np.maximum(t, 1e-4) + b
         return logits / max(self.temperature, 1e-4)
 
     def predict_proba(
@@ -609,20 +695,34 @@ class TemperatureScaler:
         return exp / np.sum(exp, axis=1, keepdims=True)
 
     def save(self, path: str) -> None:
-        """Persist the learned temperature to disk."""
+        """Persist the learned calibration to disk.
+
+        Writes ``bias`` alongside ``temperature`` so a per-class affine fit
+        round-trips; the key is absent for a scalar fit.
+        """
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, object] = {"temperature": self.temperature}
+        if self.bias is not None:
+            payload["bias"] = self.bias
         with open(p, "w") as f:
-            json.dump({"temperature": self.temperature}, f, indent=2)
+            json.dump(payload, f, indent=2)
         logger.info(f"TemperatureScaler saved to {p}")
 
     def load(self, path: str) -> None:
-        """Load a previously saved temperature from disk."""
+        """Load a previously saved calibration from disk."""
         with open(path) as f:
             data = json.load(f)
-        self.temperature = float(data["temperature"])
+        raw = data["temperature"]
+        if isinstance(raw, (list, tuple)):
+            self.temperature = [float(t) for t in raw]
+            self.bias = [float(b) for b in data.get("bias", [0.0] * len(raw))]
+            logger.info("TemperatureScaler loaded per-class: T = %s", self.temperature)
+        else:
+            self.temperature = float(raw)
+            self.bias = None
+            logger.info(f"TemperatureScaler loaded: T = {self.temperature:.4f}")
         self._is_fitted = True
-        logger.info(f"TemperatureScaler loaded: T = {self.temperature:.4f}")
 
 
 # ---------------------------------------------------------------------------

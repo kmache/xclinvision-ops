@@ -186,6 +186,10 @@ def _dummy_image():
     return (np.random.rand(64, 64, 3) * 255).astype(np.uint8)
 
 
+def _sigmoid(z):
+    return 1.0 / (1.0 + np.exp(-z))
+
+
 def test_headline_finding_is_not_lowest_class_index():
     """Tier order must beat class-index order when the two disagree.
 
@@ -311,6 +315,21 @@ def test_analyze_response_carries_every_positive_label(client):
     assert detail[3]["probability"] == pytest.approx(0.97, abs=1e-3)
     assert all(set(d) == {"class_name", "probability", "threshold", "positive"} for d in detail)
 
+def _biased_multilabel_logits(seed=0, n=4096, c=4):
+    """Logits carrying the failure mode the served checkpoints actually have.
+
+    Each class is shifted positive by a different amount, which is what training
+    with pos_weight 5.1-15.2 produces, and prevalence is low. Temperature alone
+    cannot correct a shift, so this distinguishes scale-fixing from bias-fixing.
+    """
+    rng = np.random.default_rng(seed)
+    shifts = np.linspace(1.5, 3.0, c)
+    latent = rng.normal(0.0, 1.5, size=(n, c))
+    y_true = (latent > 1.2).astype(np.float32)          # ~11% prevalence
+    logits = latent + shifts                             # systematically over-positive
+    return logits.astype(np.float32), y_true
+
+
 def test_fitted_temperature_reduces_ece_on_overconfident_logits():
     """Issue 7: replaces `assert hasattr(ts, 'temperature')`, which was always true.
 
@@ -341,6 +360,75 @@ def test_fitted_temperature_reduces_ece_on_overconfident_logits():
     assert ece_scaled < ece_raw, (
         f"temperature {temperature:.3f} did not improve calibration: "
         f"ECE {ece_raw:.4f} -> {ece_scaled:.4f}"
+    )
+
+
+def test_per_class_affine_fit_beats_a_global_temperature():
+    """The fit actually shipped must beat the one it replaced.
+
+    A single global temperature averages four different per-class errors into
+    one scalar; on biased logits it lands near T=1 and barely moves ECE. This
+    exercises TemperatureScaler.fit_per_class, the code path that produced the
+    parameters now stored in every served checkpoint.
+    """
+    from xclinvision.evaluator import CalibrationAnalyzer, TemperatureScaler
+
+    analyzer = CalibrationAnalyzer()
+    logits, y_true = _biased_multilabel_logits()
+
+    ece_raw = analyzer.compute_ece(y_true, _sigmoid(logits), multilabel=True)
+
+    global_scaler = TemperatureScaler()
+    t_global = global_scaler.fit(logits, y_true, multilabel=True)
+    ece_global = analyzer.compute_ece(
+        y_true, _sigmoid(logits / t_global), multilabel=True
+    )
+
+    per_class = TemperatureScaler()
+    temps, biases = per_class.fit_per_class(logits, y_true)
+    ece_per_class = analyzer.compute_ece(
+        y_true, _sigmoid(logits / np.array(temps) + np.array(biases)), multilabel=True
+    )
+
+    assert len(temps) == logits.shape[1]
+    assert all(t > 0 for t in temps)
+    # The fitted bias must be negative: these logits are shifted positive.
+    assert all(b < 0 for b in biases), f"expected negative biases, got {biases}"
+    assert ece_per_class < ece_global < ece_raw + 1e-9, (
+        f"raw {ece_raw:.4f} -> global {ece_global:.4f} -> per-class {ece_per_class:.4f}"
+    )
+    # Not a marginal win: bias correction is the whole point.
+    assert ece_per_class < ece_raw / 2
+
+
+def test_temperature_only_fit_cannot_remove_a_bias():
+    """Documents why the shipped fit carries a bias term.
+
+    With b pinned to 0 the residual stays large on shifted logits; freeing b
+    collapses it. If this ever inverts, the bias term is no longer earning its
+    place in the payload.
+    """
+    from xclinvision.evaluator import CalibrationAnalyzer, TemperatureScaler
+
+    analyzer = CalibrationAnalyzer()
+    logits, y_true = _biased_multilabel_logits()
+
+    t_only = TemperatureScaler()
+    temps, biases = t_only.fit_per_class(logits, y_true, with_bias=False)
+    assert biases == [0.0] * logits.shape[1]
+    ece_t_only = analyzer.compute_ece(
+        y_true, _sigmoid(logits / np.array(temps)), multilabel=True
+    )
+
+    affine = TemperatureScaler()
+    a_temps, a_biases = affine.fit_per_class(logits, y_true, with_bias=True)
+    ece_affine = analyzer.compute_ece(
+        y_true, _sigmoid(logits / np.array(a_temps) + np.array(a_biases)), multilabel=True
+    )
+
+    assert ece_affine < ece_t_only, (
+        f"bias term did not help: temperature-only {ece_t_only:.4f} vs "
+        f"affine {ece_affine:.4f}"
     )
 
 
@@ -488,3 +576,126 @@ def test_uncalibrated_report_uses_no_certainty_language():
         for r in calibrate_predictions(class_names, probabilities, None, calibrated=True)
     ]
     assert calibrated_terms[0] == "Highly suggestive"
+
+
+# ---------------------------------------------------------------------------
+# Per-class calibration reaches the served predictions
+# ---------------------------------------------------------------------------
+
+def test_per_class_calibration_changes_served_probabilities():
+    """A stored calibration must actually move the numbers.
+
+    Before this was fitted, every checkpoint carried temperature=None and
+    _apply_temperature returned the logits untouched, so "calibrated" would
+    have been a label on raw sigmoid output.
+    """
+    names = ["A", "B", "C", "D"]
+    raw_probs = [0.90, 0.75, 0.60, 0.40]
+
+    uncalibrated = _fixed_logit_pipeline(names, raw_probs)
+    before = uncalibrated.predict(
+        _dummy_image(), return_uncertainty=False, return_explanation=False
+    )["probabilities"]
+
+    calibrated = _fixed_logit_pipeline(names, raw_probs)
+    calibrated.temperature_scaler = {
+        "temperature": [0.55, 0.60, 0.65, 0.50],
+        "bias": [-2.0, -1.7, -3.4, -2.9],
+    }
+    calibrated._calibration_status = "calibrated"
+    after = calibrated.predict(
+        _dummy_image(), return_uncertainty=False, return_explanation=False
+    )
+
+    assert after["calibrated"] is True
+    assert after["calibration_status"] == "calibrated"
+    assert after["probabilities"] != before
+    # Negative bias must pull probabilities down, not merely perturb them.
+    assert all(a < b for a, b in zip(after["probabilities"], before))
+
+
+def test_calibration_status_gates_the_calibrated_flag():
+    """Carrying parameters is not the same as being calibrated.
+
+    A checkpoint whose fit failed the held-out ECE bar still stores its
+    parameters — they are applied — but must keep reporting "uncalibrated" so
+    the report layer keeps hedging the language.
+    """
+    names = ["A", "B"]
+    pipe = _fixed_logit_pipeline(names, [0.9, 0.2])
+    pipe.temperature_scaler = {"temperature": [0.6, 0.6], "bias": [-2.0, -2.0]}
+    pipe._calibration_status = "uncalibrated"
+
+    result = pipe.predict(
+        _dummy_image(), return_uncertainty=False, return_explanation=False
+    )
+    assert result["calibrated"] is False
+    assert result["calibration_status"] == "uncalibrated"
+
+    # The scaling is still applied — only the label is withheld.
+    raw = _fixed_logit_pipeline(names, [0.9, 0.2]).predict(
+        _dummy_image(), return_uncertainty=False, return_explanation=False
+    )["probabilities"]
+    assert result["probabilities"] != raw
+
+
+def test_mismatched_per_class_calibration_length_is_ignored():
+    """A calibration vector that does not match the class count must not apply.
+
+    Silently broadcasting or truncating would scale the wrong class, which is
+    worse than serving raw probabilities.
+    """
+    names = ["A", "B", "C"]
+    pipe = _fixed_logit_pipeline(names, [0.9, 0.5, 0.2])
+    pipe.temperature_scaler = {"temperature": [0.5, 0.5], "bias": [-2.0, -2.0]}
+
+    result = pipe.predict(
+        _dummy_image(), return_uncertainty=False, return_explanation=False
+    )
+    raw = _fixed_logit_pipeline(names, [0.9, 0.5, 0.2]).predict(
+        _dummy_image(), return_uncertainty=False, return_explanation=False
+    )["probabilities"]
+    assert result["probabilities"] == pytest.approx(raw, abs=1e-6)
+
+
+def test_served_checkpoints_carry_a_fitted_per_class_calibration():
+    """Every exported checkpoint must state its calibration, or say it has none.
+
+    Skipped when the weights directory is absent (CI without model artefacts).
+    """
+    import glob
+    import json
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    metas = sorted(glob.glob(str(repo / "models" / "best_models" / "*_meta.json")))
+    if not metas:
+        pytest.skip("no exported checkpoints on this machine")
+
+    for mp in metas:
+        meta = json.loads(Path(mp).read_text())
+        name = meta["model_name"]
+        temps = meta.get("temperature")
+        assert isinstance(temps, list), f"{name}: temperature is not per-class ({temps!r})"
+        assert len(temps) == len(meta["class_names"]), f"{name}: wrong temperature length"
+        assert all(t > 0 for t in temps), f"{name}: non-positive temperature"
+
+        biases = meta.get("calibration_bias")
+        assert isinstance(biases, list) and len(biases) == len(temps), f"{name}: bias missing"
+
+        status = meta.get("calibration_status")
+        assert status in {"calibrated", "uncalibrated"}, f"{name}: bad status {status!r}"
+
+        ece = meta.get("calibration_ece") or {}
+        before, after = ece.get("val_before"), ece.get("val_after")
+        assert before and after, f"{name}: calibration_ece not recorded"
+        mean_before = sum(before.values()) / len(before)
+        mean_after = sum(after.values()) / len(after)
+        if status == "calibrated":
+            assert mean_after < mean_before, (
+                f"{name} claims calibrated but ECE did not improve: "
+                f"{mean_before:.4f} -> {mean_after:.4f}"
+            )
+            assert mean_after <= 0.05, (
+                f"{name} claims calibrated at mean ECE {mean_after:.4f}, above the 0.05 bar"
+            )
