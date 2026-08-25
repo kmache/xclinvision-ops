@@ -313,6 +313,13 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
         if raw_temp is not None:
             temperature_value = float(raw_temp)
             logger.info("Loaded temperature from payload: T=%.4f", temperature_value)
+        else:
+            logger.warning(
+                "Model '%s' carries no temperature: probabilities are UNCALIBRATED. "
+                "Fit one with scripts/evaluate.py and re-export before relying on "
+                "confidence values clinically.",
+                architecture,
+            )
         raw_thresh = checkpoint.get("thresholds")
         if isinstance(raw_thresh, dict):
             thresholds_dict = {str(k): float(v) for k, v in raw_thresh.items()}
@@ -1169,6 +1176,8 @@ def analyze_image(
         "confidence": result["confidence"],
         "uncertainty": result.get("uncertainty", {}),
         "uncertainty_level": result.get("uncertainty_level", "unknown"),
+        # Whether `confidence` is a calibrated probability or a raw model output.
+        "calibrated": result.get("calibrated", False),
         "top_k_predictions": top_k,
         # Every label that crossed its threshold, not just the headline one.
         # These were computed by the pipeline and then dropped here, so a

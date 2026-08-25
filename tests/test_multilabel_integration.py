@@ -121,14 +121,6 @@ def test_save_predictions_multilabel_serializable():
     json.dumps(data)  # should not raise
 
 # ---- Temperature scaling guard ----
-def test_temperature_scaler_skipped_for_multilabel():
-    """TemperatureScaler.fit should not be called when is_multilabel() is True."""
-    from xclinvision.config import is_multilabel
-    if is_multilabel():
-        from xclinvision.evaluator import TemperatureScaler
-        ts = TemperatureScaler()
-        # In multilabel mode, scaler should either not fit or return identity
-        assert hasattr(ts, 'temperature')
 
 # ---- Failure analysis ----
 def test_failure_analyzer_multilabel():
@@ -272,3 +264,45 @@ def test_analyze_response_carries_every_positive_label(client):
     body = response.json()
     assert body["class_names_predicted"] == ["Pulmonary fibrosis", "Cardiomegaly"]
     assert body["predictions_multilabel"] == [1, 0, 0, 1]
+
+def test_temperature_scaler_actually_changes_probabilities():
+    """Issue 7: this previously asserted only hasattr(ts, 'temperature') — always true.
+
+    A fitted scaler must measurably flatten overconfident logits, otherwise
+    "calibrated confidence" is a claim with nothing behind it.
+    """
+    import torch
+
+    from xclinvision.evaluator import TemperatureScaler
+
+    rng = np.random.default_rng(0)
+    # Overconfident model: large-magnitude logits, labels agreeing only ~70%.
+    logits = rng.normal(0.0, 6.0, size=(512, 4))
+    y_true = (logits + rng.normal(0.0, 4.0, size=logits.shape) > 0).astype(np.float32)
+
+    scaler = TemperatureScaler()
+    temperature = scaler.fit(logits, y_true, multilabel=True)
+
+    assert temperature > 0
+    raw = torch.sigmoid(torch.tensor(logits)).numpy()
+    scaled = torch.sigmoid(torch.tensor(logits) / temperature).numpy()
+    # Temperature scaling must move the probabilities, not return identity.
+    assert not np.allclose(raw, scaled), f"T={temperature} left probabilities unchanged"
+
+
+def test_predict_reports_whether_probabilities_are_calibrated():
+    """Issue 7: no shipped checkpoint carries a temperature, so say so."""
+    names = ["A", "B"]
+
+    uncalibrated = _fixed_logit_pipeline(names, [0.9, 0.2])
+    result = uncalibrated.predict(
+        _dummy_image(), return_uncertainty=False, return_explanation=False
+    )
+    assert result["calibrated"] is False
+
+    calibrated = _fixed_logit_pipeline(names, [0.9, 0.2])
+    calibrated.temperature_scaler = 1.5
+    result = calibrated.predict(
+        _dummy_image(), return_uncertainty=False, return_explanation=False
+    )
+    assert result["calibrated"] is True

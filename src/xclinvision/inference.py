@@ -298,6 +298,10 @@ class InferencePipeline:
             "probabilities": probs[0].cpu().numpy().tolist(),
             "confidence": confidence,
             "class_names": self.class_names,
+            # False when no temperature was fitted: `confidence` is then a raw
+            # sigmoid/softmax output, not a calibrated probability. Every
+            # shipped checkpoint currently carries temperature=None.
+            "calibrated": self.temperature_scaler is not None,
         }
         if self.multilabel:
             result["predictions_multilabel"] = preds_binary.cpu().tolist()
