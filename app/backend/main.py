@@ -167,6 +167,18 @@ def _discover_models() -> Dict[str, dict]:
             if not pth_path.exists():
                 logger.warning("Model checkpoint not found for %s: %s", arch, pth_path)
                 continue
+            # Serving labels come from configs/system.yaml, but the checkpoint
+            # carries its own class_names. If they disagree, every prediction
+            # this model produces would be mislabelled with no error anywhere,
+            # so refuse to register it rather than serve a wrong diagnosis.
+            meta_classes = meta.get("class_names")
+            if meta_classes is not None and list(meta_classes) != get_class_names():
+                logger.error(
+                    "Refusing model '%s': class_names %s do not match "
+                    "configs/system.yaml %s. Predictions would be mislabelled.",
+                    arch, list(meta_classes), get_class_names(),
+                )
+                continue
             meta["_pth_path"] = str(pth_path)
             meta["_meta_path"] = str(meta_file)
             registry[arch] = meta
@@ -193,19 +205,40 @@ def _build_pipeline(model_path: str, architecture: str, image_size: int):
 
     checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
 
+    def _load_checked(state_dict: dict, kind: str) -> None:
+        """load_state_dict(strict=False) + refuse a partial load.
+
+        strict=False is needed to tolerate benign extras (aux heads, buffers),
+        but it also silently accepts a checkpoint whose keys do not match the
+        architecture at all — leaving a randomly-initialised network to serve
+        clinical predictions behind an INFO log. Missing keys are therefore
+        treated as fatal.
+        """
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        if incompatible.missing_keys:
+            raise ValueError(
+                f"{kind} {model_path} left {len(incompatible.missing_keys)} parameter(s) "
+                f"uninitialised (first: {incompatible.missing_keys[:3]}); "
+                f"architecture '{architecture}' does not match this checkpoint."
+            )
+        if incompatible.unexpected_keys:
+            logger.warning(
+                "%s %s carried %d unexpected key(s), ignored (first: %s)",
+                kind, model_path, len(incompatible.unexpected_keys),
+                incompatible.unexpected_keys[:3],
+            )
+        logger.info("Loaded %s: %s", kind, model_path)
+
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
         state_dict = {}
         for k, v in checkpoint["state_dict"].items():
             new_key = k.replace("model.", "", 1) if k.startswith("model.") else k
             state_dict[new_key] = v
-        model.load_state_dict(state_dict, strict=False)
-        logger.info("Loaded Lightning checkpoint: %s", model_path)
+        _load_checked(state_dict, "Lightning checkpoint")
     elif isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-        logger.info("Loaded exported .pth payload: %s", model_path)
+        _load_checked(checkpoint["model_state_dict"], "exported .pth payload")
     elif isinstance(checkpoint, dict):
-        model.load_state_dict(checkpoint, strict=False)
-        logger.info("Loaded state_dict checkpoint: %s", model_path)
+        _load_checked(checkpoint, "state_dict checkpoint")
     else:
         raise ValueError(f"Unrecognised checkpoint format in {model_path}")
 
