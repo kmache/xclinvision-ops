@@ -627,6 +627,56 @@ class TestGenerateReportV2:
         assert "findings" in body["content"]
         assert "impressions" in body["content"]
 
+    @patch("main._get_agent")
+    def test_findings_header_names_the_modality_not_the_architecture(
+        self, mock_get_agent, client
+    ):
+        """main.py:1430 rendered "AI analysis of chest convnext_small (...)".
+
+        model_version was interpolated into the modality slot, with "X-ray"
+        serving only as a dict default. Provenance now lives in its own
+        labelled field instead of the clinician-facing prose.
+        """
+        mock_get_agent.return_value = MagicMock()
+
+        from main import _analysis_store  # type: ignore[import-not-found]
+        _analysis_store["XCL-HEADER-TEST"] = {
+            "analysis_id": "XCL-HEADER-TEST",
+            "patient_id": "RPT-002",
+            "timestamp": "2026-04-01T12:00:00",
+            "prediction": "Cardiomegaly",
+            "confidence": 0.81,
+            "uncertainty": {},
+            "uncertainty_level": "low",
+            "region_scores": {},
+            "key_findings": [],
+            "llm_summary": "",
+            "model_version": "convnext_small",
+            "top_k_predictions": [{"class_name": "Cardiomegaly", "probability": 0.81}],
+        }
+
+        r = client.post("/api/v2/generate-report", json={
+            "analysis_ids": ["XCL-HEADER-TEST"],
+            "sections": ["findings"],
+        })
+        assert r.status_code == 200
+        body = r.json()
+
+        findings = body["content"]["findings"]
+        assert "chest X-ray" in findings
+
+        # No architecture name may leak into the prose a clinician reads.
+        architectures = (
+            "convnext", "resnet", "densenet", "efficientnet", "vit_base",
+            "swin", "b0", "_small",
+        )
+        lowered = findings.lower()
+        leaked = [a for a in architectures if a in lowered]
+        assert not leaked, f"architecture leaked into findings prose: {leaked}\n{findings}"
+
+        # ...but provenance is still reported, in its own labelled field.
+        assert body["model_version"] == "convnext_small"
+
 
 # ===========================================================================
 # Export report HTML endpoint (v2)

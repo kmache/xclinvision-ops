@@ -1569,8 +1569,7 @@ async def generate_dashboard_report(request: DashboardReportRequest):
 
     # Build sections
     findings = (
-        f"AI analysis of chest X-ray ({primary['timestamp'][:10]}, "
-        f"model {primary.get('model_version', 'unknown')}):\n\n"
+        f"AI analysis of chest X-ray ({primary['timestamp'][:10]}):\n\n"
         f"1. {primary['prediction']} detected with {primary['confidence']:.1%} confidence. "
         f"Uncertainty: {primary.get('uncertainty_level', 'unknown').capitalize()}.\n"
     )
@@ -1620,6 +1619,9 @@ async def generate_dashboard_report(request: DashboardReportRequest):
         "content": content,
         "analysis_ids": request.analysis_ids,
         "template": request.template,
+        # Provenance belongs in its own labelled field, not interpolated into
+        # the findings prose a clinician reads.
+        "model_version": primary.get("model_version", "unknown"),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
